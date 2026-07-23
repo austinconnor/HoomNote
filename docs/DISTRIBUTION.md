@@ -38,7 +38,7 @@ static HTTPS feed can be supplied with `-UpdateUrl` or the
 The publish script builds the release, creates the matching `vX.Y.Z` Git tag
 and GitHub Release, and uploads the installer, portable ZIP, update packages,
 feed manifest, and checksums together. Send new users the
-`HoomNote-Setup.exe` asset from the latest GitHub Release.
+`HoomNote-win-x64-Setup.exe` asset from the latest GitHub Release.
 
 Installed copies check the feed after startup without blocking the editor.
 When an update exists, HoomNote asks permission, downloads it, flushes autosave,
