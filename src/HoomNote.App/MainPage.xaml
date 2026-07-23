@@ -1,0 +1,546 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="HoomNote_App.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:canvas="using:Microsoft.Graphics.Canvas.UI.Xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    Background="{StaticResource HoomNoteBackgroundBrush}"
+    Loaded="OnLoaded"
+    Unloaded="OnUnloaded"
+    SizeChanged="OnRootSizeChanged"
+    PointerExited="OnRootPointerExited"
+    CharacterReceived="OnCharacterReceived"
+    mc:Ignorable="d">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition x:Name="TabsRow" Height="42" />
+            <RowDefinition x:Name="ToolbarRow" Height="52" />
+            <RowDefinition Height="*" />
+            <RowDefinition x:Name="FooterRow" Height="0" />
+        </Grid.RowDefinitions>
+
+        <Border x:Name="TopToolbar" Grid.Row="1"
+                Background="{StaticResource HoomNotePanelBrush}"
+                BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="0,0,0,1">
+            <Grid Padding="8,5">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnUndoClick" ToolTipService.ToolTip="Undo">
+                        <FontIcon Glyph="&#xE7A7;" FontSize="17" />
+                    </Button>
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnRedoClick" ToolTipService.ToolTip="Redo">
+                        <FontIcon Glyph="&#xE7A6;" FontSize="17" />
+                    </Button>
+                </StackPanel>
+                <Border Grid.Column="1" Width="1" Height="24" Margin="8,0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{StaticResource HoomNoteBorderBrush}" />
+                <StackPanel x:Name="ToolButtons" Grid.Column="1" Margin="17,0,0,0" Orientation="Horizontal" Spacing="1">
+                    <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="18" /></ToggleButton>
+                    <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)"><FontIcon Glyph="&#xE76D;" FontSize="18" /></ToggleButton>
+                    <ToggleButton Tag="Highlighter" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Highlighter (H)">
+                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                            <Path Data="M6,15 L14.5,6.5 L19,11 L10.5,19.5 L6,19.5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.9" StrokeLineJoin="Round" />
+                            <Path Data="M4,22 L20,22" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.8" />
+                        </Canvas></Viewbox>
+                    </ToggleButton>
+                    <ToggleButton Tag="StrokeEraser" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Erase whole strokes (E)">
+                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                            <Path Data="M4,18 L12,5 L21,11 L14,21 L8,21 Z" Fill="{StaticResource HoomNotePanelRaisedBrush}" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeLineJoin="Round" />
+                            <Path Data="M4,4 L20,4" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.3" />
+                            <Path Data="M6,2 L6,6 M10,2 L10,6 M14,2 L14,6 M18,2 L18,6" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.2" />
+                        </Canvas></Viewbox>
+                    </ToggleButton>
+                    <ToggleButton Tag="Lasso" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Freeform lasso (L)">
+                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                            <Path Data="M5,5 C1,9 3,18 11,20 C20,22 23,14 19,7 C16,2 8,2 5,5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeDashArray="1.4,1.5" />
+                            <Path Data="M15,18 C17,19 19,21 21,23" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.8" />
+                        </Canvas></Viewbox>
+                    </ToggleButton>
+                    <Button x:Name="MoreToolsButton" Width="40" Height="40" Padding="8" CornerRadius="8"
+                            ToolTipService.ToolTip="More tools">
+                        <FontIcon Glyph="&#xE712;" FontSize="18" />
+                        <Button.Flyout>
+                            <MenuFlyout>
+                                <MenuFlyoutItem Text="Style brush" Tag="Style" Click="OnOverflowToolClick" />
+                                <MenuFlyoutItem Text="Segment eraser" Tag="SegmentEraser" Click="OnOverflowToolClick" />
+                                <MenuFlyoutItem Text="Text box" Tag="Text" Click="OnOverflowToolClick" />
+                                <MenuFlyoutItem Text="Shapes" Tag="Shape" Click="OnOverflowToolClick" />
+                                <MenuFlyoutItem Text="Box selection" Tag="BoxSelect" Click="OnOverflowToolClick" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+                </StackPanel>
+                <ScrollViewer x:Name="PresetScrollViewer" Grid.Column="2" MinWidth="120" MaxWidth="420" Margin="14,0,10,0"
+                              HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Hidden"
+                              VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled"
+                              IsHorizontalRailEnabled="True" IsVerticalRailEnabled="False" ZoomMode="Disabled">
+                    <StackPanel x:Name="PresetToolButtons" Orientation="Horizontal" Spacing="5" AllowDrop="True"
+                                DragOver="OnPresetToolbarDragOver" Drop="OnPresetToolbarDrop" />
+                </ScrollViewer>
+                <StackPanel x:Name="ToolbarSecondaryActions" Grid.Column="3" Orientation="Horizontal" Spacing="2">
+                    <Border Width="1" Height="24" Margin="0,0,7,0" VerticalAlignment="Center" Background="{StaticResource HoomNoteBorderBrush}" />
+                    <Button Tag="Library" Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnSidebarToggleClick" ToolTipService.ToolTip="Toggle library">
+                        <FontIcon Glyph="&#xE8F1;" FontSize="16" />
+                    </Button>
+                    <Button Tag="Pages" Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnSidebarToggleClick" ToolTipService.ToolTip="Toggle pages">
+                        <FontIcon Glyph="&#xE8A5;" FontSize="16" />
+                    </Button>
+                    <Button Tag="Inspector" Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnSidebarToggleClick" ToolTipService.ToolTip="Page and selection settings">
+                        <FontIcon Glyph="&#xE713;" FontSize="16" />
+                    </Button>
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnReadModeClick" ToolTipService.ToolTip="Read mode (R)">
+                        <FontIcon Glyph="&#xE736;" FontSize="16" />
+                    </Button>
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnAddImageClick" ToolTipService.ToolTip="Add image">
+                        <FontIcon Glyph="&#xEB9F;" FontSize="16" />
+                    </Button>
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnImportClick" ToolTipService.ToolTip="Import (Ctrl+O)">
+                        <FontIcon Glyph="&#xE8B5;" FontSize="16" RenderTransformOrigin="0.5,0.5">
+                            <FontIcon.RenderTransform><RotateTransform Angle="90" /></FontIcon.RenderTransform>
+                        </FontIcon>
+                    </Button>
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnExportClick" ToolTipService.ToolTip="Export (Ctrl+E)">
+                        <FontIcon Glyph="&#xEDE1;" FontSize="16" RenderTransformOrigin="0.5,0.5">
+                            <FontIcon.RenderTransform><RotateTransform Angle="-90" /></FontIcon.RenderTransform>
+                        </FontIcon>
+                    </Button>
+                </StackPanel>
+                <Button x:Name="ToolbarOverflowActionsButton" Grid.Column="4" Width="40" Height="40"
+                        Padding="8" CornerRadius="8" ToolTipService.ToolTip="Workspace actions">
+                    <FontIcon Glyph="&#xE712;" FontSize="18" />
+                    <Button.Flyout>
+                        <MenuFlyout>
+                            <MenuFlyoutItem Text="Toggle library" Tag="Library" Click="OnSidebarToggleClick" />
+                            <MenuFlyoutItem Text="Toggle pages" Tag="Pages" Click="OnSidebarToggleClick" />
+                            <MenuFlyoutItem Text="Page and selection settings" Tag="Inspector" Click="OnSidebarToggleClick" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Read mode" Click="OnReadModeClick" />
+                            <MenuFlyoutItem Text="Add image" Click="OnAddImageClick" />
+                            <MenuFlyoutItem Text="Import" Click="OnImportClick" />
+                            <MenuFlyoutItem Text="Export" Click="OnExportClick" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Check for updates" Click="OnCheckForUpdatesClick" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+            </Grid>
+        </Border>
+
+        <Border x:Name="NotebookTabBar" Grid.Row="0" Background="#0D0E10" BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="0,0,0,1">
+            <Grid>
+                <TabView x:Name="NotebookTabs" Margin="8,0,120,0" IsAddTabButtonVisible="False" TabWidthMode="SizeToContent"
+                         SelectionChanged="OnNotebookTabSelectionChanged" TabCloseRequested="OnNotebookTabCloseRequested" />
+                <Border x:Name="AutosavedStatusBadge" Width="104" Height="28" Margin="0,0,10,0" Padding="9,0"
+                        HorizontalAlignment="Right" VerticalAlignment="Center" CornerRadius="8" Background="#191A1D">
+                    <StackPanel Orientation="Horizontal" Spacing="6" HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <FontIcon Glyph="&#xE73E;" FontSize="11" VerticalAlignment="Center" Foreground="{StaticResource HoomNoteAccentBrush}" />
+                        <TextBlock Text="Autosaved" FontSize="10" VerticalAlignment="Center" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+
+        <Grid x:Name="WorkspaceGrid" Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="LibraryColumn" Width="252" />
+                <ColumnDefinition x:Name="PageColumn" Width="132" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition x:Name="InspectorColumn" Width="0" />
+            </Grid.ColumnDefinitions>
+
+            <Border x:Name="LibrarySidebar" Background="#101113" BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="0,0,1,0">
+                <Grid Padding="12,14,12,10" MinHeight="0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Text="HoomNote" FontSize="17" FontWeight="SemiBold" />
+                            <TextBlock Text="LOCAL LIBRARY" Margin="0,2,0,0" FontSize="9" CharacterSpacing="70" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Width="32" Height="30" Padding="5" VerticalAlignment="Center"
+                                Click="OnNewFolderClick" ToolTipService.ToolTip="New folder">
+                            <FontIcon Glyph="&#xE8F4;" FontSize="13" />
+                        </Button>
+                    </Grid>
+                    <Grid Grid.Row="1" ColumnSpacing="5" Margin="0,14,0,14">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <Button Height="36" HorizontalAlignment="Stretch" CornerRadius="8" Click="OnNewNotebookClick" ToolTipService.ToolTip="New notebook (Ctrl+N)">
+                            <StackPanel Orientation="Horizontal" Spacing="7"><FontIcon Glyph="&#xE710;" FontSize="13" /><TextBlock Text="New notebook" /></StackPanel>
+                        </Button>
+                        <Button Grid.Column="1" Width="36" Height="36" Padding="6" CornerRadius="8" Click="OnNewCanvasClick" ToolTipService.ToolTip="New infinite canvas"><FontIcon Glyph="&#xE8A5;" FontSize="14" /></Button>
+                    </Grid>
+                    <Grid x:Name="FolderHeader" Grid.Row="2" Margin="2,0,2,5">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="LIBRARY" VerticalAlignment="Center" FontSize="10" FontWeight="SemiBold" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                            <TextBlock x:Name="NotebookCountText" Text="0" VerticalAlignment="Center" FontSize="10" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        </StackPanel>
+                    </Grid>
+                    <Border x:Name="FolderTreeContainer" Grid.Row="3" MinHeight="0" Background="Transparent" Padding="0" Margin="0,2,0,6">
+                        <Grid>
+                            <TreeView x:Name="FolderTree" MinHeight="0" SelectionMode="Single" SelectionChanged="OnFolderSelectionChanged"
+                                      RightTapped="OnFolderTreeRightTapped" AllowDrop="True"
+                                      DragOver="OnFolderTreeDragOver" Drop="OnFolderTreeDrop">
+                                <TreeView.Resources>
+                                    <Style TargetType="TreeViewItem">
+                                        <Setter Property="MinHeight" Value="32" />
+                                        <Setter Property="Padding" Value="1,0" />
+                                    </Style>
+                                </TreeView.Resources>
+                                <TreeView.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Tag="{Binding Content}" Height="30" MinWidth="150" Padding="4,1" ColumnSpacing="7"
+                                              Background="Transparent" CanDrag="{Binding Content.CanDrag}" AllowDrop="{Binding Content.IsContainer}"
+                                              Tapped="OnLibraryRowTapped" DragStarting="OnLibraryNotebookDragStarting"
+                                              DragOver="OnLibraryContainerDragOver" DragLeave="OnLibraryContainerDragLeave"
+                                              Drop="OnLibraryContainerDrop">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="18" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <FontIcon Glyph="{Binding Content.Glyph}" FontSize="13" Foreground="{Binding Content.Brush}"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                            <TextBlock Grid.Column="1" Text="{Binding Content.Name}" FontSize="12.5"
+                                                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                            <TextBlock Grid.Column="2" Text="{Binding Content.Metadata}" FontSize="9"
+                                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" VerticalAlignment="Center"
+                                                       Margin="5,0,2,0" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </TreeView.ItemTemplate>
+                            </TreeView>
+                            <TextBlock x:Name="LibraryEmptyText" Text="No notebooks or folders yet" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" Visibility="Collapsed" />
+                        </Grid>
+                    </Border>
+                    <StackPanel Grid.Row="4" Spacing="6" Margin="0,8,0,6">
+                        <TextBlock x:Name="SearchHeading" Text="Search results" Visibility="Collapsed" FontSize="11" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <ListView x:Name="SearchResultsList" MaxHeight="220" IsItemClickEnabled="True"
+                                  SelectionMode="None" ItemClick="OnSearchResultClick" Visibility="Collapsed">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Padding="2,4" Spacing="2">
+                                        <TextBlock Text="{Binding DocumentTitle}" FontWeight="SemiBold" FontSize="12" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding PageTitle}" FontSize="10" Foreground="{StaticResource HoomNoteAccentBrush}" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding Snippet}" FontSize="10" Foreground="{StaticResource HoomNoteMutedTextBrush}" TextWrapping="WrapWholeWords" MaxLines="2" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </StackPanel>
+                    <StackPanel Grid.Row="5" Spacing="6">
+                        <AutoSuggestBox x:Name="SearchBox" Height="36" PlaceholderText="Search notebooks, pages, handwriting"
+                                        QueryIcon="Find" TextChanged="OnSearchTextChanged" />
+                        <TextBlock Text="HoomNote 0.5.7 • Local notes" FontSize="9" Foreground="{StaticResource HoomNoteMutedTextBrush}"
+                                   ToolTipService.ToolTip="Diagnostics: %LOCALAPPDATA%\HoomNote\logs" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border x:Name="PageSidebar" Grid.Column="1" Background="#0E0F11" BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="0,0,1,0">
+                <Grid Padding="8,12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid Margin="2,0,2,4">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <TextBlock x:Name="NotebookTitle" Text="Pages" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                        <Button Grid.Column="1" Width="28" Height="28" Padding="4" Click="OnNotebookSettingsClick"
+                                ToolTipService.ToolTip="Notebook page defaults">
+                            <FontIcon Glyph="&#xE713;" FontSize="14" />
+                        </Button>
+                    </Grid>
+                    <Grid Grid.Row="1" Margin="0,8,0,10" ColumnSpacing="5">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Button Height="30" HorizontalAlignment="Stretch" Padding="4" Click="OnAddPageClick" ToolTipService.ToolTip="Add page (Ctrl+Enter)"><FontIcon Glyph="&#xE710;" FontSize="13" /></Button>
+                        <Button x:Name="DeletePageButton" Grid.Column="1" Width="30" Height="30" Padding="4" Click="OnDeletePageClick"
+                                IsEnabled="False" ToolTipService.ToolTip="Delete the selected page"><FontIcon Glyph="&#xE74D;" FontSize="13" /></Button>
+                    </Grid>
+                    <ListView x:Name="PageList" Grid.Row="2" SelectionChanged="OnPageSelectionChanged" RightTapped="OnPageListRightTapped"
+                              ContainerContentChanging="OnPageThumbnailContainerContentChanging"
+                              HorizontalContentAlignment="Center" SelectionMode="Single">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="Padding" Value="4" />
+                                <Setter Property="Margin" Value="0,0,0,8" />
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="CornerRadius" Value="8" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Width="96" Spacing="5">
+                                    <Border Height="116" Background="#050506" BorderBrush="#34363A" BorderThickness="1" CornerRadius="5">
+                                        <Grid>
+                                            <Image x:Name="PageThumbnailImage" Stretch="Uniform" />
+                                            <ProgressRing x:Name="PageThumbnailLoading" Width="18" Height="18"
+                                                          IsActive="True" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                        </Grid>
+                                    </Border>
+                                    <TextBlock Text="{Binding Title}" HorizontalAlignment="Center" FontSize="10"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Column="2" Background="#08090B">
+                <canvas:CanvasControl x:Name="DrawingSurface" ClearColor="Transparent" IsTabStop="True"
+                                       ManipulationMode="None"
+                                      CreateResources="OnCanvasCreateResources" Draw="OnCanvasDraw"
+                    PointerPressed="OnCanvasPointerPressed" PointerMoved="OnCanvasPointerMoved"
+                    PointerReleased="OnCanvasPointerReleased" PointerCanceled="OnCanvasPointerCanceled"
+                    PointerCaptureLost="OnCanvasPointerCaptureLost"
+                    PointerWheelChanged="OnCanvasPointerWheelChanged" />
+                <Canvas x:Name="EditorOverlay">
+                    <TextBox x:Name="TextEditorOverlay" Visibility="Collapsed" AcceptsReturn="True" TextWrapping="Wrap"
+                        Background="#EE1D1D1D" BorderBrush="{StaticResource HoomNoteAccentBrush}" BorderThickness="1"
+                        Padding="8" TextChanged="OnTextEditorChanged" LostFocus="OnTextEditorLostFocus" />
+                    <Button x:Name="ImageLockOverlayButton" Width="36" Height="36" Padding="0"
+                            Visibility="Collapsed" Click="OnSelectionLockClick"
+                            ToolTipService.ToolTip="Image is unlocked • click to lock">
+                        <FontIcon x:Name="ImageLockOverlayIcon" Glyph="&#xE785;" FontSize="17" />
+                    </Button>
+                </Canvas>
+                <Border x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#F0161616" CornerRadius="12" Padding="24" Visibility="Collapsed">
+                    <StackPanel HorizontalAlignment="Center" Spacing="8">
+                        <TextBlock x:Name="EmptyStateTitle" Text="Create a notebook to begin" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                        <TextBlock x:Name="EmptyStateMessage" Text="Ink, type, import documents, and keep everything local." Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Button x:Name="EmptyStateAddPageButton" Content="Add first page" Click="OnAddPageClick" HorizontalAlignment="Center" Visibility="Collapsed" />
+                    </StackPanel>
+                </Border>
+                <Button x:Name="ReadModeExitButton" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="16"
+                        Visibility="Collapsed" Click="OnReadModeClick" ToolTipService.ToolTip="Exit read mode (R or Esc)">
+                    <FontIcon Glyph="&#xE711;" />
+                </Button>
+            </Grid>
+
+            <Border x:Name="InspectorSidebar" Grid.Column="3" Visibility="Collapsed" Background="{StaticResource HoomNotePanelBrush}" BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="1,0,0,0">
+                <ScrollViewer HorizontalScrollMode="Disabled" HorizontalScrollBarVisibility="Disabled"
+                              VerticalScrollBarVisibility="Auto">
+                    <StackPanel Padding="16,14" Spacing="14">
+                        <TextBlock Text="PAGE &amp; SELECTION" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <TextBlock Text="Page style" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <ComboBox x:Name="TemplatePicker" HorizontalAlignment="Stretch" SelectionChanged="OnTemplateChanged" SelectedIndex="1">
+                            <ComboBoxItem Tag="Blank" Content="Blank" />
+                            <ComboBoxItem Tag="Lined" Content="Lined" />
+                            <ComboBoxItem Tag="Dotted" Content="Dotted grid" />
+                            <ComboBoxItem Tag="SquareGrid" Content="Square grid" />
+                            <ComboBoxItem Tag="Graph" Content="Graph" />
+                        </ComboBox>
+                        <TextBlock Text="Page color" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Button x:Name="PageColorButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <Border x:Name="PageColorSwatch" Width="18" Height="18" CornerRadius="4" Background="#FFFDF8"
+                                        BorderBrush="#55FFFFFF" BorderThickness="1" />
+                                <TextBlock Text="Choose paper color" VerticalAlignment="Center" />
+                            </StackPanel>
+                            <Button.Flyout>
+                                <Flyout>
+                                    <ColorPicker x:Name="PageColorPicker" IsAlphaEnabled="False"
+                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
+                                                 ColorChanged="OnPageColorChanged" />
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <Border x:Name="StyleToolPanel" Visibility="Collapsed" Padding="12" CornerRadius="8"
+                                Background="{StaticResource HoomNotePanelRaisedBrush}">
+                            <StackPanel Spacing="9">
+                                <TextBlock Text="Pick &amp; apply style" FontWeight="SemiBold" />
+                                <TextBlock Text="Pick copies color and thickness from an object. Apply paints that style onto objects."
+                                           FontSize="10" Foreground="{StaticResource HoomNoteMutedTextBrush}" TextWrapping="Wrap" />
+                                <Grid ColumnSpacing="6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <ToggleButton x:Name="StylePickModeButton" Tag="Pick" Content="Pick" IsChecked="True"
+                                                  Click="OnStyleModeClick" HorizontalAlignment="Stretch" />
+                                    <ToggleButton x:Name="StyleApplyModeButton" Grid.Column="1" Tag="Apply" Content="Apply"
+                                                  Click="OnStyleModeClick" HorizontalAlignment="Stretch" />
+                                </Grid>
+                                <ColorPicker x:Name="StyleColorPicker" IsAlphaEnabled="False"
+                                             IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
+                                             ColorChanged="OnStyleToolColorChanged" />
+                                <Slider x:Name="StyleWidthSlider" Header="Thickness" Minimum="0.5" Maximum="48"
+                                        Value="2.4" StepFrequency="0.5" ValueChanged="OnStyleToolWidthChanged" />
+                            </StackPanel>
+                        </Border>
+                        <ToggleSwitch x:Name="TemporaryGridToggle" Header="Temporary grid" OffContent="Hidden" OnContent="Visible"
+                                      Toggled="OnTemporaryGridToggled" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <TextBlock Text="Grid size" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Tag="Grid" Padding="8,3" CornerRadius="5" Background="{StaticResource HoomNotePanelRaisedBrush}"
+                                    PointerPressed="OnSliderReadoutPointerPressed" PointerMoved="OnSliderReadoutPointerMoved" PointerReleased="OnSliderReadoutPointerReleased">
+                                <TextBlock x:Name="TemporaryGridSizeValue" Text="32" FontWeight="SemiBold" />
+                            </Border>
+                        </Grid>
+                        <Slider x:Name="TemporaryGridSizeSlider" Minimum="8" Maximum="128" Value="32"
+                                StepFrequency="4" ValueChanged="OnTemporaryGridSizeChanged" IsEnabled="False" />
+                        <Border Height="1" Background="{StaticResource HoomNoteBorderBrush}" />
+                        <TextBlock Text="Ink preset" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <TextBlock Text="Width" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Tag="Width" Padding="8,3" CornerRadius="5" Background="{StaticResource HoomNotePanelRaisedBrush}"
+                                    PointerPressed="OnSliderReadoutPointerPressed" PointerMoved="OnSliderReadoutPointerMoved" PointerReleased="OnSliderReadoutPointerReleased">
+                                <TextBlock x:Name="StrokeWidthValue" Text="2.4" FontWeight="SemiBold" />
+                            </Border>
+                        </Grid>
+                        <Slider x:Name="StrokeWidthSlider" Minimum="0.5" Maximum="24" Value="2.4" StepFrequency="0.5" ValueChanged="OnInkSliderValueChanged" />
+                        <Button x:Name="InkColorButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <Border x:Name="InkColorSwatch" Width="18" Height="18" CornerRadius="9" Background="#111111"
+                                        BorderBrush="#55FFFFFF" BorderThickness="1" />
+                                <TextBlock x:Name="InkColorLabel" Text="Pen color" VerticalAlignment="Center" />
+                            </StackPanel>
+                            <Button.Flyout>
+                                <Flyout>
+                                    <ColorPicker x:Name="InkColorPicker" IsAlphaEnabled="False"
+                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
+                                                 ColorChanged="OnInkColorChanged" />
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <TextBlock Text="Pen and highlighter colors are remembered separately." FontSize="10"
+                                   Foreground="{StaticResource HoomNoteMutedTextBrush}" TextWrapping="Wrap" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Quick colors" VerticalAlignment="Center" FontSize="12"
+                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4">
+                                <Button Content="Save" Click="OnSaveInkColorClick" Padding="8,4" />
+                                <Button x:Name="RemoveSavedColorButton" Content="Remove" Click="OnRemoveSavedColorClick"
+                                        Padding="8,4" IsEnabled="False" />
+                            </StackPanel>
+                        </Grid>
+                        <GridView x:Name="SavedColorPalette" MaxHeight="104" SelectionMode="Single"
+                                  SelectionChanged="OnSavedColorSelected">
+                            <GridView.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <ItemsWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="4" />
+                                </ItemsPanelTemplate>
+                            </GridView.ItemsPanel>
+                            <GridView.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Width="28" Height="28" CornerRadius="14" Background="{Binding Brush}"
+                                            BorderBrush="#66FFFFFF" BorderThickness="1"
+                                            ToolTipService.ToolTip="{Binding Hex}" />
+                                </DataTemplate>
+                            </GridView.ItemTemplate>
+                        </GridView>
+                        <Grid ColumnSpacing="6">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Button Content="Save pen" Click="OnAddPenPresetClick" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="1" Content="Save highlighter" Click="OnAddHighlighterPresetClick" HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <ToggleSwitch x:Name="HighlighterStraightToggle" Header="Highlighter stroke" OffContent="Freeform" OnContent="Straight line"
+                                      Toggled="OnHighlighterStraightToggled" />
+                        <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" />
+                        <ComboBox x:Name="ShapePicker" Header="Shape tool" SelectedIndex="0" HorizontalAlignment="Stretch">
+                            <ComboBoxItem Tag="Rectangle" Content="Rectangle" />
+                            <ComboBoxItem Tag="RoundedRectangle" Content="Rounded rectangle" />
+                            <ComboBoxItem Tag="Ellipse" Content="Ellipse" />
+                            <ComboBoxItem Tag="Line" Content="Line" />
+                            <ComboBoxItem Tag="Arrow" Content="Arrow" />
+                            <ComboBoxItem Tag="Triangle" Content="Triangle" />
+                            <ComboBoxItem Tag="Diamond" Content="Diamond" />
+                        </ComboBox>
+                        <Border Height="1" Background="{StaticResource HoomNoteBorderBrush}" />
+                        <TextBlock Text="Object" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <TextBlock x:Name="SelectionSummary" Text="Nothing selected" TextWrapping="Wrap" />
+                        <StackPanel x:Name="SelectionStylePanel" Visibility="Collapsed" Spacing="8">
+                            <Slider x:Name="SelectionWidthSlider" Header="Selected thickness" Minimum="0.5" Maximum="48"
+                                    Value="2.4" StepFrequency="0.5" />
+                            <ColorPicker x:Name="SelectionColorPicker" IsAlphaEnabled="False" IsAlphaSliderVisible="False"
+                                         IsAlphaTextInputVisible="False" />
+                            <Button Content="Apply selected style" Click="OnApplySelectionStyleClick" HorizontalAlignment="Stretch" />
+                        </StackPanel>
+                        <StackPanel x:Name="TextFormattingPanel" Visibility="Collapsed" Spacing="8">
+                            <ComboBox x:Name="ParagraphStylePicker" Header="Paragraph style" HorizontalAlignment="Stretch" SelectionChanged="OnTextFormattingChanged">
+                                <ComboBoxItem Tag="Body" Content="Body" />
+                                <ComboBoxItem Tag="Heading1" Content="Heading 1" />
+                                <ComboBoxItem Tag="Heading2" Content="Heading 2" />
+                                <ComboBoxItem Tag="Bullet" Content="Bulleted list" />
+                                <ComboBoxItem Tag="Numbered" Content="Numbered list" />
+                                <ComboBoxItem Tag="Checkbox" Content="Checkbox" />
+                            </ComboBox>
+                            <StackPanel Orientation="Horizontal" Spacing="5">
+                                <ToggleButton x:Name="BoldButton" Content="B" FontWeight="Bold" Click="OnTextFormattingChanged" />
+                                <ToggleButton x:Name="ItalicButton" Content="I" FontStyle="Italic" Click="OnTextFormattingChanged" />
+                                <ToggleButton x:Name="UnderlineButton" Content="U" Click="OnTextFormattingChanged" />
+                            </StackPanel>
+                            <Button x:Name="TextColorButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                                <StackPanel Orientation="Horizontal" Spacing="10">
+                                    <Border x:Name="TextColorSwatch" Width="18" Height="18" CornerRadius="9"
+                                            Background="#20242D" BorderBrush="#55FFFFFF" BorderThickness="1" />
+                                    <TextBlock Text="Text color" VerticalAlignment="Center" />
+                                </StackPanel>
+                                <Button.Flyout>
+                                    <Flyout Closed="OnTextColorFlyoutClosed">
+                                        <ColorPicker x:Name="TextColorPicker" IsAlphaEnabled="False"
+                                                     IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
+                                                     ColorChanged="OnTextColorChanged" />
+                                    </Flyout>
+                                </Button.Flyout>
+                            </Button>
+                        </StackPanel>
+                        <Grid ColumnSpacing="6">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Button Content="Cut" Click="OnCutClick" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="1" Content="Copy" Click="OnCopyClick" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="2" Content="Paste" Click="OnPasteClick" HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <Button x:Name="SelectionLockButton" Content="Lock" Click="OnSelectionLockClick"
+                                Visibility="Collapsed" HorizontalAlignment="Stretch" />
+                        <Grid ColumnSpacing="6">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Button Content="Duplicate" Click="OnDuplicateClick" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="1" Content="Delete" Click="OnDeleteClick" HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <Border Height="1" Background="{StaticResource HoomNoteBorderBrush}" />
+                        <TextBlock Text="Imported page layer" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Grid ColumnSpacing="5">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Button x:Name="LayerVisibilityButton" Content="Hide" Click="OnLayerVisibilityClick" IsEnabled="False" HorizontalAlignment="Stretch" />
+                            <Button x:Name="LayerLockButton" Grid.Column="1" Content="Unlock" Click="OnLayerLockClick" IsEnabled="False" HorizontalAlignment="Stretch" />
+                            <Button x:Name="LayerRotateButton" Grid.Column="2" Content="Rotate" Click="OnLayerRotateClick" IsEnabled="False" HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <Button x:Name="LayerResetButton" Content="Reset imported layer" Click="OnLayerResetClick" IsEnabled="False" HorizontalAlignment="Stretch" />
+                        <InfoBar x:Name="ImportInfo" IsOpen="False" Severity="Informational" IsClosable="True" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <Grid x:Name="StatusBar" Grid.Row="3" Width="0" Height="0" Visibility="Collapsed">
+            <TextBlock x:Name="StatusText" Text="Ready" />
+            <TextBlock x:Name="PointerStatus" Text="Windows Ink" />
+            <TextBlock x:Name="ZoomText" Text="100%" />
+        </Grid>
+    </Grid>
+</Page>

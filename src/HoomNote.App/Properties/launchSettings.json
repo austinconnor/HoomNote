@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "HoomNote.App (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "HoomNote.App (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

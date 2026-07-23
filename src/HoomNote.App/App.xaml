@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Application
+    x:Class="HoomNote_App.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:HoomNote_App">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+                <!-- Other merged dictionaries here -->
+            </ResourceDictionary.MergedDictionaries>
+            <Color x:Key="HoomNoteBackgroundColor">#08090B</Color>
+            <Color x:Key="HoomNotePanelColor">#111214</Color>
+            <Color x:Key="HoomNotePanelRaisedColor">#1B1C1F</Color>
+            <Color x:Key="HoomNoteBorderColor">#2C2E32</Color>
+            <Color x:Key="HoomNoteAccentColor">#38BDF8</Color>
+            <Color x:Key="HoomNoteTextColor">#F3F4F6</Color>
+            <Color x:Key="HoomNoteMutedTextColor">#8B9098</Color>
+            <SolidColorBrush x:Key="HoomNoteBackgroundBrush" Color="{StaticResource HoomNoteBackgroundColor}" />
+            <SolidColorBrush x:Key="HoomNotePanelBrush" Color="{StaticResource HoomNotePanelColor}" />
+            <SolidColorBrush x:Key="HoomNotePanelRaisedBrush" Color="{StaticResource HoomNotePanelRaisedColor}" />
+            <SolidColorBrush x:Key="HoomNoteBorderBrush" Color="{StaticResource HoomNoteBorderColor}" />
+            <SolidColorBrush x:Key="HoomNoteAccentBrush" Color="{StaticResource HoomNoteAccentColor}" />
+            <SolidColorBrush x:Key="HoomNoteTextBrush" Color="{StaticResource HoomNoteTextColor}" />
+            <SolidColorBrush x:Key="HoomNoteMutedTextBrush" Color="{StaticResource HoomNoteMutedTextColor}" />
+            <Style x:Key="HoomNoteToolButtonStyle" TargetType="ToggleButton">
+                <Setter Property="MinWidth" Value="40" />
+                <Setter Property="Height" Value="40" />
+                <Setter Property="Padding" Value="8" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Background" Value="Transparent" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

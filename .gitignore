@@ -1,0 +1,16 @@
+bin/
+obj/
+.vs/
+.idea/
+TestResults/
+BenchmarkDotNet.Artifacts/
+AppPackages/
+*.user
+*.suo
+*.pfx
+*.cer
+*.db
+*.db-shm
+*.db-wal
+artifacts/
+*.sdocx

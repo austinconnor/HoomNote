@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/HoomNote.Benchmarks/HoomNote.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/HoomNote.App/HoomNote.App.csproj" />
+    <Project Path="src/HoomNote.Canvas/HoomNote.Canvas.csproj" />
+    <Project Path="src/HoomNote.Core/HoomNote.Core.csproj" />
+    <Project Path="src/HoomNote.Import.Worker/HoomNote.Import.Worker.csproj" />
+    <Project Path="src/HoomNote.Infrastructure/HoomNote.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/HoomNote.Core.Tests/HoomNote.Core.Tests.csproj" />
+    <Project Path="tests/HoomNote.Infrastructure.Tests/HoomNote.Infrastructure.Tests.csproj" />
+  </Folder>
+</Solution>
