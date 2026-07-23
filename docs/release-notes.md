@@ -1,6 +1,5 @@
-# HoomNote 0.5.8
+# HoomNote 0.5.9
 
-- Added the official HoomNote icon across the executable, installer, shortcuts,
-  Start menu tiles, package identity, and splash screen.
-- Added a complete multi-resolution Windows icon for crisp rendering from
-  16px through 256px.
+- Fixed generic icons in the taskbar and Windows installed-app listing.
+- The app now ships its runtime icon, uses a fully qualified WinUI icon path,
+  and explicitly refreshes Windows shell registration after updating.

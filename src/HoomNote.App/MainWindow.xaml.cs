@@ -26,7 +26,16 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
 
-        AppWindow.SetIcon("Assets/AppIcon.ico");
+        var iconPath = WindowsShellBranding.GetIconPath();
+        if (File.Exists(iconPath))
+        {
+            AppWindow.SetIcon(iconPath);
+            AppWindow.SetTaskbarIcon(iconPath);
+        }
+        else
+        {
+            DiagnosticsLog.Warning("shell.window_icon_missing", ("path", iconPath));
+        }
         AppWindow.Resize(new SizeInt32(1440, 920));
 
         // Navigate the root frame to the main page on startup.

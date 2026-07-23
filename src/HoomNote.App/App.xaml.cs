@@ -32,6 +32,7 @@ public partial class App : Application
     {
         LocalDataMigration.MovePreviousLibrary();
         DiagnosticsLog.Initialize();
+        WindowsShellBranding.RefreshInstalledAppIcon();
         DiagnosticsLog.Info("app.constructing");
         UnhandledException += OnApplicationUnhandledException;
         AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
