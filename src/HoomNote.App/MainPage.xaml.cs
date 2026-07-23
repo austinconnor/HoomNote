@@ -182,6 +182,13 @@ public sealed partial class MainPage : Page
     private CanvasCommandList? _pageRenderCache;
     private CanvasRenderTarget? _lowZoomPageRaster;
     private Guid? _lowZoomPageRasterPageId;
+    private readonly Dictionary<(int X, int Y), CanvasRenderTarget> _navigationTiles = [];
+    private readonly LinkedList<(int X, int Y)> _navigationTileLru = [];
+    private readonly Dictionary<(int X, int Y), LinkedListNode<(int X, int Y)>> _navigationTileLruNodes = [];
+    private readonly HashSet<(int X, int Y)> _visibleNavigationTileKeys = [];
+    private Guid? _navigationTilePageId;
+    private double _navigationTileScale;
+    private long _navigationTileBytes;
     private Guid? _pageRenderCachePageId;
     private readonly HashSet<Guid> _pageRenderCacheObjectIds = [];
     private readonly List<CanvasObject> _pageRenderOverlays = [];
@@ -193,6 +200,9 @@ public sealed partial class MainPage : Page
     // a command list created a visible hitch between letters; batching amortizes that work.
     private const int OverlayBatchSize = 8;
     private const int OverlayBatchCompactionThreshold = 8;
+    private const int NavigationTilePixels = 512;
+    private const long NavigationTileByteBudget = 32L * 1024 * 1024;
+    private const int NavigationTileObjectThreshold = 256;
 
     private SqliteDocumentRepository? _repository;
     private ContentAddressedAssetStore? _assetStore;
@@ -322,6 +332,8 @@ public sealed partial class MainPage : Page
     private readonly List<RectD> _searchFlashBounds = [];
     private long _searchFlashStarted;
     private long _lastSlowFrameLogTimestamp;
+    private int _frameNavigationTileBuilds;
+    private string _frameRenderMode = "none";
     private Guid? _pendingSearchFlashPageId;
     private string? _pendingSearchFlashQuery;
     private const double LibraryWidth = 252;
@@ -1255,6 +1267,8 @@ public sealed partial class MainPage : Page
         if (_page is null) return;
         var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         _frameStrokeGeometryBuilds = 0;
+        _frameNavigationTileBuilds = 0;
+        _frameRenderMode = "none";
         if (_fitPending && sender.ActualWidth > 0 && sender.ActualHeight > 0)
         {
             _zoom = Math.Min(1, Math.Min((sender.ActualWidth - 72) / _page.Size.Width,
@@ -1271,7 +1285,10 @@ public sealed partial class MainPage : Page
             (_multiTransformPreviews.Count == 0 || styleBrushPreview))
         {
             if (ShouldDrawInteractiveViewport(_page))
+            {
+                _frameRenderMode = "viewport-vectors";
                 DrawInteractiveViewport(drawingSession, _page);
+            }
             else
                 DrawCachedPage(sender, drawingSession, _page);
         }
@@ -1359,6 +1376,11 @@ public sealed partial class MainPage : Page
         var activeInkPoints = _activeInk.Count;
         var liveRasterActive = _liveInkRaster is not null && activeInkPoints > 0;
         var wheelZoomAnimating = _wheelZoomAnimating;
+        var renderMode = _frameRenderMode;
+        var visibleObjects = _visibleObjects.Count;
+        var navigationTiles = _navigationTiles.Count;
+        var navigationTileBuilds = _frameNavigationTileBuilds;
+        var navigationTileMb = Math.Round(_navigationTileBytes / 1024d / 1024d, 1);
         // Synchronous file I/O from CanvasControl.Draw turns a slow frame into a larger hitch.
         // The logger is bounded to one event every two seconds, so queueing it is inexpensive.
         _ = Task.Run(() => DiagnosticsLog.Warning("render.slow_frame",
@@ -1371,6 +1393,11 @@ public sealed partial class MainPage : Page
             ("vector_cache", hasVectorCache),
             ("cached_strokes", cachedStrokeCount),
             ("cached_stroke_points", cachedStrokePoints),
+            ("visible_objects", visibleObjects),
+            ("render_mode", renderMode),
+            ("navigation_tiles", navigationTiles),
+            ("navigation_tile_builds", navigationTileBuilds),
+            ("navigation_tile_mb", navigationTileMb),
             ("wheel_zoom", wheelZoomAnimating),
             ("active_ink_points", activeInkPoints),
             ("live_raster", liveRasterActive),
@@ -1387,10 +1414,12 @@ public sealed partial class MainPage : Page
         if (useLowZoomRaster)
         {
             EnsureLowZoomPageRaster(sender.Device, page);
+            _frameRenderMode = "page-raster";
         }
-        else if (_pageRenderCache is null || _pageRenderCachePageId != page.Id)
+        else
         {
-            BuildVectorPageRenderCache(sender.Device, page);
+            DrawNavigationTiles(sender.Device, drawingSession, page);
+            _frameRenderMode = "native-tiles";
         }
         while (!_isPointerDown && _touchPoints.Count == 0 &&
                _pageRenderOverlays.Count >= OverlayBatchSize)
@@ -1417,10 +1446,6 @@ public sealed partial class MainPage : Page
             else if (_pageRenderCache is not null)
                 drawingSession.DrawImage(_pageRenderCache);
         }
-        else if (_pageRenderCache is not null)
-        {
-            drawingSession.DrawImage(_pageRenderCache);
-        }
         foreach (var batch in _pageRenderOverlayBatches) drawingSession.DrawImage(batch);
         // New pen strokes remain as a tiny overlay until the next structural edit or page
         // switch. This avoids rebuilding a dense imported page immediately after every pen-up.
@@ -1437,7 +1462,7 @@ public sealed partial class MainPage : Page
         // monitor. Beyond that point, draw the visible vector scene through the spatial index.
         // This removes the old object-count and zoom-threshold mode switches that caused the
         // renderer to oscillate between three unrelated pipelines at intermediate zoom levels.
-        return !CanUseNavigationSnapshot(page);
+        return !CanUseNavigationSnapshot(page) && !CanUseNativeNavigationTiles(page);
     }
 
     private bool CanUseNavigationSnapshot(NotePage page)
@@ -1445,6 +1470,145 @@ public sealed partial class MainPage : Page
         if (page.Size.Width <= 0 || page.Size.Height <= 0) return false;
         return RenderScalePolicy.HasNativeDisplayResolution(
             NavigationSnapshotScale(page), _zoom, DrawingSurface.Dpi);
+    }
+
+    private bool CanUseNativeNavigationTiles(NotePage page) =>
+        page.Objects.Count >= NavigationTileObjectThreshold &&
+        !_wheelZoomAnimating &&
+        !_zoomNavigationActive &&
+        _touchPoints.Count < 2;
+
+    private void DrawNavigationTiles(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page)
+    {
+        var scale = RenderScalePolicy.ComputeNativeTileScale(_zoom, DrawingSurface.Dpi);
+        EnsureNavigationTileSet(page, scale);
+        var visibleBounds = VisiblePageBounds(page, 0);
+        if (visibleBounds.Width <= 0 || visibleBounds.Height <= 0) return;
+
+        var fullPixelWidth = Math.Max(1, (int)Math.Ceiling(page.Size.Width * scale));
+        var fullPixelHeight = Math.Max(1, (int)Math.Ceiling(page.Size.Height * scale));
+        var minimumTileX = Math.Clamp((int)Math.Floor(visibleBounds.Left * scale / NavigationTilePixels),
+            0, Math.Max(0, (fullPixelWidth - 1) / NavigationTilePixels));
+        var maximumTileX = Math.Clamp((int)Math.Floor(
+                Math.Max(visibleBounds.Left, visibleBounds.Right - 0.0001) * scale / NavigationTilePixels),
+            minimumTileX, Math.Max(0, (fullPixelWidth - 1) / NavigationTilePixels));
+        var minimumTileY = Math.Clamp((int)Math.Floor(visibleBounds.Top * scale / NavigationTilePixels),
+            0, Math.Max(0, (fullPixelHeight - 1) / NavigationTilePixels));
+        var maximumTileY = Math.Clamp((int)Math.Floor(
+                Math.Max(visibleBounds.Top, visibleBounds.Bottom - 0.0001) * scale / NavigationTilePixels),
+            minimumTileY, Math.Max(0, (fullPixelHeight - 1) / NavigationTilePixels));
+
+        _visibleNavigationTileKeys.Clear();
+        for (var tileY = minimumTileY; tileY <= maximumTileY; tileY++)
+        for (var tileX = minimumTileX; tileX <= maximumTileX; tileX++)
+        {
+            var key = (tileX, tileY);
+            _visibleNavigationTileKeys.Add(key);
+            var tile = GetOrCreateNavigationTile(device, page, key, fullPixelWidth, fullPixelHeight);
+            TouchNavigationTile(key);
+            var tileLeft = tileX * NavigationTilePixels / scale;
+            var tileTop = tileY * NavigationTilePixels / scale;
+            drawingSession.DrawImage(tile, new Rect(tileLeft, tileTop,
+                tile.SizeInPixels.Width / scale, tile.SizeInPixels.Height / scale));
+        }
+        TrimNavigationTiles();
+    }
+
+    private void EnsureNavigationTileSet(NotePage page, double scale)
+    {
+        if (_navigationTilePageId == page.Id && Math.Abs(_navigationTileScale - scale) < 0.0001)
+            return;
+
+        ClearNavigationTileCache();
+        _navigationTilePageId = page.Id;
+        _navigationTileScale = scale;
+        _lowZoomPageRaster?.Dispose();
+        _lowZoomPageRaster = null;
+        _lowZoomPageRasterPageId = null;
+        _pageRenderCache?.Dispose();
+        _pageRenderCache = null;
+        if (_pageRenderCachePageId != page.Id || _pageRenderCacheObjectIds.Count == 0)
+        {
+            _pageRenderCacheObjectIds.Clear();
+            _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
+        }
+        _pageRenderCachePageId = page.Id;
+    }
+
+    private CanvasRenderTarget GetOrCreateNavigationTile(CanvasDevice device, NotePage page,
+        (int X, int Y) key, int fullPixelWidth, int fullPixelHeight)
+    {
+        if (_navigationTiles.TryGetValue(key, out var existing)) return existing;
+
+        var pixelLeft = key.X * NavigationTilePixels;
+        var pixelTop = key.Y * NavigationTilePixels;
+        var pixelWidth = Math.Min(NavigationTilePixels, fullPixelWidth - pixelLeft);
+        var pixelHeight = Math.Min(NavigationTilePixels, fullPixelHeight - pixelTop);
+        var tileBounds = new RectD(
+            pixelLeft / _navigationTileScale,
+            pixelTop / _navigationTileScale,
+            pixelWidth / _navigationTileScale,
+            pixelHeight / _navigationTileScale);
+        var tile = new CanvasRenderTarget(device, pixelWidth, pixelHeight, 96);
+        using (var session = tile.CreateDrawingSession())
+        {
+            session.Clear(Color.FromArgb(0, 0, 0, 0));
+            session.Transform = Matrix3x2.CreateTranslation(
+                                    (float)-tileBounds.X, (float)-tileBounds.Y) *
+                                Matrix3x2.CreateScale((float)_navigationTileScale);
+            DrawPageBackground(session, page, tileBounds);
+            DrawImportedLayer(session, page);
+            if (_temporaryGridVisible) DrawTemporaryGrid(session, page, tileBounds);
+
+            var queryBounds = tileBounds.Inflate(32);
+            if (_spatialIndex.Count == page.Objects.Count)
+                _spatialIndex.Query(queryBounds, _visibleObjectIds, _visibleObjects);
+            else
+            {
+                _visibleObjectIds.Clear();
+                _visibleObjects.Clear();
+                foreach (var canvasObject in page.Objects)
+                {
+                    if (!StrokeGeometry.GetWorldBounds(canvasObject).Intersects(queryBounds)) continue;
+                    _visibleObjectIds.Add(canvasObject.Id);
+                    _visibleObjects.Add(canvasObject);
+                }
+            }
+            foreach (var canvasObject in _visibleObjects)
+                if (!canvasObject.IsHidden && _pageRenderCacheObjectIds.Contains(canvasObject.Id))
+                    DrawObject(session, canvasObject, cacheInkGeometry: true);
+        }
+
+        _navigationTiles[key] = tile;
+        _navigationTileBytes += (long)pixelWidth * pixelHeight * RenderScalePolicy.BytesPerPixel;
+        _frameNavigationTileBuilds++;
+        return tile;
+    }
+
+    private void TouchNavigationTile((int X, int Y) key)
+    {
+        if (_navigationTileLruNodes.Remove(key, out var node))
+            _navigationTileLru.Remove(node);
+        _navigationTileLruNodes[key] = _navigationTileLru.AddFirst(key);
+    }
+
+    private void TrimNavigationTiles()
+    {
+        while (_navigationTileBytes > NavigationTileByteBudget && _navigationTileLru.Last is not null)
+        {
+            var node = _navigationTileLru.Last;
+            while (node is not null && _visibleNavigationTileKeys.Contains(node.Value))
+                node = node.Previous;
+            if (node is null) break;
+            var key = node.Value;
+            _navigationTileLru.Remove(node);
+            _navigationTileLruNodes.Remove(key);
+            if (!_navigationTiles.Remove(key, out var tile)) continue;
+            _navigationTileBytes = Math.Max(0, _navigationTileBytes -
+                (long)tile.SizeInPixels.Width * tile.SizeInPixels.Height *
+                RenderScalePolicy.BytesPerPixel);
+            tile.Dispose();
+        }
     }
 
     private void DrawInteractiveViewport(CanvasDrawingSession drawingSession, NotePage page)
@@ -1506,6 +1670,7 @@ public sealed partial class MainPage : Page
     private void EnsureLowZoomPageRaster(CanvasDevice device, NotePage page)
     {
         if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) return;
+        ClearNavigationTileCache();
         var rasterScale = NavigationSnapshotScale(page);
         var width = Math.Max(1, page.Size.Width * rasterScale);
         var height = Math.Max(1, page.Size.Height * rasterScale);
@@ -3597,7 +3762,8 @@ public sealed partial class MainPage : Page
         var appendOnly = appendedObject is not null && _page is not null;
         var canKeepCacheForAppend = appendedObject is not null && _page is not null &&
                                     ((_pageRenderCache is not null && _pageRenderCachePageId == _page.Id) ||
-                                     (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == _page.Id)) &&
+                                     (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == _page.Id) ||
+                                     (_navigationTilePageId == _page.Id && _navigationTiles.Count > 0)) &&
                                     !_pageRenderCacheObjectIds.Contains(appendedObject.Id);
         if (canKeepCacheForAppend)
             _pageRenderOverlays.Add(appendedObject!);
@@ -3788,7 +3954,8 @@ public sealed partial class MainPage : Page
         if (document.Pages.All(page => _pageOcrIndexedThisSession.Contains(page.Id))) return;
         if (_handwritingIndexTask is { IsCompleted: false })
         {
-            if (_handwritingIndexDocumentId == document.Id) return;
+            if (_handwritingIndexDocumentId == document.Id &&
+                _handwritingIndexCancellation is { IsCancellationRequested: false }) return;
             _handwritingIndexCancellation?.Cancel();
         }
         _handwritingIndexCancellation = new CancellationTokenSource();
@@ -6115,6 +6282,7 @@ public sealed partial class MainPage : Page
     {
         _recognitionTimer.Stop();
         _incrementalRecognitionCancellation?.Cancel();
+        _handwritingIndexCancellation?.Cancel();
     }
 
     private void ResumeBackgroundRecognition()
@@ -6510,6 +6678,7 @@ public sealed partial class MainPage : Page
 
     private void InvalidatePageRenderCache()
     {
+        ClearNavigationTileCache();
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = null;
         _lowZoomPageRasterPageId = null;
@@ -6520,6 +6689,18 @@ public sealed partial class MainPage : Page
         _pageRenderCachePageId = null;
         _pageRenderCacheObjectIds.Clear();
         _pageRenderOverlays.Clear();
+    }
+
+    private void ClearNavigationTileCache()
+    {
+        foreach (var tile in _navigationTiles.Values) tile.Dispose();
+        _navigationTiles.Clear();
+        _navigationTileLru.Clear();
+        _navigationTileLruNodes.Clear();
+        _visibleNavigationTileKeys.Clear();
+        _navigationTilePageId = null;
+        _navigationTileScale = 0;
+        _navigationTileBytes = 0;
     }
 
     private Matrix3x2 PageTransform()

@@ -40,48 +40,57 @@ public sealed class WindowsInkRecognitionService : IHandwritingRecognitionServic
         const double padding = 12;
         var analyzer = new InkAnalyzer();
         var builder = new InkStrokeBuilder();
-        var previousCulture = CultureInfo.CurrentCulture;
         try
         {
-            if (!string.IsNullOrWhiteSpace(languageTag))
-                CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo(languageTag);
-            foreach (var points in prepared)
+            var previousCulture = CultureInfo.CurrentCulture;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var normalized = points.Select(point => new Point(
-                    (point.X - minX) * analysisScale + padding,
-                    (point.Y - minY) * analysisScale + padding)).ToArray();
-                var inkStroke = builder.CreateStroke(normalized);
-                analyzer.AddDataForStroke(inkStroke);
-                // These batches contain only candidate handwriting. Prevent the analyzer from
-                // discarding headers or small lettering as diagrams/shapes.
-                analyzer.SetStrokeDataKind(inkStroke.Id, InkAnalysisStrokeKind.Writing);
+                if (!string.IsNullOrWhiteSpace(languageTag))
+                    CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo(languageTag);
+                foreach (var points in prepared)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var normalized = points.Select(point => new Point(
+                        (point.X - minX) * analysisScale + padding,
+                        (point.Y - minY) * analysisScale + padding)).ToArray();
+                    var inkStroke = builder.CreateStroke(normalized);
+                    analyzer.AddDataForStroke(inkStroke);
+                    // These batches contain only candidate handwriting. Prevent the analyzer from
+                    // discarding headers or small lettering as diagrams/shapes.
+                    analyzer.SetStrokeDataKind(inkStroke.Id, InkAnalysisStrokeKind.Writing);
+                }
             }
+            finally
+            {
+                CultureInfo.CurrentCulture = previousCulture;
+            }
+
+            if (analyzer.AnalysisRoot.Children.Count == 0) return HandwritingRecognitionResult.Empty;
+            var result = await analyzer.AnalyzeAsync();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result.Status != InkAnalysisStatus.Updated) return HandwritingRecognitionResult.Empty;
+            var words = analyzer.AnalysisRoot
+                .FindNodes(InkAnalysisNodeKind.InkWord)
+                .OfType<InkAnalysisInkWord>()
+                .Where(word => !string.IsNullOrWhiteSpace(word.RecognizedText))
+                .ToArray();
+            return new HandwritingRecognitionResult(
+                string.Join(" ", words.Select(word => word.RecognizedText)),
+                words.Select(word => new RecognizedTextRegion
+                {
+                    Text = word.RecognizedText.Trim(),
+                    Bounds = new RectD(
+                        (word.BoundingRect.X - padding) / analysisScale + minX,
+                        (word.BoundingRect.Y - padding) / analysisScale + minY,
+                        word.BoundingRect.Width / analysisScale,
+                        word.BoundingRect.Height / analysisScale)
+                }).ToArray());
         }
         finally
         {
-            CultureInfo.CurrentCulture = previousCulture;
+            // InkAnalyzer retains native stroke data after analysis. Explicitly clear each
+            // short-lived batch so idle indexing cannot evict the interactive render cache.
+            analyzer.ClearDataForAllStrokes();
         }
-
-        if (analyzer.AnalysisRoot.Children.Count == 0) return HandwritingRecognitionResult.Empty;
-        var result = await analyzer.AnalyzeAsync();
-        cancellationToken.ThrowIfCancellationRequested();
-        if (result.Status != InkAnalysisStatus.Updated) return HandwritingRecognitionResult.Empty;
-        var words = analyzer.AnalysisRoot
-            .FindNodes(InkAnalysisNodeKind.InkWord)
-            .OfType<InkAnalysisInkWord>()
-            .Where(word => !string.IsNullOrWhiteSpace(word.RecognizedText))
-            .ToArray();
-        return new HandwritingRecognitionResult(
-            string.Join(" ", words.Select(word => word.RecognizedText)),
-            words.Select(word => new RecognizedTextRegion
-            {
-                Text = word.RecognizedText.Trim(),
-                Bounds = new RectD(
-                    (word.BoundingRect.X - padding) / analysisScale + minX,
-                    (word.BoundingRect.Y - padding) / analysisScale + minY,
-                    word.BoundingRect.Width / analysisScale,
-                    word.BoundingRect.Height / analysisScale)
-            }).ToArray());
     }
 }

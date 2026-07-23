@@ -36,5 +36,22 @@ public sealed class RenderScalePolicyTests
         Assert.Equal(1, RenderScalePolicy.ComputeSnapshotScale(double.NaN, 100, 1024));
         Assert.False(RenderScalePolicy.HasNativeDisplayResolution(2, 1, 0));
         Assert.Equal(0, RenderScalePolicy.EstimateSnapshotBytes(-1, 100, 2));
+        Assert.Equal(1, RenderScalePolicy.ComputeNativeTileScale(double.NaN, 96));
+    }
+
+    [Theory]
+    [InlineData(0.826, 288)]
+    [InlineData(1.0, 96)]
+    [InlineData(2.4, 192)]
+    public void NativeTileScaleNeverUndersamplesAndStaysInOneBucketStep(
+        double zoom,
+        double dpi)
+    {
+        const double step = 1.25;
+        var required = zoom * dpi / RenderScalePolicy.BaselineDpi;
+        var scale = RenderScalePolicy.ComputeNativeTileScale(zoom, dpi, step);
+
+        Assert.True(scale + 1e-9 >= required);
+        Assert.True(scale <= required * step + 1e-9);
     }
 }

@@ -50,4 +50,23 @@ public static class RenderScalePolicy
         var requiredScale = zoom * displayDpi / BaselineDpi;
         return snapshotScale * Math.Max(1d, tolerance) >= requiredScale;
     }
+
+    /// <summary>
+    /// Rounds the required physical-pixel scale upward to a stable bucket. Tiles remain
+    /// native-resolution throughout the bucket while small zoom changes do not discard the
+    /// entire working set.
+    /// </summary>
+    public static double ComputeNativeTileScale(
+        double zoom,
+        double displayDpi,
+        double scaleStep = 1.25d)
+    {
+        if (!double.IsFinite(zoom) || !double.IsFinite(displayDpi) ||
+            !double.IsFinite(scaleStep) || zoom <= 0 || displayDpi <= 0 || scaleStep <= 1)
+            return 1;
+
+        var requiredScale = zoom * displayDpi / BaselineDpi;
+        var exponent = Math.Ceiling(Math.Log(requiredScale) / Math.Log(scaleStep) - 1e-10);
+        return Math.Max(1d / 16d, Math.Pow(scaleStep, exponent));
+    }
 }
