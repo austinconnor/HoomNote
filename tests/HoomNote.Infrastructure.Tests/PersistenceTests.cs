@@ -369,6 +369,48 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public void SamsungNotesBulkDiscovery_FindsNotesRecursivelyAndPreservesFolders()
+    {
+        var root = Path.Combine(_root, "Samsung export");
+        var anatomy = Path.Combine(root, "School", "Anatomy");
+        Directory.CreateDirectory(anatomy);
+        File.WriteAllBytes(Path.Combine(root, "Loose.sdocx"), []);
+        File.WriteAllBytes(Path.Combine(anatomy, "Week 1.SDOCX"), []);
+        File.WriteAllText(Path.Combine(anatomy, "ignore.pdf"), "not a Samsung note");
+
+        var discovered = SamsungNotesBulkImportDiscovery.DiscoverFolder(root);
+
+        Assert.Collection(discovered,
+            item =>
+            {
+                Assert.Equal(string.Empty, item.RelativeFolder);
+                Assert.Equal("Loose.sdocx", Path.GetFileName(item.SourcePath));
+            },
+            item =>
+            {
+                Assert.Equal(Path.Combine("School", "Anatomy"), item.RelativeFolder);
+                Assert.Equal("Week 1.SDOCX", Path.GetFileName(item.SourcePath));
+            });
+    }
+
+    [Fact]
+    public void SamsungNotesBulkDiscovery_FindsInstalledWindowsLocalState()
+    {
+        var localAppData = Path.Combine(_root, "LocalAppData");
+        var notes = Path.Combine(localAppData, "Packages",
+            "SAMSUNGELECTRONICSCoLtd.SamsungNotes_test", "LocalState", "Course");
+        Directory.CreateDirectory(notes);
+        File.WriteAllBytes(Path.Combine(notes, "Lecture.sdocx"), []);
+
+        var discovered = SamsungNotesBulkImportDiscovery.DiscoverInstalledLibrary(localAppData);
+
+        var source = Assert.Single(discovered);
+        Assert.Equal("Lecture.sdocx", Path.GetFileName(source.SourcePath));
+        Assert.EndsWith(Path.Combine("LocalState", "Course"), source.RelativeFolder,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task SamsungNotesImport_RealSamplesPreserveFidelityWhenAvailable()
     {
         var cases = new[]

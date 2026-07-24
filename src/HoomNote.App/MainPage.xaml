@@ -43,30 +43,30 @@
                 </StackPanel>
                 <Border Grid.Column="1" Width="1" Height="24" Margin="8,0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{StaticResource HoomNoteBorderBrush}" />
                 <StackPanel x:Name="ToolButtons" Grid.Column="1" Margin="17,0,0,0" Orientation="Horizontal" Spacing="4">
-                    <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="18" /></ToggleButton>
-                    <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)"><FontIcon Glyph="&#xE76D;" FontSize="18" /></ToggleButton>
+                    <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="16" /></ToggleButton>
+                    <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)"><FontIcon Glyph="&#xE76D;" FontSize="16" /></ToggleButton>
                     <ToggleButton Tag="Highlighter" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Highlighter (H)">
-                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                        <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
                             <Path Data="M6,15 L14.5,6.5 L19,11 L10.5,19.5 L6,19.5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.9" StrokeLineJoin="Round" />
                             <Path Data="M4,22 L20,22" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.8" />
                         </Canvas></Viewbox>
                     </ToggleButton>
                     <ToggleButton Tag="StrokeEraser" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Erase whole strokes (E)">
-                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                        <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
                             <Path Data="M4,18 L12,5 L21,11 L14,21 L8,21 Z" Fill="{StaticResource HoomNotePanelRaisedBrush}" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeLineJoin="Round" />
                             <Path Data="M4,4 L20,4" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.3" />
                             <Path Data="M6,2 L6,6 M10,2 L10,6 M14,2 L14,6 M18,2 L18,6" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.2" />
                         </Canvas></Viewbox>
                     </ToggleButton>
                     <ToggleButton Tag="Lasso" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Freeform lasso (L)">
-                        <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                        <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
                             <Path Data="M5,5 C1,9 3,18 11,20 C20,22 23,14 19,7 C16,2 8,2 5,5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeDashArray="1.4,1.5" />
                             <Path Data="M15,18 C17,19 19,21 21,23" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.8" />
                         </Canvas></Viewbox>
                     </ToggleButton>
                     <Button x:Name="MoreToolsButton" Width="40" Height="40" Padding="8" CornerRadius="8"
                             ToolTipService.ToolTip="More tools">
-                        <FontIcon Glyph="&#xE712;" FontSize="18" />
+                        <FontIcon Glyph="&#xE712;" FontSize="16" />
                         <Button.Flyout>
                             <MenuFlyout>
                                 <MenuFlyoutItem Text="Style brush" Tag="Style" Click="OnOverflowToolClick" />
@@ -75,6 +75,32 @@
                                 <MenuFlyoutItem Text="Shapes" Tag="Shape" Click="OnOverflowToolClick" />
                                 <MenuFlyoutItem Text="Box selection" Tag="BoxSelect" Click="OnOverflowToolClick" />
                             </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+                    <Button x:Name="QuickInkSettingsButton" Width="44" Height="40" Padding="3" CornerRadius="8"
+                            ToolTipService.ToolTip="Pen size and color">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="1">
+                            <Border x:Name="QuickInkColorSwatch" Width="14" Height="14" CornerRadius="7"
+                                    Background="#111111" BorderBrush="#88FFFFFF" BorderThickness="1" />
+                            <TextBlock x:Name="QuickInkWidthText" Text="2.4" FontSize="9"
+                                       HorizontalAlignment="Center" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        </StackPanel>
+                        <Button.Flyout>
+                            <Flyout>
+                                <StackPanel Width="250" Spacing="10">
+                                    <TextBlock x:Name="QuickInkSettingsTitle" Text="Pen settings"
+                                               FontWeight="SemiBold" />
+                                    <NumberBox x:Name="QuickStrokeWidthBox" Header="Size" Minimum="0.1" Maximum="24"
+                                               SmallChange="0.1" LargeChange="1" Value="2.4"
+                                               SpinButtonPlacementMode="Compact"
+                                               ValueChanged="OnQuickStrokeWidthChanged" />
+                                    <TextBlock Text="Color" FontSize="12"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                    <ColorPicker x:Name="QuickInkColorPicker" IsAlphaEnabled="False"
+                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
+                                                 ColorChanged="OnQuickInkColorChanged" />
+                                </StackPanel>
+                            </Flyout>
                         </Button.Flyout>
                     </Button>
                 </StackPanel>
@@ -104,10 +130,19 @@
                     <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnAddImageClick" ToolTipService.ToolTip="Add image">
                         <FontIcon Glyph="&#xEB9F;" FontSize="16" />
                     </Button>
-                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnImportClick" ToolTipService.ToolTip="Import (Ctrl+O)">
+                    <Button Width="40" Height="40" Padding="8" CornerRadius="8" ToolTipService.ToolTip="Import">
                         <FontIcon Glyph="&#xE8B5;" FontSize="16" RenderTransformOrigin="0.5,0.5">
                             <FontIcon.RenderTransform><RotateTransform Angle="90" /></FontIcon.RenderTransform>
                         </FontIcon>
+                        <Button.Flyout>
+                            <MenuFlyout>
+                                <MenuFlyoutItem Text="Import into current notebook…" Click="OnImportClick" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick" />
+                                <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick" />
+                                <MenuFlyoutItem Text="Import installed Samsung Notes…" Click="OnImportInstalledSamsungNotesClick" />
+                            </MenuFlyout>
+                        </Button.Flyout>
                     </Button>
                     <Button Width="40" Height="40" Padding="8" CornerRadius="8" Click="OnExportClick" ToolTipService.ToolTip="Export (Ctrl+E)">
                         <FontIcon Glyph="&#xEDE1;" FontSize="16" RenderTransformOrigin="0.5,0.5">
@@ -126,7 +161,10 @@
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Read mode" Click="OnReadModeClick" />
                             <MenuFlyoutItem Text="Add image" Click="OnAddImageClick" />
-                            <MenuFlyoutItem Text="Import" Click="OnImportClick" />
+                            <MenuFlyoutItem Text="Import into current notebook…" Click="OnImportClick" />
+                            <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick" />
+                            <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick" />
+                            <MenuFlyoutItem Text="Import installed Samsung Notes…" Click="OnImportInstalledSamsungNotesClick" />
                             <MenuFlyoutItem Text="Export" Click="OnExportClick" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Check for updates" Click="OnCheckForUpdatesClick" />
@@ -399,8 +437,8 @@
                                 <ColorPicker x:Name="StyleColorPicker" IsAlphaEnabled="False"
                                              IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
                                              ColorChanged="OnStyleToolColorChanged" />
-                                <Slider x:Name="StyleWidthSlider" Header="Thickness" Minimum="0.5" Maximum="48"
-                                        Value="2.4" StepFrequency="0.5" ValueChanged="OnStyleToolWidthChanged" />
+                                <Slider x:Name="StyleWidthSlider" Header="Thickness" Minimum="0.1" Maximum="48"
+                                        Value="2.4" StepFrequency="0.1" ValueChanged="OnStyleToolWidthChanged" />
                             </StackPanel>
                         </Border>
                         <ToggleSwitch x:Name="TemporaryGridToggle" Header="Temporary grid" OffContent="Hidden" OnContent="Visible"
@@ -425,7 +463,7 @@
                                 <TextBlock x:Name="StrokeWidthValue" Text="2.4" FontWeight="SemiBold" />
                             </Border>
                         </Grid>
-                        <Slider x:Name="StrokeWidthSlider" Minimum="0.5" Maximum="24" Value="2.4" StepFrequency="0.5" ValueChanged="OnInkSliderValueChanged" />
+                        <Slider x:Name="StrokeWidthSlider" Minimum="0.1" Maximum="24" Value="2.4" StepFrequency="0.1" ValueChanged="OnInkSliderValueChanged" />
                         <Button x:Name="InkColorButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
                             <StackPanel Orientation="Horizontal" Spacing="10">
                                 <Border x:Name="InkColorSwatch" Width="18" Height="18" CornerRadius="9" Background="#111111"
@@ -491,8 +529,8 @@
                         <TextBlock Text="Object" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                         <TextBlock x:Name="SelectionSummary" Text="Nothing selected" TextWrapping="Wrap" />
                         <StackPanel x:Name="SelectionStylePanel" Visibility="Collapsed" Spacing="8">
-                            <Slider x:Name="SelectionWidthSlider" Header="Selected thickness" Minimum="0.5" Maximum="48"
-                                    Value="2.4" StepFrequency="0.5" />
+                            <Slider x:Name="SelectionWidthSlider" Header="Selected thickness" Minimum="0.1" Maximum="48"
+                                    Value="2.4" StepFrequency="0.1" />
                             <ColorPicker x:Name="SelectionColorPicker" IsAlphaEnabled="False" IsAlphaSliderVisible="False"
                                          IsAlphaTextInputVisible="False" />
                             <Button Content="Apply selected style" Click="OnApplySelectionStyleClick" HorizontalAlignment="Stretch" />

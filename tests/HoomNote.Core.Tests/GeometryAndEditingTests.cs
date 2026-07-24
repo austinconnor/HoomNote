@@ -266,6 +266,13 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void InkStyleNormalize_PreservesTenthPointPenSizes()
+    {
+        Assert.Equal(0.1f, new InkStyle { Width = 0.1f }.Normalize().Width, 3);
+        Assert.Equal(0.1f, new InkStyle { Width = 0.01f }.Normalize().Width, 3);
+    }
+
+    [Fact]
     public void ConstantWidthPen_UsesFastRoundedCenterlineAtAnyThickness()
     {
         var style = new InkStyle

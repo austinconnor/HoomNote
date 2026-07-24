@@ -41,7 +41,7 @@ public sealed record InkStyle
 
     public InkStyle Normalize() => this with
     {
-        Width = Math.Clamp(float.IsFinite(Width) ? Width : 2.4f, 0.25f, 96f),
+        Width = Math.Clamp(float.IsFinite(Width) ? Width : 2.4f, 0.1f, 96f),
         // Pen and pencil are opaque pigments. Alpha accumulation changes their selected color
         // wherever strokes overlap; only the highlighter intentionally uses translucent ink.
         Opacity = Tool == InkToolKind.Highlighter

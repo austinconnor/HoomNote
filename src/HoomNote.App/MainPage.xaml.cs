@@ -155,7 +155,8 @@ public sealed partial class MainPage : Page
         double Width,
         double Height,
         float Dpi,
-        bool InteractionActive);
+        bool InteractionActive,
+        int EditVersion);
     private readonly Dictionary<Guid, StrokeGeometryCacheEntry> _strokeGeometryCache = [];
     private readonly LinkedList<Guid> _strokeGeometryLru = [];
     private readonly Dictionary<Guid, LinkedListNode<Guid>> _strokeGeometryLruNodes = [];
@@ -187,11 +188,13 @@ public sealed partial class MainPage : Page
     private int _pageRenderInvalidationRequested;
     private int _strokeGeometryClearRequested;
     private int _navigationTileClearRequested;
+    private int _erasePreviewCommitVersion = -1;
+    private int _erasePreviewRetireQueued;
     private double _canvasWidth = 1;
     private double _canvasHeight = 1;
     private float _canvasDpi = 96;
     private PageRenderState _publishedPageRenderState =
-        new(null, 1, Vector2.Zero, 1, 1, 96, false);
+        new(null, 1, Vector2.Zero, 1, 1, 96, false, 0);
     private NotePage? _publishedPageSnapshot;
     private int _publishedPageEditVersion = -1;
     private readonly MenuFlyout _notebookContextMenu = new();
@@ -293,6 +296,7 @@ public sealed partial class MainPage : Page
     private bool _loading;
     private bool _updatingTabs;
     private bool _syncingInkColor;
+    private bool _syncingInkWidth;
     private bool _syncingTextEditor;
     private bool _requiresFullSave;
     private int _fullSaveVersion;
@@ -1231,6 +1235,8 @@ public sealed partial class MainPage : Page
         _searchLocateCancellation?.Cancel();
         _searchFlashBounds.Clear();
         _searchFlashStarted = 0;
+        _eraseDirtyRegions.Clear();
+        Volatile.Write(ref _erasePreviewCommitVersion, -1);
         _page = page;
         ClearStrokeGeometryCache();
         _selectedObject = null;
@@ -1351,7 +1357,8 @@ public sealed partial class MainPage : Page
             _canvasWidth,
             _canvasHeight,
             _canvasDpi,
-            interactionActive));
+            interactionActive,
+            _publishedPageEditVersion));
     }
 
     private void OnCanvasCreateResources(CanvasControl sender, CanvasCreateResourcesEventArgs args)
@@ -1404,7 +1411,24 @@ public sealed partial class MainPage : Page
                 DrawCachedPage(PageSurface.Device, drawingSession, page, state);
             }
             RecordCanvasFrame(frameStarted);
+            RequestErasePreviewRetire(state.EditVersion);
         }
+    }
+
+    private void RequestErasePreviewRetire(int renderedEditVersion)
+    {
+        var targetVersion = Volatile.Read(ref _erasePreviewCommitVersion);
+        if (targetVersion < 0 || renderedEditVersion < targetVersion ||
+            Interlocked.Exchange(ref _erasePreviewRetireQueued, 1) != 0) return;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            Interlocked.Exchange(ref _erasePreviewRetireQueued, 0);
+            var currentTarget = Volatile.Read(ref _erasePreviewCommitVersion);
+            if (_isPointerDown || currentTarget < 0 || renderedEditVersion < currentTarget) return;
+            _eraseDirtyRegions.Clear();
+            Volatile.Write(ref _erasePreviewCommitVersion, -1);
+            DrawingSurface.Invalidate();
+        });
     }
 
     private void ApplyPendingPageRenderInvalidations()
@@ -1450,8 +1474,9 @@ public sealed partial class MainPage : Page
         drawingSession.Transform = PageTransform();
         var styleBrushPreview = _isPointerDown && _gestureTool == EditorTool.Style && !_styleToolPickMode;
 
-        if (_isPointerDown && _gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser &&
-            _eraseDirtyRegions.Count > 0)
+        if (_eraseDirtyRegions.Count > 0 &&
+            (_gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser ||
+             Volatile.Read(ref _erasePreviewCommitVersion) >= 0))
             DrawRealtimeErasePreview(drawingSession, _page);
 
         if (styleBrushPreview)
@@ -2730,6 +2755,7 @@ public sealed partial class MainPage : Page
         ClearLiveInkGeometryCache();
         _eraserPath.Clear();
         _eraseDirtyRegions.Clear();
+        Volatile.Write(ref _erasePreviewCommitVersion, -1);
         _eraseSnapshot = _gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser
             ? [.. _page.Objects]
             : null;
@@ -2969,13 +2995,15 @@ public sealed partial class MainPage : Page
 
     private void EndPointer(PointerRoutedEventArgs e, bool releaseCapture = true)
     {
+        var retainErasePreview = _eraseDirtyRegions.Count > 0 &&
+                                 Volatile.Read(ref _erasePreviewCommitVersion) >= 0;
         _isPointerDown = false;
         _penActive = false;
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         _activeInk.Clear();
         ClearLiveInkGeometryCache();
         _eraserPath.Clear();
-        _eraseDirtyRegions.Clear();
+        if (!retainErasePreview) _eraseDirtyRegions.Clear();
         _transformOriginal = null;
         _transformPreview = null;
         _multiTransformOriginals = null;
@@ -3636,9 +3664,9 @@ public sealed partial class MainPage : Page
         {
             using var layer = drawingSession.CreateLayer(1f,
                 new Rect(region.X, region.Y, region.Width, region.Height));
-            DrawPageBackground(drawingSession, page);
+            DrawPageBackground(drawingSession, page, region);
             DrawImportedLayer(drawingSession, page);
-            if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page);
+            if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, region);
             foreach (var canvasObject in _spatialIndex.Query(region))
                 if (!canvasObject.IsHidden) DrawObject(drawingSession, canvasObject);
         }
@@ -3654,6 +3682,8 @@ public sealed partial class MainPage : Page
         _history.Execute(new ReplaceObjectsCommand(_page.Id, _eraseSnapshot, after,
             _gestureTool == EditorTool.SegmentEraser ? "Erase ink segments" : "Erase objects"), _document);
         OnDocumentChanged(recognizeInk: true);
+        if (_eraseDirtyRegions.Count > 0)
+            Volatile.Write(ref _erasePreviewCommitVersion, _editVersion);
     }
 
     private void RestoreEraseSnapshot()
@@ -3663,6 +3693,7 @@ public sealed partial class MainPage : Page
         _page.Objects.AddRange(_eraseSnapshot);
         _spatialIndex.Rebuild(_page.Objects);
         _eraseDirtyRegions.Clear();
+        Volatile.Write(ref _erasePreviewCommitVersion, -1);
         InvalidatePageRenderCache();
         InvalidateCanvas();
     }
@@ -4675,6 +4706,9 @@ public sealed partial class MainPage : Page
             SetInkColor(_penColor, rememberForTool: false);
         }
         InkColorLabel.Text = _colorTool == EditorTool.Highlighter ? "Highlighter color" : "Pen color";
+        QuickInkSettingsTitle.Text = _colorTool == EditorTool.Highlighter
+            ? "Highlighter settings"
+            : "Pen settings";
         foreach (var toggle in ToolButtons.Children.OfType<ToggleButton>())
             toggle.IsChecked = selected is not null ? toggle == selected : string.Equals(toggle.Tag as string, tool.ToString(), StringComparison.Ordinal);
         MoreToolsButton.Background = tool is EditorTool.Style or EditorTool.SegmentEraser or EditorTool.Text or
@@ -4757,7 +4791,37 @@ public sealed partial class MainPage : Page
 
     private void OnInkSliderValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
-        if (StrokeWidthValue is not null) StrokeWidthValue.Text = $"{StrokeWidthSlider.Value:0.#}";
+        var text = $"{StrokeWidthSlider.Value:0.#}";
+        if (StrokeWidthValue is not null) StrokeWidthValue.Text = text;
+        if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
+        if (!_syncingInkWidth && QuickStrokeWidthBox is not null &&
+            Math.Abs(QuickStrokeWidthBox.Value - StrokeWidthSlider.Value) > 0.0001)
+        {
+            _syncingInkWidth = true;
+            QuickStrokeWidthBox.Value = StrokeWidthSlider.Value;
+            _syncingInkWidth = false;
+        }
+    }
+
+    private void OnQuickStrokeWidthChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingInkWidth) return;
+        var value = double.IsFinite(args.NewValue)
+            ? Math.Clamp(Math.Round(args.NewValue, 1), 0.1, 24)
+            : StrokeWidthSlider.Value;
+        _syncingInkWidth = true;
+        sender.Value = value;
+        StrokeWidthSlider.Value = value;
+        _syncingInkWidth = false;
+        var text = $"{value:0.#}";
+        StrokeWidthValue.Text = text;
+        QuickInkWidthText.Text = text;
+    }
+
+    private void OnQuickInkColorChanged(ColorPicker sender, ColorChangedEventArgs args)
+    {
+        if (_syncingInkColor) return;
+        SetInkColor($"#{args.NewColor.R:X2}{args.NewColor.G:X2}{args.NewColor.B:X2}");
     }
 
     private void OnSliderReadoutPointerPressed(object sender, PointerRoutedEventArgs e)
@@ -5341,14 +5405,14 @@ public sealed partial class MainPage : Page
             FrameworkElement swatch = preset.Tool == nameof(EditorTool.Highlighter)
                 ? new Border
                 {
-                    Width = 30, Height = 16, CornerRadius = new CornerRadius(4),
+                    Width = 26, Height = 14, CornerRadius = new CornerRadius(4),
                     Background = new SolidColorBrush(ParseColor(preset.Color)),
                     BorderBrush = new SolidColorBrush(Color.FromArgb(120, 255, 255, 255)),
                     BorderThickness = new Thickness(1)
                 }
                 : new Microsoft.UI.Xaml.Shapes.Ellipse
                 {
-                    Width = 28, Height = 28,
+                    Width = 24, Height = 24,
                     Fill = new SolidColorBrush(ParseColor(preset.Color)),
                     Stroke = new SolidColorBrush(Color.FromArgb(140, 255, 255, 255)),
                     StrokeThickness = 1
@@ -5358,8 +5422,8 @@ public sealed partial class MainPage : Page
             {
                 Tag = preset.Id,
                 CanDrag = true,
-                Width = 10,
-                Height = 30,
+                Width = 9,
+                Height = 28,
                 HorizontalAlignment = HorizontalAlignment.Left,
                 CornerRadius = new CornerRadius(5),
                 Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0))
@@ -5376,8 +5440,8 @@ public sealed partial class MainPage : Page
                 Tag = preset.Id,
                 Child = content,
                 CanDrag = false,
-                Width = 40,
-                Height = 38,
+                Width = 36,
+                Height = 34,
                 Padding = new Thickness(2),
                 CornerRadius = new CornerRadius(7),
                 Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0)),
@@ -5822,6 +5886,200 @@ public sealed partial class MainPage : Page
             ScheduleDocumentHandwritingIndex(_document);
         }
         catch (Exception exception) { ShowError("Import failed.", exception); }
+    }
+
+    private async void OnImportSamsungFilesClick(object sender, RoutedEventArgs e)
+    {
+        if (_importService is null || _repository is null || App.MainAppWindow is null) return;
+        try
+        {
+            var picker = new FileOpenPicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(picker,
+                WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+            picker.FileTypeFilter.Add(".sdocx");
+            var files = await picker.PickMultipleFilesAsync();
+            if (files.Count == 0) return;
+            var sources = files
+                .Select(file => new SamsungNoteImportSource(file.Path, string.Empty))
+                .ToArray();
+            await ImportSamsungNotesBatchAsync(sources, rootFolderName: null);
+        }
+        catch (Exception exception) { ShowError("Samsung Notes files could not be imported.", exception); }
+    }
+
+    private async void OnImportSamsungFolderClick(object sender, RoutedEventArgs e)
+    {
+        if (_importService is null || _repository is null || App.MainAppWindow is null) return;
+        try
+        {
+            var picker = new FolderPicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(picker,
+                WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+            picker.FileTypeFilter.Add("*");
+            var folder = await picker.PickSingleFolderAsync();
+            if (folder is null) return;
+            StatusText.Text = "Scanning Samsung Notes folder…";
+            var sources = await Task.Run(() =>
+                SamsungNotesBulkImportDiscovery.DiscoverFolder(folder.Path));
+            var rootName = Path.GetFileName(folder.Path.TrimEnd(
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            await ImportSamsungNotesBatchAsync(sources,
+                string.IsNullOrWhiteSpace(rootName) ? "Samsung Notes import" : rootName);
+        }
+        catch (Exception exception) { ShowError("Samsung Notes folder could not be imported.", exception); }
+    }
+
+    private async void OnImportInstalledSamsungNotesClick(object sender, RoutedEventArgs e)
+    {
+        if (_importService is null || _repository is null) return;
+        try
+        {
+            StatusText.Text = "Scanning installed Samsung Notes storage…";
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var sources = await Task.Run(() =>
+                SamsungNotesBulkImportDiscovery.DiscoverInstalledLibrary(localAppData));
+            if (sources.Count == 0)
+            {
+                ImportInfo.Title = "No importable Samsung Notes cache found";
+                ImportInfo.Message =
+                    "Samsung does not expose its live note database as a public SDOCX library. " +
+                    "In Samsung Notes, select notes and use Save as file → Samsung Notes file, " +
+                    "then choose Import Samsung Notes files or folder here.";
+                ImportInfo.Severity = InfoBarSeverity.Informational;
+                ImportInfo.IsOpen = true;
+                StatusText.Text = "No SDOCX files found in Samsung Notes local storage";
+                return;
+            }
+            await ImportSamsungNotesBatchAsync(sources, "Samsung Notes");
+        }
+        catch (Exception exception) { ShowError("Installed Samsung Notes data could not be imported.", exception); }
+    }
+
+    private async Task ImportSamsungNotesBatchAsync(
+        IReadOnlyList<SamsungNoteImportSource> sources,
+        string? rootFolderName)
+    {
+        if (_importService is null || _repository is null) return;
+        var uniqueSources = sources
+            .Where(source => File.Exists(source.SourcePath))
+            .GroupBy(source => Path.GetFullPath(source.SourcePath), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        if (uniqueSources.Length == 0)
+        {
+            ImportInfo.Title = "No Samsung Notes files found";
+            ImportInfo.Message = "Choose a folder containing exported .sdocx files.";
+            ImportInfo.Severity = InfoBarSeverity.Informational;
+            ImportInfo.IsOpen = true;
+            StatusText.Text = "No Samsung Notes files found";
+            return;
+        }
+
+        await SaveNowAsync();
+        PauseBackgroundRecognition();
+        PauseThumbnailRefresh();
+        var importedIds = new List<Guid>();
+        var warnings = new List<string>();
+        var failures = new List<string>();
+        try
+        {
+            var importRootId = string.IsNullOrWhiteSpace(rootFolderName)
+                ? _selectedFolderId
+                : EnsureImportFolder(rootFolderName, _selectedFolderId);
+            for (var index = 0; index < uniqueSources.Length; index++)
+            {
+                var source = uniqueSources[index];
+                var fileName = Path.GetFileName(source.SourcePath);
+                StatusText.Text = $"Importing Samsung note {index + 1} of {uniqueSources.Length} • {fileName}";
+                try
+                {
+                    var result = await _importService.ImportAsync(new ImportRequest(source.SourcePath));
+                    var document = HoomNoteDocument.Create(
+                        Path.GetFileNameWithoutExtension(source.SourcePath),
+                        DocumentKind.PagedNotebook);
+                    foreach (var page in result.Pages)
+                    {
+                        document.Pages.Add(page);
+                        document.Sections[0].PageIds.Add(page.Id);
+                    }
+                    if (document.Pages.FirstOrDefault() is { } firstPage)
+                    {
+                        document.Settings = document.Settings with
+                        {
+                            DefaultPageTemplateKind = firstPage.Template.Kind,
+                            DefaultPaperColor = firstPage.Template.PaperColor
+                        };
+                    }
+                    var modified = File.GetLastWriteTimeUtc(source.SourcePath);
+                    if (modified > DateTime.MinValue) document.UpdatedAt = modified;
+                    await _repository.SaveAsync(document);
+
+                    var destinationFolder = EnsureImportFolderPath(
+                        source.RelativeFolder, importRootId);
+                    if (destinationFolder is { } folderId)
+                        _userPreferences.DocumentFolders[document.Id.ToString("D")] =
+                            folderId.ToString("D");
+                    _userPreferences.NotebookOrder.Add(document.Id.ToString("D"));
+                    importedIds.Add(document.Id);
+                    warnings.AddRange(result.Warnings.Select(warning => $"{fileName}: {warning}"));
+                    DiagnosticsLog.Info("samsung_bulk_import.file_complete",
+                        ("pages", result.Pages.Count), ("has_folder", destinationFolder is not null));
+                }
+                catch (Exception exception)
+                {
+                    failures.Add($"{fileName}: {exception.Message}");
+                    DiagnosticsLog.Error("samsung_bulk_import.file_failed", exception,
+                        ("file", fileName));
+                }
+            }
+
+            await PersistUserPreferencesAsync($"Imported {importedIds.Count} Samsung note(s)");
+            await RefreshLibraryAsync();
+            if (importedIds.FirstOrDefault() is { } firstId && firstId != Guid.Empty)
+            {
+                await LoadDocumentAsync(firstId);
+                SelectLibraryDocument(firstId);
+            }
+            ImportInfo.Title = failures.Count == 0
+                ? $"Imported {importedIds.Count} Samsung note(s)"
+                : $"Imported {importedIds.Count} of {uniqueSources.Length} Samsung note(s)";
+            ImportInfo.Message = failures.Count > 0
+                ? string.Join(Environment.NewLine, failures.Take(5))
+                : warnings.Count > 0
+                    ? string.Join(" ", warnings.Take(5))
+                    : "Each SDOCX file is now an editable notebook. Source folders were preserved.";
+            ImportInfo.Severity = failures.Count > 0
+                ? InfoBarSeverity.Warning
+                : InfoBarSeverity.Success;
+            ImportInfo.IsOpen = true;
+            StatusText.Text = $"Samsung Notes import complete • {importedIds.Count} notebook(s)";
+        }
+        finally
+        {
+            ResumeBackgroundRecognition();
+            ResumeThumbnailRefresh();
+        }
+    }
+
+    private Guid EnsureImportFolder(string name, Guid? parentId)
+    {
+        var existing = _userPreferences.NotebookFolders.FirstOrDefault(folder =>
+            folder.ParentId == parentId &&
+            folder.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (existing is not null) return existing.Id;
+        var created = new NotebookFolderPreference { ParentId = parentId, Name = name };
+        _userPreferences.NotebookFolders.Add(created);
+        return created.Id;
+    }
+
+    private Guid? EnsureImportFolderPath(string relativeFolder, Guid? parentId)
+    {
+        var current = parentId;
+        foreach (var segment in relativeFolder.Split(
+                     [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                     StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            current = EnsureImportFolder(segment, current);
+        return current;
     }
 
     private async void OnExportClick(object sender, RoutedEventArgs e)
@@ -6486,13 +6744,15 @@ public sealed partial class MainPage : Page
             ScheduleUserPreferencesSave();
         }
         var parsed = ParseColor(_inkColor);
-        if (InkColorPicker.Color != parsed)
+        if (InkColorPicker.Color != parsed || QuickInkColorPicker.Color != parsed)
         {
             _syncingInkColor = true;
             InkColorPicker.Color = parsed;
+            QuickInkColorPicker.Color = parsed;
             _syncingInkColor = false;
         }
         InkColorSwatch.Background = new SolidColorBrush(parsed);
+        QuickInkColorSwatch.Background = new SolidColorBrush(parsed);
     }
 
     private void LoadSavedColorPalette()
