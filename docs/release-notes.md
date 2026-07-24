@@ -1,6 +1,3 @@
-# HoomNote 0.6.2
+# HoomNote 0.6.3
 
-- Left-aligns saved pen and highlighter presets in the toolbar.
-- Displays only the current application version in the lower-left library area.
-- Sources the displayed version from build metadata so future releases update it
-  automatically.
+- Adds clearer spacing between the primary toolbar tools.

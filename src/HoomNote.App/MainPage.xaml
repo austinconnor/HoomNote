@@ -42,7 +42,7 @@
                     </Button>
                 </StackPanel>
                 <Border Grid.Column="1" Width="1" Height="24" Margin="8,0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{StaticResource HoomNoteBorderBrush}" />
-                <StackPanel x:Name="ToolButtons" Grid.Column="1" Margin="17,0,0,0" Orientation="Horizontal" Spacing="1">
+                <StackPanel x:Name="ToolButtons" Grid.Column="1" Margin="17,0,0,0" Orientation="Horizontal" Spacing="4">
                     <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="18" /></ToggleButton>
                     <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)"><FontIcon Glyph="&#xE76D;" FontSize="18" /></ToggleButton>
                     <ToggleButton Tag="Highlighter" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Highlighter (H)">
