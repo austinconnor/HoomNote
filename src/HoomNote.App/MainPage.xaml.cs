@@ -363,6 +363,7 @@ public sealed partial class MainPage : Page
     public MainPage()
     {
         InitializeComponent();
+        VersionText.Text = DisplayVersion();
         PresetScrollViewer.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnPresetScrollWheelChanged), handledEventsToo: true);
         _saveTimer = DispatcherQueue.CreateTimer();
@@ -394,6 +395,14 @@ public sealed partial class MainPage : Page
             InvalidatePageRenderCache();
             InvalidateCanvas();
         });
+    }
+
+    private static string DisplayVersion()
+    {
+        var version = typeof(MainPage).Assembly.GetName().Version;
+        return version is null
+            ? string.Empty
+            : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
     }
 
     private async void OnLoaded(object sender, RoutedEventArgs e)

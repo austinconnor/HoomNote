@@ -79,10 +79,12 @@
                     </Button>
                 </StackPanel>
                 <ScrollViewer x:Name="PresetScrollViewer" Grid.Column="2" MinWidth="120" MaxWidth="420" Margin="14,0,10,0"
+                              HorizontalAlignment="Left" HorizontalContentAlignment="Left"
                               HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Hidden"
                               VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled"
                               IsHorizontalRailEnabled="True" IsVerticalRailEnabled="False" ZoomMode="Disabled">
-                    <StackPanel x:Name="PresetToolButtons" Orientation="Horizontal" Spacing="5" AllowDrop="True"
+                    <StackPanel x:Name="PresetToolButtons" Orientation="Horizontal" Spacing="5"
+                                HorizontalAlignment="Left" AllowDrop="True"
                                 DragOver="OnPresetToolbarDragOver" Drop="OnPresetToolbarDrop" />
                 </ScrollViewer>
                 <StackPanel x:Name="ToolbarSecondaryActions" Grid.Column="3" Orientation="Horizontal" Spacing="2">
@@ -247,7 +249,7 @@
                     <StackPanel Grid.Row="5" Spacing="6">
                         <AutoSuggestBox x:Name="SearchBox" Height="36" PlaceholderText="Search notebooks, pages, handwriting"
                                         QueryIcon="Find" TextChanged="OnSearchTextChanged" />
-                        <TextBlock Text="HoomNote 0.5.7 • Local notes" FontSize="9" Foreground="{StaticResource HoomNoteMutedTextBrush}"
+                        <TextBlock x:Name="VersionText" FontSize="9" Foreground="{StaticResource HoomNoteMutedTextBrush}"
                                    ToolTipService.ToolTip="Diagnostics: %LOCALAPPDATA%\HoomNote\logs" />
                     </StackPanel>
                 </Grid>
