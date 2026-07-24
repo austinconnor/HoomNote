@@ -140,6 +140,8 @@ public sealed partial class MainPage : Page
     private const int PageThumbnailCacheLimit = 24;
     private const int PageThumbnailWidth = 96;
     private const int PageThumbnailHeight = 116;
+    private const int PageThumbnailRefreshDelayMs = 400;
+    private int _thumbnailPriorityGeneration;
     private readonly List<CanvasCachedGeometry> _liveInkGeometryChunks = [];
     private int _liveInkChunkStart;
     private const int LiveInkChunkSize = 64;
@@ -385,9 +387,9 @@ public sealed partial class MainPage : Page
         _recognitionTimer.IsRepeating = false;
         _recognitionTimer.Tick += OnRecognitionTimerTick;
         _thumbnailRefreshTimer = DispatcherQueue.CreateTimer();
-        // Thumbnail rendering walks the entire page on a software Win2D device. Give writing
-        // and navigation a generous idle window so a dense preview cannot compete with ink.
-        _thumbnailRefreshTimer.Interval = TimeSpan.FromMilliseconds(3_000);
+        // Rendering remains off the interactive Win2D device, so a short idle delay keeps the
+        // preview responsive without starting work in the middle of an active pointer gesture.
+        _thumbnailRefreshTimer.Interval = TimeSpan.FromMilliseconds(PageThumbnailRefreshDelayMs);
         _thumbnailRefreshTimer.IsRepeating = false;
         _thumbnailRefreshTimer.Tick += OnThumbnailRefreshTimerTick;
         _navigationSettleTimer = DispatcherQueue.CreateTimer();
@@ -3979,11 +3981,12 @@ public sealed partial class MainPage : Page
         var page = pageId is null ? null : _document?.Pages.FirstOrDefault(item => item.Id == pageId);
         _pendingThumbnailRefreshPageId = null;
         if (page is null) return;
-        InvalidatePageThumbnail(page.Id);
-        // When the rail is collapsed, leave the cache invalidated. Container realization will
-        // request the preview if and when the user opens the rail.
         if (PageSidebar.Visibility == Visibility.Visible && PageColumn.Width.Value > 0)
-            RequestPageThumbnail(page);
+            RequestPageThumbnail(page, refresh: true, prioritize: true);
+        else
+            // When the rail is collapsed, invalidate without paying the rendering cost.
+            // Container realization will request the preview when the user opens the rail.
+            InvalidatePageThumbnail(page.Id);
     }
 
     private void PauseThumbnailRefresh()
@@ -4358,16 +4361,24 @@ public sealed partial class MainPage : Page
         if (!_pageThumbnailCache.ContainsKey(page.Id)) RequestPageThumbnail(page);
     }
 
-    private void RequestPageThumbnail(NotePage page)
+    private void RequestPageThumbnail(NotePage page, bool refresh = false, bool prioritize = false)
     {
-        if (_pageThumbnailRenderer is null || _pageThumbnailCache.ContainsKey(page.Id) ||
-            _pageThumbnailLoads.ContainsKey(page.Id)) return;
+        if (_pageThumbnailRenderer is null || (!refresh && _pageThumbnailCache.ContainsKey(page.Id))) return;
+        var priorityGeneration = 0;
+        if (prioritize)
+        {
+            priorityGeneration = ++_thumbnailPriorityGeneration;
+            CancelPageThumbnailLoadsExcept(page.Id);
+        }
+        if (_pageThumbnailLoads.Remove(page.Id, out var previous))
+            previous.Cancel();
         var cancellation = new CancellationTokenSource();
         _pageThumbnailLoads[page.Id] = cancellation;
-        _ = LoadPageThumbnailAsync(page, cancellation);
+        _ = LoadPageThumbnailAsync(page, cancellation, priorityGeneration);
     }
 
-    private async Task LoadPageThumbnailAsync(NotePage page, CancellationTokenSource cancellation)
+    private async Task LoadPageThumbnailAsync(NotePage page, CancellationTokenSource cancellation,
+        int priorityGeneration = 0)
     {
         try
         {
@@ -4411,10 +4422,32 @@ public sealed partial class MainPage : Page
         finally
         {
             if (_pageThumbnailLoads.TryGetValue(page.Id, out var active) && ReferenceEquals(active, cancellation))
-            {
                 _pageThumbnailLoads.Remove(page.Id);
-                cancellation.Dispose();
-            }
+            cancellation.Dispose();
+            if (priorityGeneration != 0 && priorityGeneration == _thumbnailPriorityGeneration)
+                QueueMissingVisiblePageThumbnails(page.Id);
+        }
+    }
+
+    private void CancelPageThumbnailLoadsExcept(Guid pageId)
+    {
+        foreach (var (loadedPageId, cancellation) in _pageThumbnailLoads.ToArray())
+        {
+            if (loadedPageId == pageId) continue;
+            _pageThumbnailLoads.Remove(loadedPageId);
+            cancellation.Cancel();
+        }
+    }
+
+    private void QueueMissingVisiblePageThumbnails(Guid priorityPageId)
+    {
+        if (PageSidebar.Visibility != Visibility.Visible || PageColumn.Width.Value <= 0) return;
+        foreach (var page in _pages)
+        {
+            if (page.Id == priorityPageId || _pageThumbnailCache.ContainsKey(page.Id) ||
+                PageList.ContainerFromItem(page) is not ListViewItem)
+                continue;
+            RequestPageThumbnail(page);
         }
     }
 
@@ -4455,7 +4488,6 @@ public sealed partial class MainPage : Page
         if (_pageThumbnailLoads.Remove(pageId, out var cancellation))
         {
             cancellation.Cancel();
-            cancellation.Dispose();
         }
         if (_pages.FirstOrDefault(page => page.Id == pageId) is { } page &&
             PageList.ContainerFromItem(page) is ListViewItem container)

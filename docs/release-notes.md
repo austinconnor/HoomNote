@@ -1,6 +1,6 @@
-# HoomNote 0.7.4
+# HoomNote 0.7.5
 
-- Reduced the notebook tab bar from 42 px to 28 px with compact tab and close-button metrics.
-- Reduced the main tool bar from 52 px to 44 px.
-- Tightened toolbar button dimensions while giving the workspace action cluster consistent spacing and padding.
-- Kept compact dimensions intact when exiting read mode and across responsive layout changes.
+- Reduced edited-page preview debounce from three seconds to 400 milliseconds.
+- Prioritized the active page thumbnail ahead of background page previews.
+- Kept the previous preview visible until its replacement is ready instead of flashing a loading state.
+- Resumed missing visible page previews after the active-page refresh completes.
