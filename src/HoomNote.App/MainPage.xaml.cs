@@ -4952,6 +4952,11 @@ public sealed partial class MainPage : Page
         QuickInkSettingsTitle.Text = _colorTool == EditorTool.Highlighter
             ? "Highlighter settings"
             : "Pen settings";
+        SaveCurrentInkPresetMenuItem.Text = _colorTool == EditorTool.Highlighter
+            ? "Save highlighter"
+            : "Save pen";
+        ToolTipService.SetToolTip(QuickInkSettingsButton,
+            _colorTool == EditorTool.Highlighter ? "Highlighter size and color" : "Pen size and color");
         foreach (var toggle in ToolButtons.Children.OfType<ToggleButton>())
             toggle.IsChecked = selected is not null ? toggle == selected : string.Equals(toggle.Tag as string, tool.ToString(), StringComparison.Ordinal);
         MoreToolsButton.Background = tool is EditorTool.Style or EditorTool.SegmentEraser or EditorTool.Text or
@@ -5596,14 +5601,10 @@ public sealed partial class MainPage : Page
     private async void OnAddHighlighterPresetClick(object sender, RoutedEventArgs e) =>
         await AddToolbarPresetAsync(EditorTool.Highlighter);
 
-    private async void OnSaveActiveInkPresetClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is not MenuFlyoutItem { Tag: string toolName } ||
-            !Enum.TryParse<EditorTool>(toolName, out var tool) ||
-            tool is not (EditorTool.Pen or EditorTool.Highlighter))
-            return;
-        await AddToolbarPresetAsync(tool);
-    }
+    private async void OnSaveCurrentInkPresetClick(object sender, RoutedEventArgs e) =>
+        await AddToolbarPresetAsync(_colorTool == EditorTool.Highlighter
+            ? EditorTool.Highlighter
+            : EditorTool.Pen);
 
     private async Task AddToolbarPresetAsync(EditorTool tool)
     {

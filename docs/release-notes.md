@@ -1,7 +1,5 @@
-# HoomNote 0.7.6
+# HoomNote 0.7.7
 
-- Added right-click actions to save the current pen or highlighter as a complete toolbar preset.
-- Removed the synthetic Unfiled folder so unfiled notebooks live directly at the library root.
-- Added notebook tab tear-out into a separate window near the drop location, including drag-to-join and a Move to main window action.
-- Kept touch input and native file pickers attached to the correct window after detaching a notebook.
-- Standardized compact toolbar and workspace-action button sizing and spacing.
+- Moved the save-preset context action to the current ink color and size control.
+- Changed the action dynamically between Save pen and Save highlighter to match the displayed ink selection.
+- Removed the misplaced save actions from the Pen and Highlighter tool buttons.

@@ -46,26 +46,12 @@
                     <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="16" /></ToggleButton>
                     <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)">
                         <FontIcon Glyph="&#xE76D;" FontSize="16" />
-                        <ToggleButton.ContextFlyout>
-                            <MenuFlyout>
-                                <MenuFlyoutItem Text="Save current pen" Tag="Pen" Click="OnSaveActiveInkPresetClick">
-                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE74E;" /></MenuFlyoutItem.Icon>
-                                </MenuFlyoutItem>
-                            </MenuFlyout>
-                        </ToggleButton.ContextFlyout>
                     </ToggleButton>
                     <ToggleButton Tag="Highlighter" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Highlighter (H)">
                         <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
                             <Path Data="M6,15 L14.5,6.5 L19,11 L10.5,19.5 L6,19.5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.9" StrokeLineJoin="Round" />
                             <Path Data="M4,22 L20,22" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.8" />
                         </Canvas></Viewbox>
-                        <ToggleButton.ContextFlyout>
-                            <MenuFlyout>
-                                <MenuFlyoutItem Text="Save current highlighter" Tag="Highlighter" Click="OnSaveActiveInkPresetClick">
-                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE74E;" /></MenuFlyoutItem.Icon>
-                                </MenuFlyoutItem>
-                            </MenuFlyout>
-                        </ToggleButton.ContextFlyout>
                     </ToggleButton>
                     <ToggleButton Tag="StrokeEraser" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Erase whole strokes (E)">
                         <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
@@ -117,6 +103,15 @@
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>
+                        <Button.ContextFlyout>
+                            <MenuFlyout>
+                                <MenuFlyoutItem x:Name="SaveCurrentInkPresetMenuItem"
+                                                  Text="Save pen"
+                                                  Click="OnSaveCurrentInkPresetClick">
+                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE74E;" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                            </MenuFlyout>
+                        </Button.ContextFlyout>
                     </Button>
                 </StackPanel>
                 <ScrollViewer x:Name="PresetScrollViewer" Grid.Column="2" MinWidth="120" MaxWidth="420" Margin="12,0,8,0"
