@@ -32,7 +32,6 @@ public partial class App : Application
     {
         LocalDataMigration.MovePreviousLibrary();
         DiagnosticsLog.Initialize();
-        WindowsShellBranding.RefreshInstalledAppIcon();
         DiagnosticsLog.Info("app.constructing");
         UnhandledException += OnApplicationUnhandledException;
         AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
@@ -62,6 +61,7 @@ public partial class App : Application
             MainAppWindow = new MainWindow();
             MainAppWindow.Activate();
             DiagnosticsLog.Info("app.launched");
+            _ = Task.Run(WindowsShellBranding.RefreshInstalledAppIcon);
         }
         catch (Exception exception)
         {

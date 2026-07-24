@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace HoomNote_App.Services;
@@ -7,9 +6,6 @@ internal static class WindowsShellBranding
 {
     private const string UninstallKeyPath =
         @"Software\Microsoft\Windows\CurrentVersion\Uninstall\HoomNote";
-    private const uint ShellEventAssociationChanged = 0x08000000;
-    private const uint ShellNotifyIdList = 0x0000;
-
     internal static string GetIconPath() =>
         Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
 
@@ -43,7 +39,6 @@ internal static class WindowsShellBranding
                 return;
 
             uninstallKey.SetValue("DisplayIcon", iconPath, RegistryValueKind.String);
-            SHChangeNotify(ShellEventAssociationChanged, ShellNotifyIdList, nint.Zero, nint.Zero);
             DiagnosticsLog.Info("shell.install_icon_refreshed");
         }
         catch (Exception exception)
@@ -53,6 +48,4 @@ internal static class WindowsShellBranding
         }
     }
 
-    [DllImport("shell32.dll")]
-    private static extern void SHChangeNotify(uint eventId, uint flags, nint item1, nint item2);
 }

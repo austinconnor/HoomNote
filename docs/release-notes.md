@@ -1,3 +1,5 @@
-# HoomNote 0.7.1
+# HoomNote 0.7.2
 
-- Increases the saved pen and highlighter preset limit from 12 to 50.
+- Fixes a startup crash caused by synchronous Windows shell icon refresh.
+- Moves installed-app icon metadata maintenance off the critical UI startup
+  path and removes the unsafe shell-wide native notification.
