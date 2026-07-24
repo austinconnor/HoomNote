@@ -104,6 +104,7 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, int> _openDocumentPointCounts = [];
     private const int OpenDocumentCacheLimit = 1;
     private const int OpenDocumentCachePointBudget = 250_000;
+    private const int ToolbarPresetLimit = 50;
     private readonly Dictionary<Guid, SpatialIndex> _pageSpatialIndexCache = [];
     private readonly LinkedList<Guid> _pageSpatialIndexLru = [];
     private const int PageSpatialIndexCacheLimit = 2;
@@ -5354,10 +5355,12 @@ public sealed partial class MainPage : Page
 
     private async Task AddToolbarPresetAsync(EditorTool tool)
     {
-        if (_userPreferences.ToolbarPresets.Count >= 12)
+        if (_userPreferences.ToolbarPresets.Count >= ToolbarPresetLimit)
         {
             ImportInfo.Title = "Toolbar is full";
-            ImportInfo.Message = "Right-click a custom pen on the toolbar to remove it.";
+            ImportInfo.Message =
+                $"You can save up to {ToolbarPresetLimit} pen and highlighter presets. " +
+                "Right-click a custom preset to remove it.";
             ImportInfo.Severity = InfoBarSeverity.Informational;
             ImportInfo.IsOpen = true;
             return;
