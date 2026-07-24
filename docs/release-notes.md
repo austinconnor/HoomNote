@@ -1,6 +1,7 @@
-# HoomNote 0.7.5
+# HoomNote 0.7.6
 
-- Reduced edited-page preview debounce from three seconds to 400 milliseconds.
-- Prioritized the active page thumbnail ahead of background page previews.
-- Kept the previous preview visible until its replacement is ready instead of flashing a loading state.
-- Resumed missing visible page previews after the active-page refresh completes.
+- Added right-click actions to save the current pen or highlighter as a complete toolbar preset.
+- Removed the synthetic Unfiled folder so unfiled notebooks live directly at the library root.
+- Added notebook tab tear-out into a separate window near the drop location, including drag-to-join and a Move to main window action.
+- Kept touch input and native file pickers attached to the correct window after detaching a notebook.
+- Standardized compact toolbar and workspace-action button sizing and spacing.

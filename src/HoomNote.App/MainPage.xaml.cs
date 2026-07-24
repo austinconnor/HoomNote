@@ -13,6 +13,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
+using Microsoft.UI.Xaml.Navigation;
 using HoomNote.Canvas.Geometry;
 using HoomNote.Canvas.Interaction;
 using HoomNote.Canvas.Rendering;
@@ -41,6 +42,7 @@ namespace HoomNote_App;
 public sealed partial class MainPage : Page
 {
     private const string CanvasClipboardFormat = "application/x-hoomnote-canvas-objects+json";
+    private const string NotebookTabDataFormat = "application/x-hoomnote-notebook-tab";
     private sealed class SavedColorItem(string hex)
     {
         public string Hex { get; } = hex;
@@ -60,10 +62,9 @@ public sealed partial class MainPage : Page
         public string Metadata { get; } = metadata ?? string.Empty;
         public SolidColorBrush Brush { get; } = new(ParseColor(color));
         public bool IsFolder => FolderId is not null && Document is null;
-        public bool IsUnfiled => FolderId is null && Document is null;
         public bool IsContainer => Document is null;
         public bool CanDrag => Document is not null;
-        public string Glyph => IsFolder ? "\uE8B7" : IsUnfiled ? "\uE838" : "\uE8A5";
+        public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
     }
 
     private sealed class RecognitionLine
@@ -228,6 +229,10 @@ public sealed partial class MainPage : Page
     private const int NavigationTileObjectThreshold = 256;
 
     private SqliteDocumentRepository? _repository;
+    private MainWindow? _hostWindow;
+    private Guid? _startupDocumentId;
+    private bool _isPrimaryWindow;
+    private Window? HostWindow => _hostWindow ?? App.MainAppWindow;
     private ContentAddressedAssetStore? _assetStore;
     private HoomNotePackageService? _packageService;
     private VectorExportService? _vectorExportService;
@@ -324,7 +329,6 @@ public sealed partial class MainPage : Page
     private int _folderTreeRebuildVersion;
     private readonly HashSet<Guid> _expandedFolderIds = [];
     private bool _hasFolderExpansionState;
-    private bool _unfiledExpanded = true;
     private Guid? _recognitionPageId;
     private DocumentSummary? _notebookContextTarget;
     private FolderDisplay? _folderContextTarget;
@@ -332,6 +336,7 @@ public sealed partial class MainPage : Page
     private MenuFlyoutItem _renameFolderMenuItem = null!;
     private MenuFlyoutItem _deleteFolderMenuItem = null!;
     private MenuFlyoutItem _newSubfolderMenuItem = null!;
+    private MenuFlyoutItem _removeNotebookFolderMenuItem = null!;
     private string _inkColor = "#111111";
     private string _penColor = "#111111";
     private string _highlighterColor = "#FFCE56";
@@ -421,10 +426,19 @@ public sealed partial class MainPage : Page
             : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
     }
 
+    protected override void OnNavigatedTo(NavigationEventArgs e)
+    {
+        base.OnNavigatedTo(e);
+        if (e.Parameter is not MainPageNavigationContext context) return;
+        _hostWindow = context.HostWindow;
+        _startupDocumentId = context.InitialDocumentId;
+        _isPrimaryWindow = context.IsPrimary;
+    }
+
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
         DiagnosticsLog.Info("main.loaded_start");
-        if (App.MainAppWindow is MainWindow { NativeTouchSource: { } nativeTouch })
+        if (_hostWindow is { NativeTouchSource: { } nativeTouch })
         {
             nativeTouch.Frame -= OnNativeTouchFrame;
             nativeTouch.Frame += OnNativeTouchFrame;
@@ -474,7 +488,8 @@ public sealed partial class MainPage : Page
             StatusText.Text = "Ready • autosave enabled";
             DiagnosticsLog.Info("main.loaded_complete", ("notebooks", _allDocuments.Count),
                 ("log_directory", DiagnosticsLog.LogDirectory));
-            _ = UpdateService.CheckForUpdatesAsync(XamlRoot, manual: false, PrepareForUpdateRestartAsync);
+            if (_isPrimaryWindow)
+                _ = UpdateService.CheckForUpdatesAsync(XamlRoot, manual: false, PrepareForUpdateRestartAsync);
         }
         catch (Exception exception)
         {
@@ -487,7 +502,7 @@ public sealed partial class MainPage : Page
         DiagnosticsLog.Info("main.unloading", ("unsaved", _hasUnsavedChanges),
             ("document_open", _document is not null));
         _saveTimer.Stop();
-        if (App.MainAppWindow is MainWindow { NativeTouchSource: { } nativeTouch })
+        if (_hostWindow is { NativeTouchSource: { } nativeTouch })
             nativeTouch.Frame -= OnNativeTouchFrame;
         _searchDebounce?.Cancel();
         _searchLocateCancellation?.Cancel();
@@ -537,8 +552,12 @@ public sealed partial class MainPage : Page
         ApplyFolderFilter();
         if (_allDocuments.Count > 0)
         {
-            var preferred = _document is null ? _allDocuments[0] :
-                _allDocuments.FirstOrDefault(item => item.Id == _document.Id) ?? _allDocuments[0];
+            var requested = _startupDocumentId is { } requestedId
+                ? _allDocuments.FirstOrDefault(item => item.Id == requestedId)
+                : null;
+            var preferred = requested ?? (_document is null ? _allDocuments[0] :
+                _allDocuments.FirstOrDefault(item => item.Id == _document.Id) ?? _allDocuments[0]);
+            _startupDocumentId = null;
             if (_document is null || _document.Id != preferred.Id)
                 await LoadDocumentAsync(preferred.Id);
             SelectLibraryDocument(preferred.Id);
@@ -581,6 +600,8 @@ public sealed partial class MainPage : Page
         }
         var rebuildVersion = ++_folderTreeRebuildVersion;
         FolderTree.RootNodes.Clear();
+        foreach (var document in _documents.Where(document => DocumentFolderId(document.Id) is null))
+            FolderTree.RootNodes.Add(BuildNotebookNode(document));
         var folderIds = _userPreferences.NotebookFolders.Select(folder => folder.Id).ToHashSet();
         var renderedFolders = new HashSet<Guid>();
         foreach (var folder in _userPreferences.NotebookFolders
@@ -591,15 +612,6 @@ public sealed partial class MainPage : Page
         }
         foreach (var folder in _userPreferences.NotebookFolders.Where(item => !renderedFolders.Contains(item.Id)).OrderBy(item => item.Name))
             FolderTree.RootNodes.Add(BuildFolderNode(folder, renderedFolders, []));
-        var unfiledDocuments = _documents.Where(document => DocumentFolderId(document.Id) is null).ToArray();
-        var unfiledEntry = new LibraryTreeEntry(null, null, "Unfiled", "#8B95A7", unfiledDocuments.Length.ToString());
-        var unfiledNode = new TreeViewNode
-        {
-            Content = unfiledEntry,
-            IsExpanded = _unfiledExpanded
-        };
-        foreach (var document in unfiledDocuments) unfiledNode.Children.Add(BuildNotebookNode(document));
-        FolderTree.RootNodes.Insert(0, unfiledNode);
 
         LibraryEmptyText.Visibility = FolderTree.RootNodes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         var desiredFolder = preferredFolderId ?? _selectedFolderId;
@@ -632,7 +644,6 @@ public sealed partial class MainPage : Page
         if (GetLibraryEntry(node) is { } entry)
         {
             if (entry.FolderId is { } folderId && node.IsExpanded) _expandedFolderIds.Add(folderId);
-            else if (entry.IsUnfiled) _unfiledExpanded = node.IsExpanded;
         }
         foreach (var child in node.Children)
             CaptureExpandedFolders(child);
@@ -744,7 +755,7 @@ public sealed partial class MainPage : Page
         {
             var node = entry.FolderId is { } folderId
                 ? FindFolderNode(FolderTree.RootNodes, folderId)
-                : FolderTree.RootNodes.FirstOrDefault(node => GetLibraryEntry(node)?.IsUnfiled == true);
+                : null;
             if (node is not null)
             {
                 // Select the container before collapsing it. Leaving a hidden child selected
@@ -825,8 +836,12 @@ public sealed partial class MainPage : Page
         var container = FindAncestor<TreeViewItem>(e.OriginalSource as DependencyObject);
         var node = container is null ? null : FolderTree.NodeFromContainer(container);
         var target = GetLibraryEntry(node);
-        if (container is not null && target?.IsContainer != true) return;
-        await MoveNotebookToFolderAsync(documentId, target?.FolderId);
+        var targetFolderId = target?.FolderId;
+        if (target?.Document is not null)
+            targetFolderId = GetLibraryEntry(node?.Parent)?.FolderId;
+        else if (container is not null && target?.IsContainer != true)
+            return;
+        await MoveNotebookToFolderAsync(documentId, targetFolderId);
         e.Handled = true;
     }
 
@@ -882,7 +897,7 @@ public sealed partial class MainPage : Page
         else _userPreferences.DocumentFolders.Remove(key);
         ApplyFolderFilter();
         SelectLibraryDocument(documentId);
-        await PersistUserPreferencesAsync(folderId is null ? "Moved notebook to All notebooks" : "Moved notebook to folder");
+        await PersistUserPreferencesAsync(folderId is null ? "Moved notebook to top level" : "Moved notebook to folder");
         DiagnosticsLog.Info("folder.notebook_moved", ("to_folder", folderId is not null));
     }
 
@@ -897,7 +912,8 @@ public sealed partial class MainPage : Page
     private void BuildContextMenus()
     {
         AddMenuItem(_notebookContextMenu, "Rename notebook", "\uE8AC", OnRenameNotebookContextClick);
-        AddMenuItem(_notebookContextMenu, "Remove from folder", "\uE8F1", OnRemoveNotebookFolderContextClick);
+        _removeNotebookFolderMenuItem = AddMenuItem(_notebookContextMenu, "Move to top level", "\uE8F1",
+            OnRemoveNotebookFolderContextClick);
         _notebookContextMenu.Items.Add(CreateColorMenu("Notebook color", OnNotebookColorClick));
         _notebookContextMenu.Items.Add(new MenuFlyoutSeparator());
         AddMenuItem(_notebookContextMenu, "Delete notebook", "\uE74D", OnDeleteNotebookContextClick);
@@ -972,6 +988,7 @@ public sealed partial class MainPage : Page
         if (entry.Document is { } document)
         {
             _notebookContextTarget = document;
+            _removeNotebookFolderMenuItem.IsEnabled = DocumentFolderId(document.Id) is not null;
             _notebookContextMenu.ShowAt(container!);
             e.Handled = true;
             return;
@@ -1017,6 +1034,7 @@ public sealed partial class MainPage : Page
                 _requiresFullSave = false;
                 _hasUnsavedChanges = false;
                 NotebookTitle.Text = name;
+                _hostWindow?.UpdateNotebookTitle(name);
                 var tab = NotebookTabs.TabItems.OfType<TabViewItem>()
                     .FirstOrDefault(item => item.Tag is Guid id && id == target.Id);
                 if (tab is not null) tab.Header = name;
@@ -1184,6 +1202,7 @@ public sealed partial class MainPage : Page
         _requiresFullSave = false;
         _hasUnsavedChanges = false;
         NotebookTitle.Text = loaded.Title;
+        _hostWindow?.UpdateNotebookTitle(loaded.Title);
         EnsureNotebookTab(loaded.Id, loaded.Title);
         _loading = true;
         _pages.Clear();
@@ -1202,12 +1221,194 @@ public sealed partial class MainPage : Page
         if (existing is null)
         {
             existing = new TabViewItem { Header = title, Tag = id, IsClosable = true };
+            ConfigureNotebookTabContextMenu(existing, id);
             NotebookTabs.TabItems.Add(existing);
         }
-        else existing.Header = title;
+        else
+        {
+            existing.Header = title;
+            ConfigureNotebookTabContextMenu(existing, id);
+        }
         _updatingTabs = true;
         NotebookTabs.SelectedItem = existing;
         _updatingTabs = false;
+    }
+
+    internal bool ContainsNotebookTab(Guid documentId) =>
+        NotebookTabs.TabItems.OfType<TabViewItem>()
+            .Any(item => item.Tag is Guid id && id == documentId);
+
+    private void ConfigureNotebookTabContextMenu(TabViewItem tab, Guid documentId)
+    {
+        var flyout = new MenuFlyout();
+        var action = new MenuFlyoutItem
+        {
+            Text = _isPrimaryWindow ? "Open in new window" : "Move to main window",
+            Tag = documentId,
+            Icon = new FontIcon { Glyph = _isPrimaryWindow ? "\uE8A7" : "\uE8A7" }
+        };
+        if (_isPrimaryWindow) action.Click += OnOpenTabInNewWindowClick;
+        else action.Click += OnMoveTabToMainWindowClick;
+        flyout.Items.Add(action);
+        tab.ContextFlyout = flyout;
+    }
+
+    private void OnNotebookTabDragStarting(TabView sender, TabViewTabDragStartingEventArgs args)
+    {
+        if (args.Tab?.Tag is not Guid documentId)
+        {
+            args.Cancel = true;
+            return;
+        }
+
+        args.Data.RequestedOperation = DataPackageOperation.Move;
+        args.Data.SetData(NotebookTabDataFormat, documentId.ToString("D"));
+    }
+
+    private async void OnNotebookTabDroppedOutside(TabView sender, TabViewTabDroppedOutsideEventArgs args)
+    {
+        if (args.Tab?.Tag is not Guid documentId) return;
+        try
+        {
+            await DetachNotebookAsync(documentId);
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be opened in a new window.", exception);
+        }
+    }
+
+    private void OnNotebookTabStripDragOver(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(NotebookTabDataFormat)) return;
+        e.AcceptedOperation = DataPackageOperation.Move;
+        e.Handled = true;
+    }
+
+    private async void OnNotebookTabStripDrop(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(NotebookTabDataFormat)) return;
+        try
+        {
+            var raw = await e.DataView.GetDataAsync(NotebookTabDataFormat) as string;
+            if (!Guid.TryParse(raw, out var documentId)) return;
+            var source = App.FindPageHostingNotebook(documentId, this);
+            if (source is null || ReferenceEquals(source, this)) return;
+
+            await source.PrepareNotebookTransferAsync(documentId);
+            await OpenTransferredNotebookAsync(documentId);
+            await source.RemoveNotebookTabAfterTransferAsync(documentId);
+            e.AcceptedOperation = DataPackageOperation.Move;
+            e.Handled = true;
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be moved into this window.", exception);
+        }
+    }
+
+    private async void OnOpenTabInNewWindowClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem { Tag: Guid documentId }) return;
+        try
+        {
+            await DetachNotebookAsync(documentId);
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be opened in a new window.", exception);
+        }
+    }
+
+    private async void OnMoveTabToMainWindowClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem { Tag: Guid documentId }) return;
+        try
+        {
+            var primaryWindow = App.PrimaryWindow;
+            var primaryPage = primaryWindow?.MainPage;
+            if (primaryPage is null || ReferenceEquals(primaryPage, this)) return;
+
+            await PrepareNotebookTransferAsync(documentId);
+            await primaryPage.OpenTransferredNotebookAsync(documentId);
+            await RemoveNotebookTabAfterTransferAsync(documentId);
+            primaryWindow!.Activate();
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be moved to the main window.", exception);
+        }
+    }
+
+    private async Task DetachNotebookAsync(Guid documentId)
+    {
+        await PrepareNotebookTransferAsync(documentId);
+        App.OpenDetachedNotebookWindow(documentId);
+        await RemoveNotebookTabAfterTransferAsync(documentId);
+    }
+
+    private async Task PrepareNotebookTransferAsync(Guid documentId)
+    {
+        if (_document?.Id == documentId)
+            await SaveNowAsync();
+    }
+
+    internal async Task OpenTransferredNotebookAsync(Guid documentId)
+    {
+        if (_repository is null) return;
+        await LoadDocumentAsync(documentId,
+            _tabPageSelections.GetValueOrDefault(documentId) is { } pageId && pageId != Guid.Empty
+                ? pageId
+                : null);
+        SelectLibraryDocument(documentId);
+        _hostWindow?.Activate();
+    }
+
+    private async Task RemoveNotebookTabAfterTransferAsync(Guid documentId)
+    {
+        var tab = NotebookTabs.TabItems.OfType<TabViewItem>()
+            .FirstOrDefault(item => item.Tag is Guid id && id == documentId);
+        if (tab is null) return;
+
+        var wasSelected = ReferenceEquals(NotebookTabs.SelectedItem, tab);
+        _updatingTabs = true;
+        NotebookTabs.TabItems.Remove(tab);
+        _updatingTabs = false;
+        _tabPageSelections.Remove(documentId);
+        if (!wasSelected)
+        {
+            RemoveCachedDocument(documentId);
+            return;
+        }
+
+        if (NotebookTabs.TabItems.OfType<TabViewItem>()
+                .FirstOrDefault(item => item.Tag is Guid) is { Tag: Guid nextDocumentId } nextTab)
+        {
+            _updatingTabs = true;
+            NotebookTabs.SelectedItem = nextTab;
+            _updatingTabs = false;
+            await LoadDocumentAsync(nextDocumentId);
+            RemoveCachedDocument(documentId);
+            SelectLibraryDocument(nextDocumentId);
+            return;
+        }
+
+        ClearCurrentNotebookAfterTransfer(documentId);
+        if (!_isPrimaryWindow) _hostWindow?.Close();
+    }
+
+    private void ClearCurrentNotebookAfterTransfer(Guid documentId)
+    {
+        _document = null;
+        _page = null;
+        _pages.Clear();
+        _documentHistories.Remove(documentId);
+        RemoveCachedDocument(documentId);
+        NotebookTitle.Text = "No notebook";
+        _hostWindow?.UpdateNotebookTitle(null);
+        SelectPage(null);
+        UpdateFolderActions();
+        UpdateEmptyState();
     }
 
     private async void OnNotebookTabSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -5395,6 +5596,15 @@ public sealed partial class MainPage : Page
     private async void OnAddHighlighterPresetClick(object sender, RoutedEventArgs e) =>
         await AddToolbarPresetAsync(EditorTool.Highlighter);
 
+    private async void OnSaveActiveInkPresetClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem { Tag: string toolName } ||
+            !Enum.TryParse<EditorTool>(toolName, out var tool) ||
+            tool is not (EditorTool.Pen or EditorTool.Highlighter))
+            return;
+        await AddToolbarPresetAsync(tool);
+    }
+
     private async Task AddToolbarPresetAsync(EditorTool tool)
     {
         if (_userPreferences.ToolbarPresets.Count >= ToolbarPresetLimit)
@@ -5701,12 +5911,13 @@ public sealed partial class MainPage : Page
 
     private async void OnAddImageClick(object sender, RoutedEventArgs e)
     {
-        if (_document is null || _page is null || _assetStore is null || App.MainAppWindow is null) return;
+        var hostWindow = HostWindow;
+        if (_document is null || _page is null || _assetStore is null || hostWindow is null) return;
         try
         {
             var picker = new FileOpenPicker();
             WinRT.Interop.InitializeWithWindow.Initialize(picker,
-                WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+                WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
             foreach (var extension in new[] { ".png", ".jpg", ".jpeg", ".webp", ".bmp" })
                 picker.FileTypeFilter.Add(extension);
             var file = await picker.PickSingleFileAsync();
@@ -5886,11 +6097,12 @@ public sealed partial class MainPage : Page
 
     private async void OnImportClick(object sender, RoutedEventArgs e)
     {
-        if (_document is null || _importService is null || App.MainAppWindow is null) return;
+        var hostWindow = HostWindow;
+        if (_document is null || _importService is null || hostWindow is null) return;
         try
         {
             var picker = new FileOpenPicker();
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
             picker.FileTypeFilter.Add(".pdf");
             picker.FileTypeFilter.Add(".ppt");
             picker.FileTypeFilter.Add(".pptx");
@@ -5935,12 +6147,13 @@ public sealed partial class MainPage : Page
 
     private async void OnImportSamsungFilesClick(object sender, RoutedEventArgs e)
     {
-        if (_importService is null || _repository is null || App.MainAppWindow is null) return;
+        var hostWindow = HostWindow;
+        if (_importService is null || _repository is null || hostWindow is null) return;
         try
         {
             var picker = new FileOpenPicker();
             WinRT.Interop.InitializeWithWindow.Initialize(picker,
-                WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+                WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
             picker.FileTypeFilter.Add(".sdocx");
             var files = await picker.PickMultipleFilesAsync();
             if (files.Count == 0) return;
@@ -5954,12 +6167,13 @@ public sealed partial class MainPage : Page
 
     private async void OnImportSamsungFolderClick(object sender, RoutedEventArgs e)
     {
-        if (_importService is null || _repository is null || App.MainAppWindow is null) return;
+        var hostWindow = HostWindow;
+        if (_importService is null || _repository is null || hostWindow is null) return;
         try
         {
             var picker = new FolderPicker();
             WinRT.Interop.InitializeWithWindow.Initialize(picker,
-                WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+                WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
             picker.FileTypeFilter.Add("*");
             var folder = await picker.PickSingleFolderAsync();
             if (folder is null) return;
@@ -6129,11 +6343,12 @@ public sealed partial class MainPage : Page
 
     private async void OnExportClick(object sender, RoutedEventArgs e)
     {
-        if (_document is null || _packageService is null || _vectorExportService is null || App.MainAppWindow is null) return;
+        var hostWindow = HostWindow;
+        if (_document is null || _packageService is null || _vectorExportService is null || hostWindow is null) return;
         try
         {
             var picker = new FileSavePicker { SuggestedFileName = SanitizeFileName(_document.Title) };
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(App.MainAppWindow));
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
             picker.FileTypeChoices.Add("HoomNote package", [".hoomnote"]);
             picker.FileTypeChoices.Add("Vector PDF", [".pdf"]);
             picker.FileTypeChoices.Add("Scalable vector graphic", [".svg"]);

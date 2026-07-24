@@ -31,6 +31,12 @@
                 <Setter Property="CornerRadius" Value="7" />
                 <Setter Property="Background" Value="Transparent" />
             </Style>
+            <Style x:Key="HoomNoteToolbarButtonStyle" TargetType="Button">
+                <Setter Property="Width" Value="36" />
+                <Setter Property="Height" Value="36" />
+                <Setter Property="Padding" Value="6" />
+                <Setter Property="CornerRadius" Value="7" />
+            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

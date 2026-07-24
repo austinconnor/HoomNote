@@ -15,9 +15,12 @@ namespace HoomNote_App;
 public sealed partial class MainWindow : Window
 {
     internal NativeTouchWindowSource? NativeTouchSource { get; }
+    internal bool IsPrimary { get; }
+    internal MainPage? MainPage => RootFrame.Content as MainPage;
 
-    public MainWindow()
+    public MainWindow(Guid? initialDocumentId = null, bool isPrimary = false)
     {
+        IsPrimary = isPrimary;
         InitializeComponent();
         var windowHandle = WinRT.Interop.WindowNative.GetWindowHandle(this);
         NativeTouchSource = NativeTouchWindowSource.TryCreate(windowHandle);
@@ -38,7 +41,30 @@ public sealed partial class MainWindow : Window
         }
         AppWindow.Resize(new SizeInt32(1440, 920));
 
-        // Navigate the root frame to the main page on startup.
-        RootFrame.Navigate(typeof(MainPage));
+        // Each page receives its actual host window so touch input and native file pickers
+        // remain attached to the correct HWND after a notebook tab is detached.
+        RootFrame.Navigate(typeof(MainPage),
+            new MainPageNavigationContext(this, initialDocumentId, isPrimary));
+    }
+
+    internal void UpdateNotebookTitle(string? notebookTitle)
+    {
+        if (IsPrimary)
+        {
+            Title = "HoomNote";
+            AppTitleBar.Title = "HoomNote";
+            AppTitleBar.Subtitle = string.IsNullOrWhiteSpace(notebookTitle) ? "Local notes" : notebookTitle;
+            return;
+        }
+
+        var title = string.IsNullOrWhiteSpace(notebookTitle) ? "HoomNote" : notebookTitle;
+        Title = $"{title} — HoomNote";
+        AppTitleBar.Title = title;
+        AppTitleBar.Subtitle = "HoomNote";
     }
 }
+
+internal sealed record MainPageNavigationContext(
+    MainWindow HostWindow,
+    Guid? InitialDocumentId,
+    bool IsPrimary);

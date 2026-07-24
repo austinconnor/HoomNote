@@ -11,6 +11,8 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Navigation;
 using Microsoft.UI.Xaml.Shapes;
 using HoomNote_App.Services;
+using System.Runtime.InteropServices;
+using Windows.Graphics;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -23,6 +25,7 @@ namespace HoomNote_App;
 public partial class App : Application
 {
     public static Window? MainAppWindow { get; private set; }
+    private readonly HashSet<MainWindow> _windows = [];
     
     /// <summary>
     /// Initializes the singleton application object.  This is the first line of authored code
@@ -58,8 +61,10 @@ public partial class App : Application
         try
         {
             DiagnosticsLog.Info("app.launching", ("arguments_length", args.Arguments?.Length ?? 0));
-            MainAppWindow = new MainWindow();
-            MainAppWindow.Activate();
+            var mainWindow = new MainWindow(isPrimary: true);
+            MainAppWindow = mainWindow;
+            RegisterWindow(mainWindow);
+            mainWindow.Activate();
             DiagnosticsLog.Info("app.launched");
             _ = Task.Run(WindowsShellBranding.RefreshInstalledAppIcon);
         }
@@ -88,4 +93,56 @@ public partial class App : Application
 
     private static void OnProcessExit(object? sender, EventArgs args) =>
         DiagnosticsLog.Shutdown();
+
+    private void RegisterWindow(MainWindow window)
+    {
+        _windows.Add(window);
+        window.Closed += (_, _) =>
+        {
+            _windows.Remove(window);
+            DiagnosticsLog.Info("window.closed", ("remaining_windows", _windows.Count));
+        };
+    }
+
+    internal static MainWindow? PrimaryWindow => MainAppWindow as MainWindow;
+
+    internal static MainPage? FindPageHostingNotebook(Guid documentId, MainPage? except = null)
+    {
+        if (Current is not App app) return null;
+        return app._windows
+            .Select(window => window.MainPage)
+            .FirstOrDefault(page => page is not null && !ReferenceEquals(page, except) &&
+                                    page.ContainsNotebookTab(documentId));
+    }
+
+    internal static MainWindow OpenDetachedNotebookWindow(Guid documentId)
+    {
+        if (Current is not App app) throw new InvalidOperationException("The HoomNote application is not available.");
+        var window = new MainWindow(documentId);
+        app.RegisterWindow(window);
+        window.Activate();
+        try
+        {
+            if (GetCursorPos(out var pointer))
+                window.AppWindow.Move(new PointInt32(pointer.X - 120, pointer.Y - 18));
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.Warning("window.detach_position_failed",
+                ("exception", exception.GetType().Name));
+        }
+        DiagnosticsLog.Info("window.notebook_detached", ("document_id", documentId));
+        return window;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out NativePoint point);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
 }
