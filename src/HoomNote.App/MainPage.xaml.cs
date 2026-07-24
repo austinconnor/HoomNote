@@ -4661,7 +4661,7 @@ public sealed partial class MainPage : Page
         ToolbarSecondaryActions.Visibility = compactToolbar ? Visibility.Collapsed : Visibility.Visible;
         ToolbarOverflowActionsButton.Visibility = Visibility.Visible;
         AutosavedStatusBadge.Visibility = narrowToolbar ? Visibility.Collapsed : Visibility.Visible;
-        NotebookTabs.Margin = new Thickness(8, 0, narrowToolbar ? 8 : 120, 0);
+        NotebookTabs.Margin = new Thickness(6, 0, narrowToolbar ? 6 : 100, 0);
         PresetScrollViewer.MinWidth = narrowToolbar ? 72 : 120;
         PresetScrollViewer.MaxWidth = compactToolbar
             ? narrowToolbar ? 140 : 260
@@ -4995,8 +4995,8 @@ public sealed partial class MainPage : Page
             TopToolbar.Visibility = Visibility.Visible;
             NotebookTabBar.Visibility = Visibility.Visible;
             StatusBar.Visibility = Visibility.Collapsed;
-            ToolbarRow.Height = new GridLength(52);
-            TabsRow.Height = new GridLength(42);
+            ToolbarRow.Height = new GridLength(44);
+            TabsRow.Height = new GridLength(28);
             FooterRow.Height = new GridLength(0);
             EditorOverlay.IsHitTestVisible = true;
         }
