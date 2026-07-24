@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <Version>0.7.2</Version>
+    <Version>0.7.3</Version>
     <AssemblyName>HoomNote</AssemblyName>
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
@@ -97,8 +97,11 @@
     <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">False</PublishReadyToRun>
     <TieredPGO Condition="'$(Configuration)' != 'Debug'">True</TieredPGO>
     <ServerGarbageCollection>false</ServerGarbageCollection>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+    <!-- WinUI's CsWinRT collection projections and the current persistence layer's
+         reflection-based System.Text.Json contracts are not trim-safe. Trimming stripped
+         both from published builds, causing startup failure and library initialization
+         failure. Keep framework code intact until all JSON contracts are source-generated. -->
+    <PublishTrimmed>False</PublishTrimmed>
     <DebugType Condition="'$(Configuration)' != 'Debug'">None</DebugType>
     <DebugSymbols Condition="'$(Configuration)' != 'Debug'">False</DebugSymbols>
   </PropertyGroup>

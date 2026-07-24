@@ -92,13 +92,11 @@
                                                FontWeight="SemiBold" />
                                     <NumberBox x:Name="QuickStrokeWidthBox" Header="Size" Minimum="0.1" Maximum="24"
                                                SmallChange="0.1" LargeChange="1" Value="2.4"
-                                               SpinButtonPlacementMode="Compact"
-                                               ValueChanged="OnQuickStrokeWidthChanged" />
+                                               SpinButtonPlacementMode="Compact" />
                                     <TextBlock Text="Color" FontSize="12"
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                     <ColorPicker x:Name="QuickInkColorPicker" IsAlphaEnabled="False"
-                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
-                                                 ColorChanged="OnQuickInkColorChanged" />
+                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False" />
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>

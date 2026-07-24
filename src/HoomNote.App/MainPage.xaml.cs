@@ -368,6 +368,11 @@ public sealed partial class MainPage : Page
     public MainPage()
     {
         InitializeComponent();
+        // XAML assigns NumberBox.Value and ColorPicker.Color while the rest of the page is
+        // still being constructed. Subscribing in markup lets those assignments invoke our
+        // synchronization handlers before the inspector controls exist, which aborts startup.
+        QuickStrokeWidthBox.ValueChanged += OnQuickStrokeWidthChanged;
+        QuickInkColorPicker.ColorChanged += OnQuickInkColorChanged;
         VersionText.Text = DisplayVersion();
         PresetScrollViewer.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnPresetScrollWheelChanged), handledEventsToo: true);
@@ -390,9 +395,13 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.IsRepeating = false;
         _navigationSettleTimer.Tick += OnNavigationSettleTick;
         AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnGlobalKeyDown), handledEventsToo: true);
+        DiagnosticsLog.Info("main.constructor.binding_page_list");
         PageList.ItemsSource = _pages;
+        DiagnosticsLog.Info("main.constructor.binding_search_results");
         SearchResultsList.ItemsSource = _searchResults;
+        DiagnosticsLog.Info("main.constructor.binding_saved_colors");
         SavedColorPalette.ItemsSource = _savedColors;
+        DiagnosticsLog.Info("main.constructor.bindings_complete");
         BuildContextMenus();
         SetInkColor(_inkColor, rememberForTool: false);
         _pdfPreview.PreviewAvailable += (_, _) => DispatcherQueue.TryEnqueue(() =>
@@ -4792,6 +4801,7 @@ public sealed partial class MainPage : Page
 
     private void OnInkSliderValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
+        if (StrokeWidthSlider is null) return;
         var text = $"{StrokeWidthSlider.Value:0.#}";
         if (StrokeWidthValue is not null) StrokeWidthValue.Text = text;
         if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
@@ -4806,7 +4816,7 @@ public sealed partial class MainPage : Page
 
     private void OnQuickStrokeWidthChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
     {
-        if (_syncingInkWidth) return;
+        if (_syncingInkWidth || StrokeWidthSlider is null) return;
         var value = double.IsFinite(args.NewValue)
             ? Math.Clamp(Math.Round(args.NewValue, 1), 0.1, 24)
             : StrokeWidthSlider.Value;
@@ -4815,8 +4825,8 @@ public sealed partial class MainPage : Page
         StrokeWidthSlider.Value = value;
         _syncingInkWidth = false;
         var text = $"{value:0.#}";
-        StrokeWidthValue.Text = text;
-        QuickInkWidthText.Text = text;
+        if (StrokeWidthValue is not null) StrokeWidthValue.Text = text;
+        if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
     }
 
     private void OnQuickInkColorChanged(ColorPicker sender, ColorChangedEventArgs args)
@@ -6747,15 +6757,19 @@ public sealed partial class MainPage : Page
             ScheduleUserPreferencesSave();
         }
         var parsed = ParseColor(_inkColor);
-        if (InkColorPicker.Color != parsed || QuickInkColorPicker.Color != parsed)
+        var inspectorPicker = InkColorPicker;
+        var quickPicker = QuickInkColorPicker;
+        var inspectorNeedsUpdate = inspectorPicker is not null && inspectorPicker.Color != parsed;
+        var quickPickerNeedsUpdate = quickPicker is not null && quickPicker.Color != parsed;
+        if (inspectorNeedsUpdate || quickPickerNeedsUpdate)
         {
             _syncingInkColor = true;
-            InkColorPicker.Color = parsed;
-            QuickInkColorPicker.Color = parsed;
+            if (inspectorNeedsUpdate) inspectorPicker!.Color = parsed;
+            if (quickPickerNeedsUpdate) quickPicker!.Color = parsed;
             _syncingInkColor = false;
         }
-        InkColorSwatch.Background = new SolidColorBrush(parsed);
-        QuickInkColorSwatch.Background = new SolidColorBrush(parsed);
+        if (InkColorSwatch is not null) InkColorSwatch.Background = new SolidColorBrush(parsed);
+        if (QuickInkColorSwatch is not null) QuickInkColorSwatch.Background = new SolidColorBrush(parsed);
     }
 
     private void LoadSavedColorPalette()
