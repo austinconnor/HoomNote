@@ -217,6 +217,7 @@ public sealed partial class MainPage : Page
     private const int OverlayBatchSize = 8;
     private const int OverlayBatchCompactionThreshold = 8;
     private const int NavigationTilePixels = 512;
+    private const int NavigationTileGutterPixels = 2;
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
     private const int NavigationTileObjectThreshold = 256;
 
@@ -1533,10 +1534,12 @@ public sealed partial class MainPage : Page
         // Normal reading and navigation should be a single textured quad, not a replay of every
         // vector command on every pan frame. Vector objects remain the source of truth and are
         // used again once the user zooms in far enough to benefit from their extra resolution.
+        // Every scene revision first records a complete fallback. Tile refinement is never
+        // presented against an empty surface or an obsolete pre-undo page.
+        EnsureLowZoomPageRaster(device, page);
         var useLowZoomRaster = CanUseNavigationSnapshot(page, state);
         if (useLowZoomRaster)
         {
-            EnsureLowZoomPageRaster(device, page);
             _frameRenderMode = "page-raster";
         }
         else
@@ -1632,37 +1635,65 @@ public sealed partial class MainPage : Page
 
         _visibleNavigationTileKeys.Clear();
         (int X, int Y)? firstMissing = null;
+        var readyTileCount = 0;
         for (var tileY = minimumTileY; tileY <= maximumTileY; tileY++)
         for (var tileX = minimumTileX; tileX <= maximumTileX; tileX++)
         {
             var key = (tileX, tileY);
             _visibleNavigationTileKeys.Add(key);
-            if (!_navigationTiles.TryGetValue(key, out var tile))
+            if (!_navigationTiles.ContainsKey(key))
             {
                 firstMissing ??= key;
                 continue;
             }
             TouchNavigationTile(key);
-            var tileLeft = tileX * NavigationTilePixels / scale;
-            var tileTop = tileY * NavigationTilePixels / scale;
-            drawingSession.DrawImage(tile, new Rect(tileLeft, tileTop,
-                tile.SizeInPixels.Width / scale, tile.SizeInPixels.Height / scale));
+            readyTileCount++;
         }
 
         // A single refinement per settled frame bounds worst-case work. The previous renderer
-        // built every visible miss synchronously (24 tiles in one observed 35 ms frame).
+        // built every visible miss synchronously (24 tiles in one observed 35 ms frame). The
+        // refined set remains hidden until it is complete, preventing checkerboard loading.
         if (NavigationRefinementPolicy.TileBuildBudget(state.InteractionActive) > 0 &&
             firstMissing is { } missing)
         {
-            var tile = GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight);
+            GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight);
             TouchNavigationTile(missing);
-            var tileLeft = missing.X * NavigationTilePixels / scale;
-            var tileTop = missing.Y * NavigationTilePixels / scale;
-            drawingSession.DrawImage(tile, new Rect(tileLeft, tileTop,
-                tile.SizeInPixels.Width / scale, tile.SizeInPixels.Height / scale));
-            DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
+            readyTileCount++;
+            if (!NavigationRefinementPolicy.ShouldPresentTiles(
+                    _visibleNavigationTileKeys.Count, readyTileCount))
+                DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
+        }
+
+        if (NavigationRefinementPolicy.ShouldPresentTiles(
+                _visibleNavigationTileKeys.Count, readyTileCount))
+        {
+            foreach (var key in _visibleNavigationTileKeys)
+                DrawNavigationTile(drawingSession, _navigationTiles[key], key,
+                    fullPixelWidth, fullPixelHeight, scale);
         }
         TrimNavigationTiles();
+    }
+
+    private static void DrawNavigationTile(
+        CanvasDrawingSession drawingSession,
+        CanvasRenderTarget tile,
+        (int X, int Y) key,
+        int fullPixelWidth,
+        int fullPixelHeight,
+        double scale)
+    {
+        var metrics = NavigationTileMetrics.Create(
+            key.X,
+            key.Y,
+            NavigationTilePixels,
+            fullPixelWidth,
+            fullPixelHeight,
+            NavigationTileGutterPixels);
+        drawingSession.DrawImage(tile, new Rect(
+            metrics.RenderPixelLeft / scale,
+            metrics.RenderPixelTop / scale,
+            metrics.RenderPixelWidth / scale,
+            metrics.RenderPixelHeight / scale));
     }
 
     private void EnsureNavigationTileSet(NotePage page, double scale)
@@ -1688,16 +1719,20 @@ public sealed partial class MainPage : Page
     {
         if (_navigationTiles.TryGetValue(key, out var existing)) return existing;
 
-        var pixelLeft = key.X * NavigationTilePixels;
-        var pixelTop = key.Y * NavigationTilePixels;
-        var pixelWidth = Math.Min(NavigationTilePixels, fullPixelWidth - pixelLeft);
-        var pixelHeight = Math.Min(NavigationTilePixels, fullPixelHeight - pixelTop);
+        var metrics = NavigationTileMetrics.Create(
+            key.X,
+            key.Y,
+            NavigationTilePixels,
+            fullPixelWidth,
+            fullPixelHeight,
+            NavigationTileGutterPixels);
         var tileBounds = new RectD(
-            pixelLeft / _navigationTileScale,
-            pixelTop / _navigationTileScale,
-            pixelWidth / _navigationTileScale,
-            pixelHeight / _navigationTileScale);
-        var tile = new CanvasRenderTarget(device, pixelWidth, pixelHeight, 96);
+            metrics.RenderPixelLeft / _navigationTileScale,
+            metrics.RenderPixelTop / _navigationTileScale,
+            metrics.RenderPixelWidth / _navigationTileScale,
+            metrics.RenderPixelHeight / _navigationTileScale);
+        var tile = new CanvasRenderTarget(device,
+            metrics.RenderPixelWidth, metrics.RenderPixelHeight, 96);
         using (var session = tile.CreateDrawingSession())
         {
             session.Clear(Color.FromArgb(0, 0, 0, 0));
@@ -1728,7 +1763,8 @@ public sealed partial class MainPage : Page
         }
 
         _navigationTiles[key] = tile;
-        _navigationTileBytes += (long)pixelWidth * pixelHeight * RenderScalePolicy.BytesPerPixel;
+        _navigationTileBytes += (long)metrics.RenderPixelWidth * metrics.RenderPixelHeight *
+                                RenderScalePolicy.BytesPerPixel;
         _frameNavigationTileBuilds++;
         return tile;
     }

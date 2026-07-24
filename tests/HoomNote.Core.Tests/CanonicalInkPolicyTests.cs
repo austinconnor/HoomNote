@@ -24,4 +24,23 @@ public sealed class CanonicalInkPolicyTests
     {
         Assert.Equal(expected, NavigationRefinementPolicy.TileBuildBudget(interactionActive));
     }
+
+    [Fact]
+    public void RefinementIsPresentedOnlyWhenTheVisibleSetIsComplete()
+    {
+        Assert.False(NavigationRefinementPolicy.ShouldPresentTiles(6, 0));
+        Assert.False(NavigationRefinementPolicy.ShouldPresentTiles(6, 5));
+        Assert.True(NavigationRefinementPolicy.ShouldPresentTiles(6, 6));
+    }
+
+    [Fact]
+    public void AdjacentTilesHaveContiguousCoresAndOverlappingRenderGutters()
+    {
+        var left = NavigationTileMetrics.Create(0, 0, 512, 1_200, 900, 2);
+        var right = NavigationTileMetrics.Create(1, 0, 512, 1_200, 900, 2);
+
+        Assert.Equal(left.CorePixelLeft + left.CorePixelWidth, right.CorePixelLeft);
+        Assert.True(left.RenderPixelLeft + left.RenderPixelWidth > right.RenderPixelLeft);
+        Assert.True(right.RenderPixelLeft < right.CorePixelLeft);
+    }
 }
