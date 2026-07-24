@@ -308,11 +308,26 @@
             </Border>
 
             <Grid Grid.Column="2" Background="#08090B">
-                <canvas:CanvasControl x:Name="DrawingSurface" ClearColor="Transparent" IsTabStop="True"
-                                       ManipulationMode="None"
-                                      CreateResources="OnCanvasCreateResources" Draw="OnCanvasDraw"
-                    PointerPressed="OnCanvasPointerPressed" PointerMoved="OnCanvasPointerMoved"
-                    PointerReleased="OnCanvasPointerReleased" PointerCanceled="OnCanvasPointerCanceled"
+                <canvas:CanvasAnimatedControl x:Name="PageSurface"
+                    ClearColor="Transparent"
+                    IsFixedTimeStep="False"
+                    Paused="True"
+                    SyncInterval="1"
+                    UseSharedDevice="True"
+                    CreateResources="OnPageSurfaceCreateResources"
+                    Draw="OnPageSurfaceDraw" />
+                <canvas:CanvasControl x:Name="DrawingSurface"
+                    ClearColor="Transparent"
+                    IsTabStop="True"
+                    ManipulationMode="None"
+                    UseSharedDevice="True"
+                    CreateResources="OnCanvasCreateResources"
+                    Draw="OnCanvasDraw"
+                    SizeChanged="OnDrawingSurfaceSizeChanged"
+                    PointerPressed="OnCanvasPointerPressed"
+                    PointerMoved="OnCanvasPointerMoved"
+                    PointerReleased="OnCanvasPointerReleased"
+                    PointerCanceled="OnCanvasPointerCanceled"
                     PointerCaptureLost="OnCanvasPointerCaptureLost"
                     PointerWheelChanged="OnCanvasPointerWheelChanged" />
                 <Canvas x:Name="EditorOverlay">

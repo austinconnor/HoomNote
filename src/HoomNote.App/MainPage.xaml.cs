@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Numerics;
 using Microsoft.Graphics.Canvas;
@@ -124,6 +125,9 @@ public sealed partial class MainPage : Page
     private const long ImageBitmapCacheBudget = 24L * 1024 * 1024;
     private long _imageBitmapBytes;
     private readonly HashSet<string> _pendingImageLoads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _queuedImageLoadRequests =
+        new(StringComparer.OrdinalIgnoreCase);
+    private int _queuedPdfLoadRequest;
     private readonly HashSet<string> _failedImageLoads = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, HashSet<Guid>> _imageWaitingPages = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<Guid> _imagePagesNeedingRefresh = [];
@@ -137,21 +141,21 @@ public sealed partial class MainPage : Page
     private const int PageThumbnailHeight = 116;
     private readonly List<CanvasCachedGeometry> _liveInkGeometryChunks = [];
     private int _liveInkChunkStart;
-    private CanvasRenderTarget? _liveInkRaster;
-    private Guid? _liveInkRasterPageId;
-    private int _liveInkRasterPointIndex;
-    private double _liveInkRasterWidth;
-    private double _liveInkRasterHeight;
-    private float _liveInkRasterDpi;
-    private Matrix3x2 _liveInkPageToScreen = Matrix3x2.Identity;
     private const int LiveInkChunkSize = 64;
-    private const double LiveInkMinimumScreenDistance = 0.65;
     private sealed record StrokeGeometryCacheEntry(
         InkStrokeObject Stroke,
         CanvasGeometry Geometry,
         Color Color,
         bool IsCenterline,
         float Width);
+    private sealed record PageRenderState(
+        NotePage? Page,
+        double Zoom,
+        Vector2 Pan,
+        double Width,
+        double Height,
+        float Dpi,
+        bool InteractionActive);
     private readonly Dictionary<Guid, StrokeGeometryCacheEntry> _strokeGeometryCache = [];
     private readonly LinkedList<Guid> _strokeGeometryLru = [];
     private readonly Dictionary<Guid, LinkedListNode<Guid>> _strokeGeometryLruNodes = [];
@@ -176,6 +180,20 @@ public sealed partial class MainPage : Page
     private readonly List<CanvasObject> _selectedObjects = [];
     private readonly Dictionary<Guid, CanvasObject> _multiTransformPreviews = [];
     private readonly Dictionary<Guid, CanvasObject> _styleBrushOriginals = [];
+    // The committed page is rendered by CanvasAnimatedControl on its dedicated game-loop
+    // thread. UI/input mutations publish immutable page/viewport state through InvalidateCanvas.
+    // GPU resources are created, drawn, and disposed while holding this renderer-owned gate.
+    private readonly object _pageRenderGate = new();
+    private int _pageRenderInvalidationRequested;
+    private int _strokeGeometryClearRequested;
+    private int _navigationTileClearRequested;
+    private double _canvasWidth = 1;
+    private double _canvasHeight = 1;
+    private float _canvasDpi = 96;
+    private PageRenderState _publishedPageRenderState =
+        new(null, 1, Vector2.Zero, 1, 1, 96, false);
+    private NotePage? _publishedPageSnapshot;
+    private int _publishedPageEditVersion = -1;
     private readonly MenuFlyout _notebookContextMenu = new();
     private readonly MenuFlyout _folderContextMenu = new();
     private readonly MenuFlyout _pageContextMenu = new();
@@ -193,9 +211,7 @@ public sealed partial class MainPage : Page
     private readonly HashSet<Guid> _pageRenderCacheObjectIds = [];
     private readonly List<CanvasObject> _pageRenderOverlays = [];
     private readonly List<CanvasCommandList> _pageRenderOverlayBatches = [];
-    private readonly Dictionary<Guid, CanvasRenderTarget> _warmPageRenderCaches = [];
-    private readonly LinkedList<Guid> _warmPageRenderLru = [];
-    private const int WarmPageRenderCacheLimit = 1;
+    private readonly ConcurrentQueue<(Guid PageId, CanvasObject Object)> _pendingPageRenderAppends = new();
     // Keep recent strokes as cached geometry while the user writes. Compiling every pen-up into
     // a command list created a visible hitch between letters; batching amortizes that work.
     private const int OverlayBatchSize = 8;
@@ -234,7 +250,6 @@ public sealed partial class MainPage : Page
     private CancellationTokenSource? _incrementalRecognitionCancellation;
     private readonly DispatcherQueueTimer _thumbnailRefreshTimer;
     private readonly DispatcherQueueTimer _navigationSettleTimer;
-    private readonly DispatcherQueueTimer _liveInkRasterReleaseTimer;
     private Guid? _pendingThumbnailRefreshPageId;
     private EditorTool _activeTool = EditorTool.Select;
     private EditorTool _gestureTool = EditorTool.Select;
@@ -367,13 +382,6 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.Interval = TimeSpan.FromMilliseconds(180);
         _navigationSettleTimer.IsRepeating = false;
         _navigationSettleTimer.Tick += OnNavigationSettleTick;
-        _liveInkRasterReleaseTimer = DispatcherQueue.CreateTimer();
-        _liveInkRasterReleaseTimer.Interval = TimeSpan.FromSeconds(2);
-        _liveInkRasterReleaseTimer.IsRepeating = false;
-        _liveInkRasterReleaseTimer.Tick += (_, _) =>
-        {
-            if (!_isPointerDown) DisposeLiveInkRaster();
-        };
         AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnGlobalKeyDown), handledEventsToo: true);
         PageList.ItemsSource = _pages;
         SearchResultsList.ItemsSource = _searchResults;
@@ -382,9 +390,8 @@ public sealed partial class MainPage : Page
         SetInkColor(_inkColor, rememberForTool: false);
         _pdfPreview.PreviewAvailable += (_, _) => DispatcherQueue.TryEnqueue(() =>
         {
-            ClearWarmPageRenderCaches();
             InvalidatePageRenderCache();
-            DrawingSurface.Invalidate();
+            InvalidateCanvas();
         });
     }
 
@@ -463,7 +470,6 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.Stop();
         _wheelZoomAnimating = false;
         StopViewportFramePump();
-        _liveInkRasterReleaseTimer.Stop();
         StopTouchInertia(resumeBackgroundWork: false);
         _touchPoints.Clear();
         _isPointerDown = false;
@@ -482,12 +488,15 @@ public sealed partial class MainPage : Page
         if (_document is not null) await SaveNowAsync();
         if (_userSettingsStore is not null) await SaveUserPreferencesAsync();
         if (_repository is not null) await _repository.DisposeAsync();
-        InvalidatePageRenderCache();
-        ClearWarmPageRenderCaches();
+        PageSurface.RemoveFromVisualTree();
+        DrawingSurface.RemoveFromVisualTree();
+        lock (_pageRenderGate)
+        {
+            InvalidatePageRenderCacheCore();
+            ClearStrokeGeometryCacheCore();
+            ClearImageBitmapCacheCore();
+        }
         ClearLiveInkGeometryCache();
-        DisposeLiveInkRaster();
-        ClearStrokeGeometryCache();
-        ClearImageBitmapCache();
         _roundInkStrokeStyle.Dispose();
         _pdfPreview.Dispose();
         DiagnosticsLog.Info("main.unloaded");
@@ -1206,13 +1215,13 @@ public sealed partial class MainPage : Page
         _pendingRecognitionStrokes.Clear();
         _recognitionPageId = page?.Id;
         CommitOrDiscardTextEditor();
-        StashCurrentPageRenderCache();
+        // The game-loop renderer owns retained GPU resources. Page switches publish an
+        // invalidation instead of moving render targets on the UI thread.
+        InvalidatePageRenderCache();
         _searchLocateCancellation?.Cancel();
         _searchFlashBounds.Clear();
         _searchFlashStarted = 0;
         _page = page;
-        _liveInkRasterReleaseTimer.Stop();
-        DisposeLiveInkRaster();
         ClearStrokeGeometryCache();
         _selectedObject = null;
         _selectedObjects.Clear();
@@ -1220,7 +1229,6 @@ public sealed partial class MainPage : Page
         _transformPreview = null;
         _fitPending = true;
         _pan = Vector2.Zero;
-        RestoreWarmPageRenderCache(page);
         PrepareSpatialIndex(page);
         SyncTemplatePicker();
         UpdateSelectionUi();
@@ -1228,14 +1236,29 @@ public sealed partial class MainPage : Page
         DeletePageButton.IsEnabled = page is not null;
         BeginPdfPreviewLoad();
         UpdateEmptyState();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
-    private void BeginPdfPreviewLoad()
+    private void BeginPdfPreviewLoad(NotePage? requestedPage = null)
     {
-        var layer = _page?.ImportedLayer;
+        var layer = (requestedPage ?? _page)?.ImportedLayer;
         if (layer is null || _assetStore is null) return;
         _ = LoadPdfPreviewAsync(_assetStore.GetPath(layer.AssetHash), layer.SourcePageIndex);
+    }
+
+    private void RequestPdfPreviewLoad(NotePage page)
+    {
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            BeginPdfPreviewLoad(page);
+            return;
+        }
+        if (Interlocked.Exchange(ref _queuedPdfLoadRequest, 1) != 0) return;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            Interlocked.Exchange(ref _queuedPdfLoadRequest, 0);
+            BeginPdfPreviewLoad(page);
+        });
     }
 
     private async Task LoadPdfPreviewAsync(string path, int pageIndex)
@@ -1243,7 +1266,7 @@ public sealed partial class MainPage : Page
         try
         {
             await _pdfPreview.EnsureLoadedAsync(path, pageIndex);
-            DispatcherQueue.TryEnqueue(() => DrawingSurface.Invalidate());
+            DispatcherQueue.TryEnqueue(InvalidateCanvas);
         }
         catch (Exception exception)
         {
@@ -1251,49 +1274,171 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void OnDrawingSurfaceSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        _canvasWidth = Math.Max(1, e.NewSize.Width);
+        _canvasHeight = Math.Max(1, e.NewSize.Height);
+        _canvasDpi = DrawingSurface.Dpi;
+        InvalidateCanvas();
+    }
+
+    private void EnsureFitViewport()
+    {
+        if (!_fitPending || _page is null || _canvasWidth <= 0 || _canvasHeight <= 0) return;
+        _zoom = Math.Min(1, Math.Min(
+            (_canvasWidth - 72) / _page.Size.Width,
+            (_canvasHeight - 72) / _page.Size.Height));
+        _zoom = Math.Max(0.08, _zoom);
+        _fitPending = false;
+        UpdateZoomText();
+    }
+
+    private void InvalidateCanvas()
+    {
+        if (!DispatcherQueue.HasThreadAccess)
+        {
+            DispatcherQueue.TryEnqueue(InvalidateCanvas);
+            return;
+        }
+
+        EnsureFitViewport();
+        _canvasDpi = DrawingSurface.Dpi;
+        PublishPageRenderState();
+        // Invalidate is nonblocking. The committed page consumes the latest published viewport
+        // on the Win2D game-loop thread while the UI-thread overlay remains responsive.
+        PageSurface.Invalidate();
+        DrawingSurface.Invalidate();
+    }
+
+    private void PublishPageRenderState()
+    {
+        if (_page is null)
+        {
+            _publishedPageSnapshot = null;
+            _publishedPageEditVersion = _editVersion;
+        }
+        else if (_publishedPageSnapshot?.Id != _page.Id || _publishedPageEditVersion != _editVersion)
+        {
+            // Canvas objects and their point arrays are immutable after command commit. Copying
+            // only the page shell/list gives the render thread a stable scene in O(object count)
+            // per edit, never per pointer frame and never O(sample count).
+            _publishedPageSnapshot = _page with
+            {
+                Template = _page.Template with { },
+                ImportedLayer = _page.ImportedLayer is null ? null : _page.ImportedLayer with { },
+                Objects = _page.Objects.ToList()
+            };
+            _publishedPageEditVersion = _editVersion;
+        }
+
+        var interactionActive = _isPointerDown || _touchPoints.Count > 0 ||
+                                _touchInertiaActive || _wheelZoomAnimating ||
+                                _zoomNavigationActive;
+        Volatile.Write(ref _publishedPageRenderState, new PageRenderState(
+            _publishedPageSnapshot,
+            _zoom,
+            _pan,
+            _canvasWidth,
+            _canvasHeight,
+            _canvasDpi,
+            interactionActive));
+    }
+
     private void OnCanvasCreateResources(CanvasControl sender, CanvasCreateResourcesEventArgs args)
     {
-        // Device resets invalidate command lists and live-stroke resources.
-        ClearWarmPageRenderCaches();
-        InvalidatePageRenderCache();
+        // Both surfaces share one device. The overlay owns only ephemeral interaction resources;
+        // committed page resources are rebuilt by the dedicated game-loop surface.
         ClearLiveInkGeometryCache();
-        DisposeLiveInkRaster();
-        ClearStrokeGeometryCache();
-        ClearImageBitmapCache();
+    }
+
+    private void OnPageSurfaceCreateResources(
+        CanvasAnimatedControl sender,
+        CanvasCreateResourcesEventArgs args)
+    {
+        lock (_pageRenderGate)
+        {
+            Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0);
+            Interlocked.Exchange(ref _strokeGeometryClearRequested, 0);
+            Interlocked.Exchange(ref _navigationTileClearRequested, 0);
+            InvalidatePageRenderCacheCore();
+            ClearStrokeGeometryCacheCore();
+            ClearImageBitmapCacheCore();
+        }
+    }
+
+    private void OnPageSurfaceDraw(
+        ICanvasAnimatedControl sender,
+        CanvasAnimatedDrawEventArgs args)
+    {
+        lock (_pageRenderGate)
+        {
+            ApplyPendingPageRenderInvalidations();
+            var state = Volatile.Read(ref _publishedPageRenderState);
+            if (state.Page is not { } page) return;
+            DrainPageRenderAppends(page.Id);
+            var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            _frameStrokeGeometryBuilds = 0;
+            _frameNavigationTileBuilds = 0;
+            _frameRenderMode = "none";
+
+            var drawingSession = args.DrawingSession;
+            drawingSession.Transform = PageTransform(
+                page, state.Zoom, state.Pan, state.Width, state.Height);
+            if (ShouldDrawInteractiveViewport(page, state))
+            {
+                _frameRenderMode = "viewport-vectors";
+                DrawInteractiveViewport(drawingSession, page, state);
+            }
+            else
+            {
+                DrawCachedPage(PageSurface.Device, drawingSession, page, state);
+            }
+            RecordCanvasFrame(frameStarted);
+        }
+    }
+
+    private void ApplyPendingPageRenderInvalidations()
+    {
+        var clearedPage = Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0) != 0;
+        if (clearedPage)
+            InvalidatePageRenderCacheCore();
+        else if (Interlocked.Exchange(ref _navigationTileClearRequested, 0) != 0)
+            ClearNavigationTileCacheCore();
+        if (Interlocked.Exchange(ref _strokeGeometryClearRequested, 0) != 0)
+            ClearStrokeGeometryCacheCore();
+    }
+
+    private void DrainPageRenderAppends(Guid pageId)
+    {
+        while (_pendingPageRenderAppends.TryDequeue(out var pending))
+        {
+            if (pageId != pending.PageId) continue;
+            var canKeepCache =
+                ((_pageRenderCache is not null && _pageRenderCachePageId == pending.PageId) ||
+                 (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == pending.PageId) ||
+                 (_navigationTilePageId == pending.PageId && _navigationTiles.Count > 0)) &&
+                !_pageRenderCacheObjectIds.Contains(pending.Object.Id);
+            if (canKeepCache)
+            {
+                _pageRenderOverlays.Add(pending.Object);
+                continue;
+            }
+
+            // The document already contains the append. Rebuilding now records the current
+            // source of truth, so remaining queued appends for this page need no special case.
+            InvalidatePageRenderCacheCore();
+            while (_pendingPageRenderAppends.TryPeek(out var next) && next.PageId == pending.PageId)
+                _pendingPageRenderAppends.TryDequeue(out _);
+            break;
+        }
     }
 
     private void OnCanvasDraw(CanvasControl sender, CanvasDrawEventArgs args)
     {
         if (_page is null) return;
-        var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-        _frameStrokeGeometryBuilds = 0;
-        _frameNavigationTileBuilds = 0;
-        _frameRenderMode = "none";
-        if (_fitPending && sender.ActualWidth > 0 && sender.ActualHeight > 0)
-        {
-            _zoom = Math.Min(1, Math.Min((sender.ActualWidth - 72) / _page.Size.Width,
-                (sender.ActualHeight - 72) / _page.Size.Height));
-            _zoom = Math.Max(0.08, _zoom);
-            _fitPending = false;
-            UpdateZoomText();
-        }
-
         var drawingSession = args.DrawingSession;
         drawingSession.Transform = PageTransform();
         var styleBrushPreview = _isPointerDown && _gestureTool == EditorTool.Style && !_styleToolPickMode;
-        if (_transformPreview is null && _textPreview is null &&
-            (_multiTransformPreviews.Count == 0 || styleBrushPreview))
-        {
-            if (ShouldDrawInteractiveViewport(_page))
-            {
-                _frameRenderMode = "viewport-vectors";
-                DrawInteractiveViewport(drawingSession, _page);
-            }
-            else
-                DrawCachedPage(sender, drawingSession, _page);
-        }
-        else
-            DrawCommittedPage(drawingSession, _page, usePreviews: true);
 
         if (_isPointerDown && _gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser &&
             _eraseDirtyRegions.Count > 0)
@@ -1305,28 +1450,8 @@ public sealed partial class MainPage : Page
 
         if (_activeInk.Count > 0 && _gestureTool is EditorTool.Pen or EditorTool.Highlighter)
         {
-            var useLiveInkRaster = CanUseLiveInkRaster();
-            if (useLiveInkRaster)
-                UpdateLiveInkRaster();
-            if (useLiveInkRaster && _liveInkRaster is not null)
-            {
-                var liveOpacity = (_gestureInkStyle ?? CurrentInkStyle()).Normalize().Opacity;
-                var pageTransform = drawingSession.Transform;
-                drawingSession.Transform = Matrix3x2.Identity;
-                if (liveOpacity < 0.995f)
-                {
-                    using var layer = drawingSession.CreateLayer(liveOpacity);
-                    drawingSession.DrawImage(_liveInkRaster);
-                }
-                else
-                {
-                    drawingSession.DrawImage(_liveInkRaster);
-                }
-                drawingSession.Transform = pageTransform;
-                DrawLiveInkPrediction(drawingSession);
-            }
-            else
-                DrawLiveInk(drawingSession);
+            DrawLiveInk(drawingSession);
+            DrawLiveInkPrediction(drawingSession);
         }
 
         if (_isPointerDown && _gestureTool == EditorTool.Shape && _activeInk.Count > 0)
@@ -1355,7 +1480,6 @@ public sealed partial class MainPage : Page
             DrawSelectionMarquee(drawingSession);
 
         UpdateImageLockOverlay();
-        RecordCanvasFrame(frameStarted);
     }
 
     private void RecordCanvasFrame(long frameStarted)
@@ -1374,7 +1498,6 @@ public sealed partial class MainPage : Page
         var cachedStrokeCount = _strokeGeometryCache.Count;
         var cachedStrokePoints = _strokeGeometryCachedPoints;
         var activeInkPoints = _activeInk.Count;
-        var liveRasterActive = _liveInkRaster is not null && activeInkPoints > 0;
         var wheelZoomAnimating = _wheelZoomAnimating;
         var renderMode = _frameRenderMode;
         var visibleObjects = _visibleObjects.Count;
@@ -1400,31 +1523,30 @@ public sealed partial class MainPage : Page
             ("navigation_tile_mb", navigationTileMb),
             ("wheel_zoom", wheelZoomAnimating),
             ("active_ink_points", activeInkPoints),
-            ("live_raster", liveRasterActive),
             ("overlay_objects", overlayCount),
             ("overlay_batches", overlayBatchCount)));
     }
 
-    private void DrawCachedPage(CanvasControl sender, CanvasDrawingSession drawingSession, NotePage page)
+    private void DrawCachedPage(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
+        PageRenderState state)
     {
         // Normal reading and navigation should be a single textured quad, not a replay of every
         // vector command on every pan frame. Vector objects remain the source of truth and are
         // used again once the user zooms in far enough to benefit from their extra resolution.
-        var useLowZoomRaster = CanUseNavigationSnapshot(page);
+        var useLowZoomRaster = CanUseNavigationSnapshot(page, state);
         if (useLowZoomRaster)
         {
-            EnsureLowZoomPageRaster(sender.Device, page);
+            EnsureLowZoomPageRaster(device, page);
             _frameRenderMode = "page-raster";
         }
         else
         {
-            DrawNavigationTiles(sender.Device, drawingSession, page);
+            DrawNavigationTiles(device, drawingSession, page, state);
             _frameRenderMode = "native-tiles";
         }
-        while (!_isPointerDown && _touchPoints.Count == 0 &&
-               _pageRenderOverlays.Count >= OverlayBatchSize)
+        while (!state.InteractionActive && _pageRenderOverlays.Count >= OverlayBatchSize)
         {
-            var batch = new CanvasCommandList(sender.Device);
+            var batch = new CanvasCommandList(device);
             using (var batchSession = batch.CreateDrawingSession())
             {
                 for (var index = 0; index < OverlayBatchSize; index++)
@@ -1432,7 +1554,7 @@ public sealed partial class MainPage : Page
             }
             _pageRenderOverlayBatches.Add(batch);
             _pageRenderOverlays.RemoveRange(0, OverlayBatchSize);
-            CompactOverlayBatches(sender.Device);
+            CompactOverlayBatches(device);
         }
         if (useLowZoomRaster &&
             _pageRenderOverlayBatches.Count * OverlayBatchSize + _pageRenderOverlays.Count >= 12)
@@ -1456,34 +1578,44 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private bool ShouldDrawInteractiveViewport(NotePage page)
+    private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
     {
+        // Interaction must never replay a dense vector scene. Keep presenting retained content
+        // while pan/pinch/wheel state changes; native tiles refine only after the viewport settles.
+        if (state.InteractionActive) return false;
         // The retained snapshot is used only while it has enough source pixels for the current
         // monitor. Beyond that point, draw the visible vector scene through the spatial index.
         // This removes the old object-count and zoom-threshold mode switches that caused the
         // renderer to oscillate between three unrelated pipelines at intermediate zoom levels.
-        return !CanUseNavigationSnapshot(page) && !CanUseNativeNavigationTiles(page);
+        return !CanUseNavigationSnapshot(page, state) && !CanUseNativeNavigationTiles(page, state);
     }
 
-    private bool CanUseNavigationSnapshot(NotePage page)
+    private static bool CanUseNavigationSnapshot(NotePage page, PageRenderState state)
     {
         if (page.Size.Width <= 0 || page.Size.Height <= 0) return false;
         return RenderScalePolicy.HasNativeDisplayResolution(
-            NavigationSnapshotScale(page), _zoom, DrawingSurface.Dpi);
+            NavigationSnapshotScale(page), state.Zoom, state.Dpi);
     }
 
-    private bool CanUseNativeNavigationTiles(NotePage page) =>
-        page.Objects.Count >= NavigationTileObjectThreshold &&
-        !_wheelZoomAnimating &&
-        !_zoomNavigationActive &&
-        _touchPoints.Count < 2;
+    private static bool CanUseNativeNavigationTiles(NotePage page, PageRenderState state) =>
+        page.Objects.Count >= NavigationTileObjectThreshold && !state.InteractionActive;
 
-    private void DrawNavigationTiles(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page)
+    private void DrawNavigationTiles(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
+        PageRenderState state)
     {
-        var scale = RenderScalePolicy.ComputeNativeTileScale(_zoom, DrawingSurface.Dpi);
+        var scale = RenderScalePolicy.ComputeNativeTileScale(state.Zoom, state.Dpi);
         EnsureNavigationTileSet(page, scale);
-        var visibleBounds = VisiblePageBounds(page, 0);
+        var visibleBounds = VisiblePageBounds(page, 0, state);
         if (visibleBounds.Width <= 0 || visibleBounds.Height <= 0) return;
+
+        // Always present the last complete page immediately. Native-resolution tiles replace
+        // this progressively, so pan/zoom never waits for a batch of raster builds and never
+        // drops to a blank or deliberately blurred interaction surface.
+        if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id)
+            drawingSession.DrawImage(_lowZoomPageRaster,
+                new Rect(0, 0, page.Size.Width, page.Size.Height));
+        else if (_pageRenderCache is not null && _pageRenderCachePageId == page.Id)
+            drawingSession.DrawImage(_pageRenderCache);
 
         var fullPixelWidth = Math.Max(1, (int)Math.Ceiling(page.Size.Width * scale));
         var fullPixelHeight = Math.Max(1, (int)Math.Ceiling(page.Size.Height * scale));
@@ -1499,17 +1631,36 @@ public sealed partial class MainPage : Page
             minimumTileY, Math.Max(0, (fullPixelHeight - 1) / NavigationTilePixels));
 
         _visibleNavigationTileKeys.Clear();
+        (int X, int Y)? firstMissing = null;
         for (var tileY = minimumTileY; tileY <= maximumTileY; tileY++)
         for (var tileX = minimumTileX; tileX <= maximumTileX; tileX++)
         {
             var key = (tileX, tileY);
             _visibleNavigationTileKeys.Add(key);
-            var tile = GetOrCreateNavigationTile(device, page, key, fullPixelWidth, fullPixelHeight);
+            if (!_navigationTiles.TryGetValue(key, out var tile))
+            {
+                firstMissing ??= key;
+                continue;
+            }
             TouchNavigationTile(key);
             var tileLeft = tileX * NavigationTilePixels / scale;
             var tileTop = tileY * NavigationTilePixels / scale;
             drawingSession.DrawImage(tile, new Rect(tileLeft, tileTop,
                 tile.SizeInPixels.Width / scale, tile.SizeInPixels.Height / scale));
+        }
+
+        // A single refinement per settled frame bounds worst-case work. The previous renderer
+        // built every visible miss synchronously (24 tiles in one observed 35 ms frame).
+        if (NavigationRefinementPolicy.TileBuildBudget(state.InteractionActive) > 0 &&
+            firstMissing is { } missing)
+        {
+            var tile = GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight);
+            TouchNavigationTile(missing);
+            var tileLeft = missing.X * NavigationTilePixels / scale;
+            var tileTop = missing.Y * NavigationTilePixels / scale;
+            drawingSession.DrawImage(tile, new Rect(tileLeft, tileTop,
+                tile.SizeInPixels.Width / scale, tile.SizeInPixels.Height / scale));
+            DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
         }
         TrimNavigationTiles();
     }
@@ -1519,12 +1670,9 @@ public sealed partial class MainPage : Page
         if (_navigationTilePageId == page.Id && Math.Abs(_navigationTileScale - scale) < 0.0001)
             return;
 
-        ClearNavigationTileCache();
+        ClearNavigationTileCacheCore();
         _navigationTilePageId = page.Id;
         _navigationTileScale = scale;
-        _lowZoomPageRaster?.Dispose();
-        _lowZoomPageRaster = null;
-        _lowZoomPageRasterPageId = null;
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
         if (_pageRenderCachePageId != page.Id || _pageRenderCacheObjectIds.Count == 0)
@@ -1611,9 +1759,10 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void DrawInteractiveViewport(CanvasDrawingSession drawingSession, NotePage page)
+    private void DrawInteractiveViewport(CanvasDrawingSession drawingSession, NotePage page,
+        PageRenderState state)
     {
-        var visibleBounds = VisiblePageBounds(page, 32 / Math.Max(_zoom, 0.08));
+        var visibleBounds = VisiblePageBounds(page, 32 / Math.Max(state.Zoom, 0.08), state);
         DrawPageBackground(drawingSession, page, visibleBounds);
         DrawImportedLayer(drawingSession, page);
         if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, visibleBounds);
@@ -1640,13 +1789,14 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private RectD VisiblePageBounds(NotePage page, double padding)
+    private static RectD VisiblePageBounds(NotePage page, double padding, PageRenderState state)
     {
-        if (!Matrix3x2.Invert(PageTransform(), out var inverse))
+        if (!Matrix3x2.Invert(PageTransform(
+                page, state.Zoom, state.Pan, state.Width, state.Height), out var inverse))
             return new RectD(0, 0, page.Size.Width, page.Size.Height);
         var topLeft = Vector2.Transform(Vector2.Zero, inverse);
         var bottomRight = Vector2.Transform(
-            new Vector2((float)DrawingSurface.ActualWidth, (float)DrawingSurface.ActualHeight), inverse);
+            new Vector2((float)state.Width, (float)state.Height), inverse);
         var left = Math.Max(0, Math.Min(topLeft.X, bottomRight.X) - padding);
         var top = Math.Max(0, Math.Min(topLeft.Y, bottomRight.Y) - padding);
         var right = Math.Min(page.Size.Width, Math.Max(topLeft.X, bottomRight.X) + padding);
@@ -1670,7 +1820,7 @@ public sealed partial class MainPage : Page
     private void EnsureLowZoomPageRaster(CanvasDevice device, NotePage page)
     {
         if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) return;
-        ClearNavigationTileCache();
+        ClearNavigationTileCacheCore();
         var rasterScale = NavigationSnapshotScale(page);
         var width = Math.Max(1, page.Size.Width * rasterScale);
         var height = Math.Max(1, page.Size.Height * rasterScale);
@@ -1807,85 +1957,9 @@ public sealed partial class MainPage : Page
         drawingSession.DrawGeometry(geometry, color, width, _roundInkStrokeStyle);
     }
 
-    private bool CanUseLiveInkRaster()
-    {
-        if (_page is null || _gestureTool is not (EditorTool.Pen or EditorTool.Highlighter)) return false;
-        if (_gestureTool == EditorTool.Highlighter && HighlighterStraightToggle.IsOn) return false;
-        return DrawingSurface.ActualWidth > 0 && DrawingSurface.ActualHeight > 0;
-    }
-
-    private void ResetLiveInkRaster()
-    {
-        _liveInkRasterPointIndex = 0;
-        if (!CanUseLiveInkRaster() || _page is null) return;
-        var width = DrawingSurface.ActualWidth;
-        var height = DrawingSurface.ActualHeight;
-        var dpi = DrawingSurface.Dpi;
-        if (_liveInkRaster is null || _liveInkRasterPageId != _page.Id ||
-            Math.Abs(_liveInkRasterWidth - width) > 0.5 ||
-            Math.Abs(_liveInkRasterHeight - height) > 0.5 ||
-            Math.Abs(_liveInkRasterDpi - dpi) > 0.1f)
-        {
-            DisposeLiveInkRaster();
-            _liveInkRaster = new CanvasRenderTarget(DrawingSurface.Device,
-                (float)Math.Max(1, width), (float)Math.Max(1, height), dpi);
-            _liveInkRasterPageId = _page.Id;
-            _liveInkRasterWidth = width;
-            _liveInkRasterHeight = height;
-            _liveInkRasterDpi = dpi;
-        }
-        _liveInkPageToScreen = _gestureScreenToPageValid &&
-                               Matrix3x2.Invert(_gestureScreenToPage, out var pageToScreen)
-            ? pageToScreen
-            : PageTransform();
-        using var session = _liveInkRaster.CreateDrawingSession();
-        session.Clear(Color.FromArgb(0, 0, 0, 0));
-    }
-
-    private void UpdateLiveInkRaster()
-    {
-        if (!CanUseLiveInkRaster() || _page is null || _activeInk.Count == 0) return;
-        if (_liveInkRaster is null || _liveInkRasterPageId != _page.Id) ResetLiveInkRaster();
-        if (_liveInkRaster is null) return;
-        var style = (_gestureInkStyle ?? CurrentInkStyle()).Normalize();
-        // Build one opaque mask for the entire live stroke, then apply its opacity once while
-        // compositing. This prevents translucent pen/highlighter segments from darkening where
-        // the incremental line pieces overlap.
-        var color = ParseColor(style.Color);
-        using var session = _liveInkRaster.CreateDrawingSession();
-        session.Transform = _liveInkPageToScreen;
-        if (_liveInkRasterPointIndex == 0)
-        {
-            var first = _activeInk[0];
-            session.FillCircle((float)first.X, (float)first.Y, style.Width / 2f, color);
-            _liveInkRasterPointIndex = 1;
-        }
-        var start = Math.Max(1, _liveInkRasterPointIndex);
-        for (var index = start; index < _activeInk.Count; index++)
-        {
-            var previous = _activeInk[index - 1];
-            var current = _activeInk[index];
-            session.DrawLine(previous.Position.ToVector2(), current.Position.ToVector2(),
-                color, style.Width, _roundInkStrokeStyle);
-        }
-        _liveInkRasterPointIndex = _activeInk.Count;
-    }
-
-    private void DisposeLiveInkRaster()
-    {
-        _liveInkRaster?.Dispose();
-        _liveInkRaster = null;
-        _liveInkRasterPageId = null;
-        _liveInkRasterPointIndex = 0;
-        _liveInkRasterWidth = 0;
-        _liveInkRasterHeight = 0;
-        _liveInkRasterDpi = 0;
-        _liveInkPageToScreen = Matrix3x2.Identity;
-    }
-
     private void DrawLiveInkPrediction(CanvasDrawingSession drawingSession)
     {
-        if (_activeInk.Count < 2 || !CanUseLiveInkRaster()) return;
+        if (_activeInk.Count < 2 || _gestureTool != EditorTool.Pen) return;
         var style = (_gestureInkStyle ?? CurrentInkStyle()).Normalize();
         if (style.Tool != InkToolKind.Pen || style.Opacity < 0.995f) return;
         var previous = _activeInk[^2];
@@ -2001,7 +2075,7 @@ public sealed partial class MainPage : Page
             // Selection can happen before the async page load or after a device/resource reset.
             // Re-requesting here is cheap (the cache de-duplicates loads) and makes the canvas
             // self-healing instead of relying on an unrelated UI toggle to trigger a redraw.
-            BeginPdfPreviewLoad();
+            RequestPdfPreviewLoad(page);
             drawingSession.FillRectangle(0, 0, (float)page.Size.Width, 42, Color.FromArgb(210, 37, 43, 54));
             drawingSession.DrawText($"Loading {layer.SourceName} • page {layer.SourcePageIndex + 1}", 18, 12,
                 Color.FromArgb(255, 218, 225, 235));
@@ -2072,7 +2146,22 @@ public sealed partial class MainPage : Page
             (float)image.Bounds.Width, (float)image.Bounds.Height, Color.FromArgb(255, 113, 167, 255), 1);
         drawingSession.DrawText("Loading image…", (float)image.Bounds.X + 12, (float)image.Bounds.Y + 12,
             Color.FromArgb(255, 210, 218, 230));
-        BeginImageLoad(image);
+        RequestImageLoad(image);
+    }
+
+    private void RequestImageLoad(ImageObject image)
+    {
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            BeginImageLoad(image);
+            return;
+        }
+        if (!_queuedImageLoadRequests.TryAdd(image.AssetHash, 0)) return;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _queuedImageLoadRequests.TryRemove(image.AssetHash, out _);
+            BeginImageLoad(image);
+        });
     }
 
     private void BeginImageLoad(ImageObject image)
@@ -2123,11 +2212,10 @@ public sealed partial class MainPage : Page
                 // Re-record a dense page once after its image batch is ready, rather than once
                 // per image. Rebuilding thousands of vector strokes for every decode caused a
                 // visible sequence of stalls on Samsung pages with many embedded images.
-                foreach (var pageId in _imagePagesNeedingRefresh) RemoveWarmPageRenderCache(pageId);
                 if (_page is not null && _imagePagesNeedingRefresh.Contains(_page.Id))
                 {
                     InvalidatePageRenderCache();
-                    DrawingSurface.Invalidate();
+                    InvalidateCanvas();
                 }
                 _imagePagesNeedingRefresh.Clear();
             }
@@ -2229,11 +2317,13 @@ public sealed partial class MainPage : Page
     {
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
-            var centerline = StrokeOutlineBuilder.FitCenterline(stroke);
-            if (centerline.Count < 2) return null;
+            if (stroke.Points.Count < 2) return null;
+            var geometry = ShouldUseCanonicalSmoothCenterline(stroke)
+                ? CreateSmoothCenterlineGeometry(resourceCreator, stroke.Points, 0, stroke.Points.Count)
+                : CreateCenterlineGeometry(resourceCreator, StrokeOutlineBuilder.FitCenterline(stroke));
             return new StrokeGeometryCacheEntry(
                 stroke,
-                CreateCenterlineGeometry(resourceCreator, centerline),
+                geometry,
                 color,
                 IsCenterline: true,
                 Width: StrokeOutlineBuilder.VectorCenterlineWidth(stroke.Style));
@@ -2317,7 +2407,9 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        var centerline = StrokeOutlineBuilder.FitCenterline(stroke);
+        var centerline = ShouldUseCanonicalSmoothCenterline(stroke)
+            ? stroke.Points
+            : StrokeOutlineBuilder.FitCenterline(stroke);
         if (centerline.Count == 0) return;
         if (centerline.Count == 1)
         {
@@ -2326,9 +2418,14 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        using var geometry = CreateCenterlineGeometry(drawingSession, centerline);
+        using var geometry = ShouldUseCanonicalSmoothCenterline(stroke)
+            ? CreateSmoothCenterlineGeometry(drawingSession, centerline, 0, centerline.Count)
+            : CreateCenterlineGeometry(drawingSession, centerline);
         drawingSession.DrawGeometry(geometry, color, width, _roundInkStrokeStyle);
     }
+
+    private static bool ShouldUseCanonicalSmoothCenterline(InkStrokeObject stroke) =>
+        !stroke.Style.PreserveSourceGeometry && stroke.Style.Smoothing > 0;
 
     private static CanvasGeometry CreateCenterlineGeometry(ICanvasResourceCreator resourceCreator,
         IReadOnlyList<InkPoint> centerline)
@@ -2520,7 +2617,6 @@ public sealed partial class MainPage : Page
     {
         if (_page is null) return;
         StopWheelZoomAnimation(resumeBackgroundWork: false);
-        _liveInkRasterReleaseTimer.Stop();
         var point = e.GetCurrentPoint(DrawingSurface);
         if (point.PointerDeviceType == PointerDeviceType.Mouse &&
             MillisecondsSince(_lastNativeTouchTimestamp) < 500)
@@ -2587,7 +2683,6 @@ public sealed partial class MainPage : Page
         _activeInk.Clear();
         _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         ClearLiveInkGeometryCache();
-        ResetLiveInkRaster();
         _eraserPath.Clear();
         _eraseDirtyRegions.Clear();
         _eraseSnapshot = _gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser
@@ -2657,7 +2752,7 @@ public sealed partial class MainPage : Page
         }
 
         e.Handled = true;
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void OnCanvasPointerMoved(object sender, PointerRoutedEventArgs e)
@@ -2733,7 +2828,7 @@ public sealed partial class MainPage : Page
         }
 
         e.Handled = true;
-        if (redraw) DrawingSurface.Invalidate();
+        if (redraw) InvalidateCanvas();
     }
 
     private void OnCanvasPointerReleased(object sender, PointerRoutedEventArgs e)
@@ -2834,12 +2929,6 @@ public sealed partial class MainPage : Page
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         _activeInk.Clear();
         ClearLiveInkGeometryCache();
-        _liveInkRasterPointIndex = 0;
-        if (_liveInkRaster is not null)
-        {
-            _liveInkRasterReleaseTimer.Stop();
-            _liveInkRasterReleaseTimer.Start();
-        }
         _eraserPath.Clear();
         _eraseDirtyRegions.Clear();
         _transformOriginal = null;
@@ -2852,7 +2941,7 @@ public sealed partial class MainPage : Page
         _gestureInkStyle = null;
         _gestureScreenToPageValid = false;
         e.Handled = true;
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         ResumeBackgroundRecognition();
         ResumeThumbnailRefresh();
     }
@@ -2980,7 +3069,7 @@ public sealed partial class MainPage : Page
 
         if (!ended) return;
         PointerStatus.Text = "Windows Ink";
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         if (!TryStartTouchInertia())
         {
             ResumeBackgroundRecognition();
@@ -3017,7 +3106,7 @@ public sealed partial class MainPage : Page
         }
 
         PointerStatus.Text = "Windows Ink";
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         if (!TryStartTouchInertia())
         {
             ResumeBackgroundRecognition();
@@ -3076,7 +3165,7 @@ public sealed partial class MainPage : Page
             UpdateZoomText();
         }
         _fitPending = false;
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void UpdateTouchVelocity(Point centroid)
@@ -3159,7 +3248,7 @@ public sealed partial class MainPage : Page
         }
         if (!_zoomNavigationActive) return;
         _zoomNavigationActive = false;
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private bool AdvanceWheelZoom()
@@ -3247,7 +3336,7 @@ public sealed partial class MainPage : Page
             StopWheelZoomAnimation(resumeBackgroundWork: false);
             _pan.Y += pointer.Properties.MouseWheelDelta * 0.65f;
             e.Handled = true;
-            DrawingSurface.Invalidate();
+            InvalidateCanvas();
             ResumeBackgroundRecognition();
             ResumeThumbnailRefresh();
             return;
@@ -3279,7 +3368,7 @@ public sealed partial class MainPage : Page
         _wheelZoomStart = _zoom;
         _wheelZoomAnimationStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         UpdateZoomText();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         e.Handled = true;
     }
 
@@ -3353,13 +3442,7 @@ public sealed partial class MainPage : Page
         if (_activeInk.Count > 0)
         {
             var last = _activeInk[^1];
-            // Sampling substantially below one screen pixel only increases path construction
-            // and persistence work; it cannot add visible detail. This still preserves sharp
-            // corners because a fast direction change travels well beyond this threshold.
-            var minimumDistance = LiveInkMinimumScreenDistance / Math.Max(_zoom, 0.08);
-            var deltaX = last.X - pagePoint.X;
-            var deltaY = last.Y - pagePoint.Y;
-            if (!force && deltaX * deltaX + deltaY * deltaY < minimumDistance * minimumDistance) return false;
+            if (!CanonicalInkPolicy.ShouldAccept(last, pagePoint, force)) return false;
         }
         var sample = new InkPoint(pagePoint.X, pagePoint.Y, 0.65f, 0, 0, (long)pointer.Timestamp);
         var endpointOnly = _gestureTool is EditorTool.Shape or EditorTool.BoxSelect ||
@@ -3393,7 +3476,7 @@ public sealed partial class MainPage : Page
         var style = _gestureInkStyle ?? CurrentInkStyle();
         var points = _gestureTool == EditorTool.Highlighter && HighlighterStraightToggle.IsOn && _activeInk.Count > 1
             ? new List<InkPoint> { _activeInk[0], SnapHighlighterEnd(_activeInk[0], _activeInk[^1]) }
-            : StrokeGeometry.StabilizeForViewport(_activeInk, _zoom, style.Smoothing).ToList();
+            : _activeInk.ToList();
         var stroke = new InkStrokeObject
         {
             Points = points,
@@ -3483,7 +3566,7 @@ public sealed partial class MainPage : Page
         if (!changed) return;
         _selectedObject = null;
         _selectedObjects.Clear();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void AddEraseDirtyRegion(RectD region)
@@ -3536,7 +3619,7 @@ public sealed partial class MainPage : Page
         _spatialIndex.Rebuild(_page.Objects);
         _eraseDirtyRegions.Clear();
         InvalidatePageRenderCache();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void CommitAreaSelection(bool lasso)
@@ -3646,7 +3729,7 @@ public sealed partial class MainPage : Page
         {
             Content = WithPlainText(_textPreview?.Content ?? _textOriginal.Content, TextEditorOverlay.Text)
         };
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void OnTextEditorLostFocus(object sender, RoutedEventArgs e)
@@ -3685,7 +3768,7 @@ public sealed partial class MainPage : Page
             }
         }
         UpdateSelectionUi();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private RichTextObject? FindTextAt(PointD point)
@@ -3760,13 +3843,8 @@ public sealed partial class MainPage : Page
             _fullSaveVersion++;
         }
         var appendOnly = appendedObject is not null && _page is not null;
-        var canKeepCacheForAppend = appendedObject is not null && _page is not null &&
-                                    ((_pageRenderCache is not null && _pageRenderCachePageId == _page.Id) ||
-                                     (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == _page.Id) ||
-                                     (_navigationTilePageId == _page.Id && _navigationTiles.Count > 0)) &&
-                                    !_pageRenderCacheObjectIds.Contains(appendedObject.Id);
-        if (canKeepCacheForAppend)
-            _pageRenderOverlays.Add(appendedObject!);
+        if (appendOnly)
+            _pendingPageRenderAppends.Enqueue((_page!.Id, appendedObject!));
         else
             InvalidatePageRenderCache();
         if (_page is not null)
@@ -3785,7 +3863,7 @@ public sealed partial class MainPage : Page
             }
         }
         if (!appendOnly) UpdateSelectionUi();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         ScheduleSave();
         if (appendedObject is ImageObject && _document is not null && _page is not null)
         {
@@ -4431,9 +4509,8 @@ public sealed partial class MainPage : Page
         }
         MarkFullDocumentDirty();
         SyncTemplatePicker();
-        if (applyExisting.IsChecked == true) ClearWarmPageRenderCaches();
         InvalidatePageRenderCache();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         StatusText.Text = applyExisting.IsChecked == true ? "Updated all notebook pages" : "Updated notebook defaults";
     }
 
@@ -4618,9 +4695,8 @@ public sealed partial class MainPage : Page
     {
         _temporaryGridVisible = TemporaryGridToggle.IsOn;
         TemporaryGridSizeSlider.IsEnabled = _temporaryGridVisible;
-        ClearWarmPageRenderCaches();
         InvalidatePageRenderCache();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void OnTemporaryGridSizeChanged(object sender, RangeBaseValueChangedEventArgs e)
@@ -4629,9 +4705,8 @@ public sealed partial class MainPage : Page
         if (TemporaryGridSizeValue is not null) TemporaryGridSizeValue.Text = $"{e.NewValue:0}";
         if (_temporaryGridVisible)
         {
-            ClearWarmPageRenderCaches();
             InvalidatePageRenderCache();
-            DrawingSurface.Invalidate();
+            InvalidateCanvas();
         }
     }
 
@@ -4808,7 +4883,7 @@ public sealed partial class MainPage : Page
         _readMode = enabled;
         ReadModeExitButton.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
         UpdateEmptyState();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
     }
 
     private void UpdateEmptyState()
@@ -5000,7 +5075,7 @@ public sealed partial class MainPage : Page
                 _transformPreview = null;
                 _multiTransformPreviews.Clear();
                 UpdateSelectionUi();
-                DrawingSurface.Invalidate();
+                InvalidateCanvas();
             }
             args.Handled = true;
             return;
@@ -5099,7 +5174,7 @@ public sealed partial class MainPage : Page
         _transformPreview = null;
         _multiTransformPreviews.Clear();
         UpdateSelectionUi();
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         args.Handled = true;
     }
 
@@ -5689,7 +5764,7 @@ public sealed partial class MainPage : Page
                 PageList.SelectedItem = result.Pages[0];
                 SelectPage(result.Pages[0]);
                 BeginPdfPreviewLoad();
-                DrawingSurface.Invalidate();
+                InvalidateCanvas();
             }
             ImportInfo.Title = $"Imported {result.DisplayName}";
             ImportInfo.Message = result.Warnings.Count == 0
@@ -6039,7 +6114,7 @@ public sealed partial class MainPage : Page
         // page texture may take longer than the flash itself on low-end hardware; starting here
         // allowed the highlight to expire before it was ever presented.
         _searchFlashStarted = 0;
-        DrawingSurface.Invalidate();
+        InvalidateCanvas();
         return true;
     }
 
@@ -6251,7 +6326,7 @@ public sealed partial class MainPage : Page
         if (_wheelZoomAnimating) redraw |= AdvanceWheelZoom();
         if (_searchFlashBounds.Count > 0 && _searchFlashStarted != 0)
             redraw |= AdvanceSearchFlash();
-        if (redraw) DrawingSurface.Invalidate();
+        if (redraw) InvalidateCanvas();
         StopViewportFramePumpIfIdle();
     }
 
@@ -6454,6 +6529,11 @@ public sealed partial class MainPage : Page
 
     private void ClearStrokeGeometryCache()
     {
+        Interlocked.Exchange(ref _strokeGeometryClearRequested, 1);
+    }
+
+    private void ClearStrokeGeometryCacheCore()
+    {
         foreach (var entry in _strokeGeometryCache.Values) entry.Geometry.Dispose();
         _strokeGeometryCache.Clear();
         _strokeGeometryLru.Clear();
@@ -6462,6 +6542,11 @@ public sealed partial class MainPage : Page
     }
 
     private void ClearImageBitmapCache()
+    {
+        lock (_pageRenderGate) ClearImageBitmapCacheCore();
+    }
+
+    private void ClearImageBitmapCacheCore()
     {
         _imageLoadGeneration++;
         foreach (var bitmap in _imageBitmapCache.Values) bitmap.Dispose();
@@ -6477,24 +6562,27 @@ public sealed partial class MainPage : Page
 
     private void CacheImageBitmap(string assetHash, CanvasBitmap bitmap)
     {
-        if (_imageBitmapCache.Remove(assetHash, out var existing))
+        lock (_pageRenderGate)
         {
-            _imageBitmapBytes -= _imageBitmapSizes.GetValueOrDefault(assetHash);
-            existing.Dispose();
-        }
-        _imageBitmapLru.Remove(assetHash);
-        _imageBitmapSizes.Remove(assetHash);
-        _imageBitmapCache[assetHash] = bitmap;
-        var byteSize = Math.Max(1L, (long)bitmap.SizeInPixels.Width * bitmap.SizeInPixels.Height * 4L);
-        _imageBitmapSizes[assetHash] = byteSize;
-        _imageBitmapBytes += byteSize;
-        _imageBitmapLru.AddFirst(assetHash);
-        while (_imageBitmapBytes > ImageBitmapCacheBudget && _imageBitmapLru.Count > 1)
-        {
-            var evicted = _imageBitmapLru.Last!.Value;
-            _imageBitmapLru.RemoveLast();
-            if (_imageBitmapSizes.Remove(evicted, out var evictedBytes)) _imageBitmapBytes -= evictedBytes;
-            if (_imageBitmapCache.Remove(evicted, out var evictedBitmap)) evictedBitmap.Dispose();
+            if (_imageBitmapCache.Remove(assetHash, out var existing))
+            {
+                _imageBitmapBytes -= _imageBitmapSizes.GetValueOrDefault(assetHash);
+                existing.Dispose();
+            }
+            _imageBitmapLru.Remove(assetHash);
+            _imageBitmapSizes.Remove(assetHash);
+            _imageBitmapCache[assetHash] = bitmap;
+            var byteSize = Math.Max(1L, (long)bitmap.SizeInPixels.Width * bitmap.SizeInPixels.Height * 4L);
+            _imageBitmapSizes[assetHash] = byteSize;
+            _imageBitmapBytes += byteSize;
+            _imageBitmapLru.AddFirst(assetHash);
+            while (_imageBitmapBytes > ImageBitmapCacheBudget && _imageBitmapLru.Count > 1)
+            {
+                var evicted = _imageBitmapLru.Last!.Value;
+                _imageBitmapLru.RemoveLast();
+                if (_imageBitmapSizes.Remove(evicted, out var evictedBytes)) _imageBitmapBytes -= evictedBytes;
+                if (_imageBitmapCache.Remove(evicted, out var evictedBitmap)) evictedBitmap.Dispose();
+            }
         }
     }
 
@@ -6609,76 +6697,14 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void StashCurrentPageRenderCache()
-    {
-        if (_page is not { } page)
-        {
-            InvalidatePageRenderCache();
-            return;
-        }
-        // Page switching must never synthesize a large snapshot for a page that is already
-        // leaving the viewport. Retain an existing snapshot, but let the destination page draw
-        // immediately and build its own representation on demand.
-        if (_lowZoomPageRaster is null || _lowZoomPageRasterPageId != page.Id)
-        {
-            InvalidatePageRenderCache();
-            return;
-        }
-        if (_pageRenderOverlayBatches.Count > 0 || _pageRenderOverlays.Count > 0)
-            MergeOverlaysIntoLowZoomRaster(page);
-
-        if (_lowZoomPageRaster is null) return;
-        var pageId = page.Id;
-        if (_warmPageRenderCaches.Remove(pageId, out var previous)) previous.Dispose();
-        _warmPageRenderCaches[pageId] = _lowZoomPageRaster;
-        _warmPageRenderLru.Remove(pageId);
-        _warmPageRenderLru.AddFirst(pageId);
-        _lowZoomPageRaster = null;
-        _lowZoomPageRasterPageId = null;
-        _pageRenderCache?.Dispose();
-        _pageRenderCache = null;
-        _pageRenderCachePageId = null;
-        _pageRenderCacheObjectIds.Clear();
-        _pageRenderOverlays.Clear();
-        _pageRenderOverlayBatches.Clear();
-    }
-
-    private void RestoreWarmPageRenderCache(NotePage? page)
-    {
-        if (page is not null && _warmPageRenderCaches.Remove(page.Id, out var cache))
-        {
-            _warmPageRenderLru.Remove(page.Id);
-            _lowZoomPageRaster = cache;
-            _lowZoomPageRasterPageId = page.Id;
-            _pageRenderCache = null;
-            _pageRenderCachePageId = page.Id;
-            _pageRenderCacheObjectIds.Clear();
-            _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
-        }
-        while (_warmPageRenderLru.Count > WarmPageRenderCacheLimit)
-        {
-            var evicted = _warmPageRenderLru.Last!.Value;
-            _warmPageRenderLru.RemoveLast();
-            if (_warmPageRenderCaches.Remove(evicted, out var oldCache)) oldCache.Dispose();
-        }
-    }
-
-    private void ClearWarmPageRenderCaches()
-    {
-        foreach (var cache in _warmPageRenderCaches.Values) cache.Dispose();
-        _warmPageRenderCaches.Clear();
-        _warmPageRenderLru.Clear();
-    }
-
-    private void RemoveWarmPageRenderCache(Guid pageId)
-    {
-        _warmPageRenderLru.Remove(pageId);
-        if (_warmPageRenderCaches.Remove(pageId, out var cache)) cache.Dispose();
-    }
-
     private void InvalidatePageRenderCache()
     {
-        ClearNavigationTileCache();
+        Interlocked.Exchange(ref _pageRenderInvalidationRequested, 1);
+    }
+
+    private void InvalidatePageRenderCacheCore()
+    {
+        ClearNavigationTileCacheCore();
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = null;
         _lowZoomPageRasterPageId = null;
@@ -6693,6 +6719,11 @@ public sealed partial class MainPage : Page
 
     private void ClearNavigationTileCache()
     {
+        Interlocked.Exchange(ref _navigationTileClearRequested, 1);
+    }
+
+    private void ClearNavigationTileCacheCore()
+    {
         foreach (var tile in _navigationTiles.Values) tile.Dispose();
         _navigationTiles.Clear();
         _navigationTileLru.Clear();
@@ -6706,16 +6737,24 @@ public sealed partial class MainPage : Page
     private Matrix3x2 PageTransform()
     {
         if (_page is null) return Matrix3x2.Identity;
-        var offset = PageOffset();
-        return Matrix3x2.CreateScale((float)_zoom) * Matrix3x2.CreateTranslation(offset);
+        return PageTransform(_page, _zoom, _pan, _canvasWidth, _canvasHeight);
+    }
+
+    private static Matrix3x2 PageTransform(NotePage page, double zoom, Vector2 pan,
+        double viewportWidth, double viewportHeight)
+    {
+        var offset = new Vector2(
+            (float)((viewportWidth - page.Size.Width * zoom) / 2d) + pan.X,
+            (float)((viewportHeight - page.Size.Height * zoom) / 2d) + pan.Y);
+        return Matrix3x2.CreateScale((float)zoom) * Matrix3x2.CreateTranslation(offset);
     }
 
     private Vector2 PageOffset()
     {
         if (_page is null) return _pan;
         return new Vector2(
-            (float)((DrawingSurface.ActualWidth - _page.Size.Width * _zoom) / 2d) + _pan.X,
-            (float)((DrawingSurface.ActualHeight - _page.Size.Height * _zoom) / 2d) + _pan.Y);
+            (float)((_canvasWidth - _page.Size.Width * _zoom) / 2d) + _pan.X,
+            (float)((_canvasHeight - _page.Size.Height * _zoom) / 2d) + _pan.Y);
     }
 
     private PointD ScreenToPage(Point screen)
