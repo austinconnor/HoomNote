@@ -96,6 +96,16 @@ public static class StrokeGeometry
         return RectD.FromPoints(corners);
     }
 
+    public static double EffectiveWorldWidth(InkStrokeObject stroke)
+    {
+        var transform = stroke.Transform;
+        var areaScale = Math.Abs(transform.M11 * transform.M22 - transform.M12 * transform.M21);
+        var linearScale = double.IsFinite(areaScale) && areaScale > 0
+            ? Math.Sqrt(areaScale)
+            : 1;
+        return stroke.Style.Normalize().Width * linearScale;
+    }
+
     public static bool HitTest(CanvasObject canvasObject, PointD worldPoint, double tolerance = 8)
     {
         if (!Matrix3x2.Invert(canvasObject.Transform.ToMatrix(), out var inverse)) return false;

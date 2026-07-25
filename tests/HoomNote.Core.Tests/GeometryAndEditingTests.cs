@@ -10,6 +10,23 @@ namespace HoomNote.Core.Tests;
 public sealed class GeometryAndEditingTests
 {
     [Fact]
+    public void EffectiveWorldWidth_TracksUniformAndNonUniformStrokeTransforms()
+    {
+        var stroke = new InkStrokeObject
+        {
+            Style = new InkStyle { Width = 3 },
+            Transform = Transform2D.Scale(2, 2, new PointD(0, 0))
+        };
+        Assert.Equal(6, StrokeGeometry.EffectiveWorldWidth(stroke), 4);
+
+        var stretched = stroke with
+        {
+            Transform = Transform2D.Scale(4, 1, new PointD(0, 0))
+        };
+        Assert.Equal(6, StrokeGeometry.EffectiveWorldWidth(stretched), 4);
+    }
+
+    [Fact]
     public void OneFingerTouch_PansWithoutChangingZoom()
     {
         var result = TouchViewportMath.Pan(

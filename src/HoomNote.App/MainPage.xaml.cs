@@ -77,6 +77,7 @@ public sealed partial class MainPage : Page
         Style,
         Pen,
         Highlighter,
+        Eyedropper,
         SegmentEraser,
         StrokeEraser,
         Text,
@@ -3027,6 +3028,23 @@ public sealed partial class MainPage : Page
                 }
                 ApplyStyleBrushAtPoint(_gestureStart);
                 break;
+            case EditorTool.Eyedropper:
+                var pickedInk = FindInkStrokeAt(_gestureStart);
+                EndPointer(e);
+                if (pickedInk is null)
+                {
+                    StatusText.Text = "No ink stroke here";
+                    return;
+                }
+                ActivateTool(EditorTool.Pen);
+                SetInkColor(pickedInk.Style.Color);
+                StrokeWidthSlider.Value = Math.Clamp(
+                    Math.Round(StrokeGeometry.EffectiveWorldWidth(pickedInk), 1),
+                    StrokeWidthSlider.Minimum,
+                    StrokeWidthSlider.Maximum);
+                StatusText.Text =
+                    $"Pen matched • {pickedInk.Style.Color.ToUpperInvariant()} • {StrokeWidthSlider.Value:0.#} pt";
+                return;
         }
 
         e.Handled = true;
@@ -3689,6 +3707,25 @@ public sealed partial class MainPage : Page
         _transformHandle = _selectedObject is null or { IsLocked: true } ? TransformHandle.None : TransformHandle.Move;
         _transformOriginal = _selectedObject is { IsLocked: false } ? _selectedObject : null;
         UpdateSelectionUi();
+    }
+
+    private InkStrokeObject? FindInkStrokeAt(PointD point)
+    {
+        if (_page is null) return null;
+        var tolerance = 10 / Math.Max(_zoom, 0.08);
+        IEnumerable<CanvasObject> candidates = _spatialIndex.Count == _page.Objects.Count
+            ? _spatialIndex.Query(new RectD(
+                point.X - tolerance,
+                point.Y - tolerance,
+                tolerance * 2,
+                tolerance * 2))
+            : _page.Objects;
+        return candidates
+            .OfType<InkStrokeObject>()
+            .Where(stroke => !stroke.IsHidden &&
+                             StrokeGeometry.HitTest(stroke, point, tolerance))
+            .OrderByDescending(stroke => stroke.ZIndex)
+            .FirstOrDefault();
     }
 
     private bool SelectionContainsInteraction(PointD point)

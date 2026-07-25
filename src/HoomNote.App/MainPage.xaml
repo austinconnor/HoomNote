@@ -53,6 +53,11 @@
                             <Path Data="M4,22 L20,22" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.8" />
                         </Canvas></Viewbox>
                     </ToggleButton>
+                    <ToggleButton Tag="Eyedropper" Click="OnToolClick"
+                                  Style="{StaticResource HoomNoteToolButtonStyle}"
+                                  ToolTipService.ToolTip="Pick ink color and thickness">
+                        <FontIcon Glyph="&#xE82F;" FontSize="16" />
+                    </ToggleButton>
                     <ToggleButton Tag="StrokeEraser" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Erase whole strokes (E)">
                         <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
                             <Path Data="M4,18 L12,5 L21,11 L14,21 L8,21 Z" Fill="{StaticResource HoomNotePanelRaisedBrush}" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeLineJoin="Round" />
