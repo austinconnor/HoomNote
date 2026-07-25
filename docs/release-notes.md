@@ -1,4 +1,8 @@
-# HoomNote 0.7.16
+# HoomNote 0.7.17
 
-- Fixed clipping caused by placing 24x24 vector geometry in a 16x16 layout box.
-- Icons now retain their native geometry bounds, scale visually around their center, and align consistently inside toolbar buttons.
+- Close notebook tabs immediately while their final autosave completes.
+- Restore the folder tree's expanded and collapsed state between sessions.
+- Keep newly created notebooks in the selected folder and inherit that folder's color.
+- Preview selected ink and objects while moving or transforming a lasso selection.
+- Save straight-line mode as part of highlighter presets and expose it in quick ink settings.
+- Reduce PDF import latency by copying the source and reading its page tree concurrently.

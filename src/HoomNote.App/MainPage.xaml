@@ -149,6 +149,10 @@
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                     <ColorPicker x:Name="QuickInkColorPicker" IsAlphaEnabled="False"
                                                  IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False" />
+                                    <CheckBox x:Name="HighlighterStraightCheckBox"
+                                              Content="Snap highlighter to straight lines"
+                                              Visibility="Collapsed"
+                                              Click="OnHighlighterStraightToggled" />
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>
@@ -294,6 +298,7 @@
                     <Border x:Name="FolderTreeContainer" Grid.Row="3" MinHeight="0" Background="Transparent" Padding="0" Margin="0,2,0,6">
                         <Grid>
                             <TreeView x:Name="FolderTree" MinHeight="0" SelectionMode="Single" SelectionChanged="OnFolderSelectionChanged"
+                                      Expanding="OnFolderTreeExpanding" Collapsed="OnFolderTreeCollapsed"
                                       RightTapped="OnFolderTreeRightTapped" AllowDrop="True"
                                       DragOver="OnFolderTreeDragOver" Drop="OnFolderTreeDrop">
                                 <TreeView.Resources>
@@ -514,8 +519,6 @@
                                         Value="2.4" StepFrequency="0.1" ValueChanged="OnStyleToolWidthChanged" />
                             </StackPanel>
                         </Border>
-                        <ToggleSwitch x:Name="HighlighterStraightToggle" Header="Highlighter stroke" OffContent="Freeform" OnContent="Straight line"
-                                      Toggled="OnHighlighterStraightToggled" />
                         <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" />
                         <ComboBox x:Name="ShapePicker" Header="Shape tool" SelectedIndex="0" HorizontalAlignment="Stretch">
                             <ComboBoxItem Tag="Rectangle" Content="Rectangle" />

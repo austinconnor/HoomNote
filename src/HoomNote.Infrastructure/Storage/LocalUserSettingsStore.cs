@@ -5,7 +5,7 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 6;
+    public const int CurrentVersion = 7;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
@@ -16,6 +16,7 @@ public sealed record UserPreferences
     public bool TabsCollapsed { get; init; }
     public List<ToolbarPresetPreference> ToolbarPresets { get; init; } = [];
     public List<NotebookFolderPreference> NotebookFolders { get; init; } = [];
+    public List<string> ExpandedFolderIds { get; init; } = [];
     public Dictionary<string, string> DocumentFolders { get; init; } = [];
     public Dictionary<string, string> DocumentColors { get; init; } = [];
     public List<string> NotebookOrder { get; init; } = [];

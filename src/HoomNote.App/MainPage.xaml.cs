@@ -325,7 +325,7 @@ public sealed partial class MainPage : Page
     private Guid? _selectedFolderId;
     private int _folderTreeRebuildVersion;
     private readonly HashSet<Guid> _expandedFolderIds = [];
-    private bool _hasFolderExpansionState;
+    private bool _rebuildingFolderTree;
     private Guid? _recognitionPageId;
     private DocumentSummary? _notebookContextTarget;
     private FolderDisplay? _folderContextTarget;
@@ -474,7 +474,11 @@ public sealed partial class MainPage : Page
             if (migratedInkPresets) await _userSettingsStore.SaveAsync(_userPreferences);
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
             _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFCE56";
-            HighlighterStraightToggle.IsOn = _userPreferences.HighlighterStraightLine;
+            HighlighterStraightCheckBox.IsChecked = _userPreferences.HighlighterStraightLine;
+            _expandedFolderIds.Clear();
+            foreach (var value in _userPreferences.ExpandedFolderIds)
+                if (Guid.TryParse(value, out var folderId))
+                    _expandedFolderIds.Add(folderId);
             _temporaryGridSize = Math.Clamp(_userPreferences.TemporaryGridSize, 8, 128);
             _syncingTemporaryGridSize = true;
             TemporaryGridSizeSlider.Value = _temporaryGridSize;
@@ -556,19 +560,22 @@ public sealed partial class MainPage : Page
         DiagnosticsLog.Info("main.unloaded");
     }
 
-    private async Task RefreshLibraryAsync()
+    private async Task RefreshLibraryAsync(Guid? preferredDocumentId = null)
     {
         if (_repository is null) return;
         var summaries = await _repository.ListAsync();
         _allDocuments.Clear();
         _allDocuments.AddRange(summaries);
-        ApplyFolderFilter();
+        ApplyFolderFilter(preferredDocumentId);
         if (_allDocuments.Count > 0)
         {
+            var explicitlyPreferred = preferredDocumentId is { } preferredId
+                ? _allDocuments.FirstOrDefault(item => item.Id == preferredId)
+                : null;
             var requested = _startupDocumentId is { } requestedId
                 ? _allDocuments.FirstOrDefault(item => item.Id == requestedId)
                 : null;
-            var preferred = requested ?? (_document is null ? _allDocuments[0] :
+            var preferred = explicitlyPreferred ?? requested ?? (_document is null ? _allDocuments[0] :
                 _allDocuments.FirstOrDefault(item => item.Id == _document.Id) ?? _allDocuments[0]);
             _startupDocumentId = null;
             if (_document is null || _document.Id != preferred.Id)
@@ -578,7 +585,7 @@ public sealed partial class MainPage : Page
         UpdateEmptyState();
     }
 
-    private void ApplyFolderFilter()
+    private void ApplyFolderFilter(Guid? preferredDocumentId = null)
     {
         var documents = _allDocuments
             .OrderBy(document => NotebookOrderIndex(document.Id))
@@ -588,11 +595,10 @@ public sealed partial class MainPage : Page
         _documents.Clear();
         foreach (var document in documents)
         {
-            var color = _userPreferences.DocumentColors.GetValueOrDefault(document.Id.ToString("D"), "#4BAEFF");
-            _documents.Add(document with { Color = color });
+            _documents.Add(document with { Color = EffectiveDocumentColor(document.Id) });
         }
         _loading = false;
-        RebuildFolderTree(_selectedFolderId, _document?.Id);
+        RebuildFolderTree(_selectedFolderId, preferredDocumentId ?? _document?.Id);
         UpdateLibrarySummary();
         UpdateFolderActions();
     }
@@ -603,14 +609,27 @@ public sealed partial class MainPage : Page
         return index < 0 ? int.MaxValue : index;
     }
 
+    private string EffectiveDocumentColor(Guid documentId)
+    {
+        var documentKey = documentId.ToString("D");
+        if (_userPreferences.DocumentColors.TryGetValue(documentKey, out var explicitColor) &&
+            IsValidHexColor(explicitColor))
+            return explicitColor;
+        var folderId = DocumentFolderId(documentId);
+        var folderColor = folderId is { } id
+            ? _userPreferences.NotebookFolders.FirstOrDefault(folder => folder.Id == id)?.Color
+            : null;
+        return IsValidHexColor(folderColor ?? string.Empty) ? folderColor! : "#4BAEFF";
+    }
+
     private void RebuildFolderTree(Guid? preferredFolderId = null, Guid? preferredDocumentId = null)
     {
         if (FolderTree.RootNodes.Count > 0)
         {
             _expandedFolderIds.Clear();
             foreach (var existingRoot in FolderTree.RootNodes) CaptureExpandedFolders(existingRoot);
-            _hasFolderExpansionState = true;
         }
+        _rebuildingFolderTree = true;
         var rebuildVersion = ++_folderTreeRebuildVersion;
         FolderTree.RootNodes.Clear();
         foreach (var document in _documents.Where(document => DocumentFolderId(document.Id) is null))
@@ -638,15 +657,19 @@ public sealed partial class MainPage : Page
         // same call stack that replaced RootNodes. Restore it after the tree has attached.
         DispatcherQueue.TryEnqueue(() =>
         {
-            if (rebuildVersion != _folderTreeRebuildVersion || nodeToSelect is null) return;
+            if (rebuildVersion != _folderTreeRebuildVersion) return;
             try
             {
-                FolderTree.SelectedNode = nodeToSelect;
+                if (nodeToSelect is not null) FolderTree.SelectedNode = nodeToSelect;
             }
             catch (Exception exception)
             {
                 DiagnosticsLog.Error("folder.selection_restore_failed", exception,
                     ("folder_count", _userPreferences.NotebookFolders.Count));
+            }
+            finally
+            {
+                _rebuildingFolderTree = false;
             }
         });
         UpdateFolderActions();
@@ -671,7 +694,7 @@ public sealed partial class MainPage : Page
         var node = new TreeViewNode
         {
             Content = entry,
-            IsExpanded = !_hasFolderExpansionState || _expandedFolderIds.Contains(folder.Id) || _selectedFolderId == folder.Id
+            IsExpanded = _expandedFolderIds.Contains(folder.Id)
         };
         foreach (var child in _userPreferences.NotebookFolders
                      .Where(item => item.ParentId == folder.Id && !ancestry.Contains(item.Id) && !rendered.Contains(item.Id))
@@ -813,6 +836,36 @@ public sealed partial class MainPage : Page
         }
         UpdateLibrarySummary();
         UpdateFolderActions();
+    }
+
+    private void OnFolderTreeExpanding(TreeView sender, TreeViewExpandingEventArgs args)
+    {
+        _ = sender;
+        if (_rebuildingFolderTree) return;
+        if (GetLibraryEntry(args.Node)?.FolderId is not { } folderId) return;
+        _expandedFolderIds.Add(folderId);
+        PersistExpandedFolderState();
+    }
+
+    private void OnFolderTreeCollapsed(TreeView sender, TreeViewCollapsedEventArgs args)
+    {
+        _ = sender;
+        if (_rebuildingFolderTree) return;
+        if (GetLibraryEntry(args.Node)?.FolderId is not { } folderId) return;
+        _expandedFolderIds.Remove(folderId);
+        PersistExpandedFolderState();
+    }
+
+    private void PersistExpandedFolderState()
+    {
+        _userPreferences = _userPreferences with
+        {
+            ExpandedFolderIds = _expandedFolderIds
+                .OrderBy(id => id)
+                .Select(id => id.ToString("D"))
+                .ToList()
+        };
+        ScheduleUserPreferencesSave();
     }
 
     private async void OnLibraryRowTapped(object sender, TappedRoutedEventArgs e)
@@ -1048,7 +1101,7 @@ public sealed partial class MainPage : Page
         var index = _userPreferences.NotebookFolders.FindIndex(folder => folder.Id == folderId);
         if (index < 0) return;
         _userPreferences.NotebookFolders[index] = _userPreferences.NotebookFolders[index] with { Color = color };
-        if (!RefreshFolderNodeContent(folderId)) RebuildFolderTree(folderId);
+        ApplyFolderFilter();
         await PersistUserPreferencesAsync("Updated folder color");
     }
 
@@ -1510,11 +1563,41 @@ public sealed partial class MainPage : Page
     private async void OnNotebookTabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
     {
         if (args.Item is not TabViewItem { Tag: Guid closingId } tab || sender.TabItems.Count <= 1) return;
-        await SaveNowAsync();
         var wasSelected = ReferenceEquals(sender.SelectedItem, tab);
+        if (!wasSelected)
+        {
+            sender.TabItems.Remove(tab);
+            _tabPageSelections.Remove(closingId);
+            RemoveCachedDocument(closingId);
+            return;
+        }
+
+        var nextTab = sender.TabItems.OfType<TabViewItem>()
+            .FirstOrDefault(item => !ReferenceEquals(item, tab) && item.Tag is Guid);
+        var saveTask = SaveNowAsync();
+        _updatingTabs = true;
         sender.TabItems.Remove(tab);
-        if (!wasSelected) RemoveCachedDocument(closingId);
-        if (wasSelected && sender.TabItems.Count > 0) sender.SelectedItem = sender.TabItems[0];
+        if (nextTab is not null) sender.SelectedItem = nextTab;
+        _updatingTabs = false;
+        _tabPageSelections.Remove(closingId);
+        StatusText.Text = "Closing notebook…";
+        await Task.Yield();
+        try
+        {
+            await saveTask;
+            if (nextTab?.Tag is Guid nextDocumentId)
+            {
+                await LoadDocumentAsync(nextDocumentId,
+                    _tabPageSelections.GetValueOrDefault(nextDocumentId) is { } pageId &&
+                    pageId != Guid.Empty ? pageId : null);
+                RemoveCachedDocument(closingId);
+                SelectLibraryDocument(nextDocumentId);
+            }
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be closed cleanly.", exception);
+        }
     }
 
     private void SelectPage(NotePage? page)
@@ -1772,6 +1855,7 @@ public sealed partial class MainPage : Page
         var drawingSession = args.DrawingSession;
         drawingSession.Transform = PageTransform();
         var styleBrushPreview = _isPointerDown && _gestureTool == EditorTool.Style && !_styleToolPickMode;
+        var selectionTransformPreview = _isPointerDown && _gestureTool == EditorTool.Select;
 
         if (_eraseDirtyRegions.Count > 0 &&
             (_gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser ||
@@ -1781,6 +1865,14 @@ public sealed partial class MainPage : Page
         if (styleBrushPreview)
             foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
                 DrawObject(drawingSession, preview);
+
+        if (selectionTransformPreview)
+        {
+            foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
+                DrawObject(drawingSession, preview);
+            if (_transformPreview is not null)
+                DrawObject(drawingSession, _transformPreview);
+        }
 
         if (_activeInk.Count > 0 && _gestureTool is EditorTool.Pen or EditorTool.Highlighter)
         {
@@ -2289,7 +2381,7 @@ public sealed partial class MainPage : Page
         var style = _gestureInkStyle ?? CurrentInkStyle();
         var color = ParseColor(style.Color, style.Opacity);
         var width = style.Width;
-        if (style.Tool == InkToolKind.Highlighter && HighlighterStraightToggle.IsOn && _activeInk.Count > 1)
+        if (style.Tool == InkToolKind.Highlighter && HighlighterStraightCheckBox.IsChecked == true && _activeInk.Count > 1)
         {
             var snappedEnd = SnapHighlighterEnd(_activeInk[0], _activeInk[^1]);
             drawingSession.DrawLine(_activeInk[0].Position.ToVector2(), snappedEnd.Position.ToVector2(),
@@ -3854,7 +3946,7 @@ public sealed partial class MainPage : Page
         }
         var sample = new InkPoint(pagePoint.X, pagePoint.Y, 0.65f, 0, 0, (long)pointer.Timestamp);
         var endpointOnly = _gestureTool is EditorTool.Shape or EditorTool.BoxSelect ||
-                           (_gestureTool == EditorTool.Highlighter && HighlighterStraightToggle.IsOn);
+                           (_gestureTool == EditorTool.Highlighter && HighlighterStraightCheckBox.IsChecked == true);
         if (endpointOnly && _activeInk.Count > 1) _activeInk[^1] = sample;
         else _activeInk.Add(sample);
         if (!force) _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -3882,7 +3974,7 @@ public sealed partial class MainPage : Page
             return;
         }
         var style = _gestureInkStyle ?? CurrentInkStyle();
-        var points = _gestureTool == EditorTool.Highlighter && HighlighterStraightToggle.IsOn && _activeInk.Count > 1
+        var points = _gestureTool == EditorTool.Highlighter && HighlighterStraightCheckBox.IsChecked == true && _activeInk.Count > 1
             ? new List<InkPoint> { _activeInk[0], SnapHighlighterEnd(_activeInk[0], _activeInk[^1]) }
             : _activeInk.ToList();
         var stroke = new InkStrokeObject
@@ -4834,6 +4926,7 @@ public sealed partial class MainPage : Page
     private async Task CreateDocumentAsync(DocumentKind kind, string title)
     {
         if (_repository is null) return;
+        var destinationFolderId = _selectedFolderId;
         var document = HoomNoteDocument.Create(title, kind);
         var defaultKind = Enum.TryParse<PageTemplateKind>(_userPreferences.DefaultPageTemplate, out var parsedDefault)
             ? parsedDefault
@@ -4858,14 +4951,13 @@ public sealed partial class MainPage : Page
             document.Sections[0].PageIds.Add(canvas.Id);
         }
         await _repository.SaveAsync(document);
-        if (_selectedFolderId is { } folderId)
+        if (destinationFolderId is { } folderId)
         {
             _userPreferences.DocumentFolders[document.Id.ToString("D")] = folderId.ToString("D");
             await PersistUserPreferencesAsync("Created notebook in folder");
         }
-        await RefreshLibraryAsync();
-        await LoadDocumentAsync(document.Id);
-        SelectLibraryDocument(document.Id);
+        _selectedFolderId = destinationFolderId;
+        await RefreshLibraryAsync(document.Id);
     }
 
     private void OnAddPageClick(object sender, RoutedEventArgs e)
@@ -5069,6 +5161,9 @@ public sealed partial class MainPage : Page
         QuickInkSettingsTitle.Text = _colorTool == EditorTool.Highlighter
             ? "Highlighter settings"
             : "Pen settings";
+        HighlighterStraightCheckBox.Visibility = _colorTool == EditorTool.Highlighter
+            ? Visibility.Visible
+            : Visibility.Collapsed;
         SaveCurrentInkPresetMenuItem.Text = _colorTool == EditorTool.Highlighter
             ? "Save highlighter"
             : "Save pen";
@@ -5222,7 +5317,24 @@ public sealed partial class MainPage : Page
     private void OnHighlighterStraightToggled(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
-        _userPreferences = _userPreferences with { HighlighterStraightLine = HighlighterStraightToggle.IsOn };
+        var straightLine = HighlighterStraightCheckBox.IsChecked == true;
+        _userPreferences = _userPreferences with { HighlighterStraightLine = straightLine };
+        if (!_applyingToolbarPreset && _activeToolbarPresetId is { } presetId)
+        {
+            var presetIndex = _userPreferences.ToolbarPresets.FindIndex(preset => preset.Id == presetId);
+            if (presetIndex >= 0 &&
+                string.Equals(_userPreferences.ToolbarPresets[presetIndex].Tool,
+                    nameof(EditorTool.Highlighter), StringComparison.OrdinalIgnoreCase))
+            {
+                _userPreferences.ToolbarPresets[presetIndex] =
+                    _userPreferences.ToolbarPresets[presetIndex] with { StraightLine = straightLine };
+                RebuildPresetToolbar();
+                SetActiveToolbarPreset(presetId);
+                StatusText.Text = straightLine
+                    ? "Updated saved highlighter • straight line"
+                    : "Updated saved highlighter • freeform";
+            }
+        }
         ScheduleUserPreferencesSave();
     }
 
@@ -5707,7 +5819,7 @@ public sealed partial class MainPage : Page
             PressureSensitivity = 0,
             Opacity = style.Opacity,
             Smoothing = style.Smoothing,
-            StraightLine = tool == EditorTool.Highlighter && HighlighterStraightToggle.IsOn
+            StraightLine = tool == EditorTool.Highlighter && HighlighterStraightCheckBox.IsChecked == true
         });
         RebuildPresetToolbar();
         await PersistUserPreferencesAsync("Saved toolbar preset");
@@ -5794,7 +5906,7 @@ public sealed partial class MainPage : Page
             return;
         }
         ActivePresetSaveText.Text =
-            $"{preset.Tool} preset selected • size changes save automatically.";
+            $"{preset.Tool} preset selected • size and stroke mode changes save automatically.";
         ActivePresetSaveText.Visibility = Visibility.Visible;
     }
 
@@ -5874,14 +5986,14 @@ public sealed partial class MainPage : Page
             _presetSmoothing = (float)Math.Clamp(preset.Smoothing, 0, 1);
             SetInkColor(preset.Color);
             SetInkWidth(preset.Width);
-            if (tool == EditorTool.Highlighter) HighlighterStraightToggle.IsOn = preset.StraightLine;
+            if (tool == EditorTool.Highlighter) HighlighterStraightCheckBox.IsChecked = preset.StraightLine;
         }
         finally
         {
             _applyingToolbarPreset = false;
         }
         SetActiveToolbarPreset(id);
-        StatusText.Text = $"{preset.Tool} preset selected • size changes save automatically";
+        StatusText.Text = $"{preset.Tool} preset selected • settings save automatically";
     }
 
     private async void OnRemoveToolbarPresetClick(object sender, RoutedEventArgs e)
@@ -7086,7 +7198,7 @@ public sealed partial class MainPage : Page
         {
             PenColor = _penColor,
             HighlighterColor = _highlighterColor,
-            HighlighterStraightLine = HighlighterStraightToggle.IsOn,
+            HighlighterStraightLine = HighlighterStraightCheckBox.IsChecked == true,
             TemporaryGridSize = _temporaryGridSize
         };
         await PersistUserPreferencesAsync("Saved settings");

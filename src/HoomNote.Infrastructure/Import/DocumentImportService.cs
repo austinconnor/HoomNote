@@ -83,8 +83,11 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
 
         if (extension != ".pdf") throw new NotSupportedException("HoomNote currently imports PDF, PPT, PPTX, and Samsung Notes SDOCX documents.");
         await using var stream = File.OpenRead(sourcePath);
-        var assetHash = await assetStore.AddAsync(stream, extension, cancellationToken);
-        var pageCount = await CountPdfPagesAsync(sourcePath, cancellationToken);
+        var assetTask = assetStore.AddAsync(stream, extension, cancellationToken);
+        var pageCountTask = CountPdfPagesAsync(sourcePath, cancellationToken);
+        await Task.WhenAll(assetTask, pageCountTask);
+        var assetHash = await assetTask;
+        var pageCount = await pageCountTask;
         var selected = request.PageIndexes?.Where(index => index >= 0 && index < pageCount).Distinct().ToArray()
                        ?? Enumerable.Range(0, pageCount).ToArray();
         var margin = Math.Clamp(request.Margin, 0, 200);

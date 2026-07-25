@@ -468,6 +468,7 @@ public sealed class PersistenceTests : IAsyncLifetime
                 PressureSensitivity = 40, Opacity = 0.34, Smoothing = 0.8, StraightLine = true
             }],
             NotebookFolders = [folder, childFolder],
+            ExpandedFolderIds = [folder.Id.ToString("D")],
             DocumentColors = new Dictionary<string, string>
             {
                 [documentId.ToString("D")] = "#4BAEFF"
@@ -496,6 +497,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal(0.34, preset.Opacity, 3);
         Assert.Equal(0.8, preset.Smoothing, 3);
         Assert.True(preset.StraightLine);
+        Assert.Equal(folder.Id.ToString("D"), Assert.Single(loaded.ExpandedFolderIds));
         var loadedFolder = Assert.Single(loaded.NotebookFolders, item => item.Id == folder.Id);
         Assert.Equal("School", loadedFolder.Name);
         Assert.Equal("#7C6CFF", loadedFolder.Color);
