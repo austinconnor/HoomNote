@@ -4920,16 +4920,11 @@ public sealed partial class MainPage : Page
 
     private void OnRootSizeChanged(object sender, SizeChangedEventArgs e)
     {
-        var compactToolbar = e.NewSize.Width < 1_180;
         var narrowToolbar = e.NewSize.Width < 760;
-        ToolbarSecondaryActions.Visibility = compactToolbar ? Visibility.Collapsed : Visibility.Visible;
         ToolbarOverflowActionsButton.Visibility = Visibility.Visible;
         AutosavedStatusBadge.Visibility = narrowToolbar ? Visibility.Collapsed : Visibility.Visible;
         NotebookTabs.Margin = new Thickness(6, 0, narrowToolbar ? 6 : 100, 0);
         PresetScrollViewer.MinWidth = narrowToolbar ? 72 : 120;
-        PresetScrollViewer.MaxWidth = compactToolbar
-            ? narrowToolbar ? 140 : 260
-            : 420;
 
         var compact = e.NewSize.Width < 980 || e.NewSize.Height < 620;
         if (compact == _compactLayout) return;
@@ -5623,14 +5618,14 @@ public sealed partial class MainPage : Page
             FrameworkElement swatch = preset.Tool == nameof(EditorTool.Highlighter)
                 ? new Border
                 {
-                    Width = 26, Height = 14, CornerRadius = new CornerRadius(4),
+                    Width = 20, Height = 10, CornerRadius = new CornerRadius(3),
                     Background = new SolidColorBrush(ParseColor(preset.Color)),
                     BorderBrush = new SolidColorBrush(Color.FromArgb(120, 255, 255, 255)),
                     BorderThickness = new Thickness(1)
                 }
                 : new Microsoft.UI.Xaml.Shapes.Ellipse
                 {
-                    Width = 24, Height = 24,
+                    Width = 18, Height = 18,
                     Fill = new SolidColorBrush(ParseColor(preset.Color)),
                     Stroke = new SolidColorBrush(Color.FromArgb(140, 255, 255, 255)),
                     StrokeThickness = 1
@@ -5640,10 +5635,10 @@ public sealed partial class MainPage : Page
             {
                 Tag = preset.Id,
                 CanDrag = true,
-                Width = 9,
-                Height = 28,
+                Width = 7,
+                Height = 26,
                 HorizontalAlignment = HorizontalAlignment.Left,
-                CornerRadius = new CornerRadius(5),
+                CornerRadius = new CornerRadius(4),
                 Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0))
             };
             SetTransientToolTip(grip, "Drag to reorder");
@@ -5658,10 +5653,10 @@ public sealed partial class MainPage : Page
                 Tag = preset.Id,
                 Child = content,
                 CanDrag = false,
-                Width = 36,
-                Height = 34,
+                Width = 28,
+                Height = 32,
                 Padding = new Thickness(2),
-                CornerRadius = new CornerRadius(7),
+                CornerRadius = new CornerRadius(6),
                 Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0)),
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center

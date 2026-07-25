@@ -1,5 +1,5 @@
-# HoomNote 0.7.11
+# HoomNote 0.7.12
 
-- Added an eyedropper directly after Highlighter in the main toolbar.
-- Click any visible vector ink stroke to copy its color and displayed thickness into the current Pen.
-- Automatically returns to Pen after a successful sample so drawing can resume immediately.
+- Moved every workspace action into the top-right overflow menu.
+- Expanded the saved-preset strip across all newly available toolbar space.
+- Reduced pen and highlighter preset tile sizes so more presets remain visible.
