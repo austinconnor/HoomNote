@@ -251,7 +251,7 @@
                             <TextBlock Text="LOCAL LIBRARY" Margin="0,2,0,0" FontSize="9" CharacterSpacing="70" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                         </StackPanel>
                         <Button Grid.Column="1" Width="32" Height="30" Padding="5" VerticalAlignment="Center"
-                                Click="OnNewFolderClick" ToolTipService.ToolTip="New folder">
+                                Click="OnNewFolderClick" ToolTipService.ToolTip="New top-level folder">
                             <FontIcon Glyph="&#xE8F4;" FontSize="13" />
                         </Button>
                     </Grid>

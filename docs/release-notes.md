@@ -1,5 +1,5 @@
-# HoomNote 0.7.13
+# HoomNote 0.7.14
 
-- Saved pen and highlighter presets now retain size edits automatically after selection.
-- Limited ink-size input and display values to one decimal place.
-- Added a transient zoom percentage badge for wheel and pinch zooming.
+- Folder creation now inserts only the new node without rebuilding existing hierarchy.
+- Folder color and rename changes update only that node without flattening the tree.
+- Added nested-folder persistence regression coverage.

@@ -694,6 +694,66 @@ public sealed partial class MainPage : Page
         };
     }
 
+    private void AttachNewFolderNode(NotebookFolderPreference folder)
+    {
+        var node = BuildFolderNode(folder, [], []);
+        if (folder.ParentId is { } parentId &&
+            FindFolderNode(FolderTree.RootNodes, parentId) is { } parentNode)
+        {
+            InsertFolderNode(parentNode.Children, node, foldersBeforeDocuments: true);
+            parentNode.IsExpanded = true;
+        }
+        else
+        {
+            InsertFolderNode(FolderTree.RootNodes, node, foldersBeforeDocuments: false);
+        }
+        LibraryEmptyText.Visibility = Visibility.Collapsed;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            try { FolderTree.SelectedNode = node; }
+            catch (Exception exception)
+            {
+                DiagnosticsLog.Error("folder.selection_restore_failed", exception,
+                    ("folder_count", _userPreferences.NotebookFolders.Count));
+            }
+        });
+    }
+
+    private static void InsertFolderNode(IList<TreeViewNode> nodes, TreeViewNode folderNode,
+        bool foldersBeforeDocuments)
+    {
+        var folderName = GetLibraryEntry(folderNode)?.Name ?? string.Empty;
+        var insertionIndex = nodes.Count;
+        for (var index = 0; index < nodes.Count; index++)
+        {
+            var entry = GetLibraryEntry(nodes[index]);
+            if (entry is null) continue;
+            if (entry.Document is not null)
+            {
+                if (foldersBeforeDocuments)
+                {
+                    insertionIndex = index;
+                    break;
+                }
+                continue;
+            }
+            if (string.Compare(entry.Name, folderName, StringComparison.CurrentCultureIgnoreCase) <= 0) continue;
+            insertionIndex = index;
+            break;
+        }
+        nodes.Insert(insertionIndex, folderNode);
+    }
+
+    private bool RefreshFolderNodeContent(Guid folderId)
+    {
+        var folder = _userPreferences.NotebookFolders.FirstOrDefault(item => item.Id == folderId);
+        var node = FindFolderNode(FolderTree.RootNodes, folderId);
+        if (folder is null || node is null) return false;
+        node.Content = new LibraryTreeEntry(folder.Id, null, folder.Name, folder.Color,
+            _documents.Count(document => DocumentFolderId(document.Id) == folder.Id).ToString());
+        return true;
+    }
+
     private static LibraryTreeEntry? GetLibraryEntry(TreeViewNode? node) =>
         node?.Content as LibraryTreeEntry;
 
@@ -886,10 +946,12 @@ public sealed partial class MainPage : Page
         };
         _userPreferences.NotebookFolders.Add(created);
         _selectedFolderId = created.Id;
-        RebuildFolderTree(created.Id);
-        ApplyFolderFilter();
+        AttachNewFolderNode(created);
+        UpdateLibrarySummary();
+        UpdateFolderActions();
         await PersistUserPreferencesAsync("Created notebook folder");
-        DiagnosticsLog.Info("folder.created", ("is_subfolder", parentId is not null));
+        DiagnosticsLog.Info("folder.created", ("is_subfolder", parentId is not null),
+            ("parent_id", parentId?.ToString("D") ?? "root"));
     }
 
     private async void OnMoveNotebookToFolderClick(object sender, RoutedEventArgs e)
@@ -980,7 +1042,7 @@ public sealed partial class MainPage : Page
         var index = _userPreferences.NotebookFolders.FindIndex(folder => folder.Id == folderId);
         if (index < 0) return;
         _userPreferences.NotebookFolders[index] = _userPreferences.NotebookFolders[index] with { Color = color };
-        RebuildFolderTree(folderId);
+        if (!RefreshFolderNodeContent(folderId)) RebuildFolderTree(folderId);
         await PersistUserPreferencesAsync("Updated folder color");
     }
 
@@ -1131,7 +1193,7 @@ public sealed partial class MainPage : Page
         var index = _userPreferences.NotebookFolders.FindIndex(item => item.Id == folderId);
         if (index < 0) return;
         _userPreferences.NotebookFolders[index] = _userPreferences.NotebookFolders[index] with { Name = name };
-        RebuildFolderTree(_selectedFolderId);
+        if (!RefreshFolderNodeContent(folderId)) RebuildFolderTree(_selectedFolderId);
         await PersistUserPreferencesAsync("Renamed folder");
         UpdateLibrarySummary();
     }

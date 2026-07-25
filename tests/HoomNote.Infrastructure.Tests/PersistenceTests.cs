@@ -448,6 +448,12 @@ public sealed class PersistenceTests : IAsyncLifetime
     {
         var path = Path.Combine(_root, "settings.json");
         var folder = new NotebookFolderPreference { Name = "School", Color = "#7C6CFF" };
+        var childFolder = new NotebookFolderPreference
+        {
+            ParentId = folder.Id,
+            Name = "Biology",
+            Color = "#38B26C"
+        };
         var documentId = Guid.NewGuid();
         var preferences = new UserPreferences
         {
@@ -461,7 +467,7 @@ public sealed class PersistenceTests : IAsyncLifetime
                 Tool = "Highlighter", Color = "#FFCE56", Width = 8,
                 PressureSensitivity = 40, Opacity = 0.34, Smoothing = 0.8, StraightLine = true
             }],
-            NotebookFolders = [folder],
+            NotebookFolders = [folder, childFolder],
             DocumentColors = new Dictionary<string, string>
             {
                 [documentId.ToString("D")] = "#4BAEFF"
@@ -490,13 +496,26 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal(0.34, preset.Opacity, 3);
         Assert.Equal(0.8, preset.Smoothing, 3);
         Assert.True(preset.StraightLine);
-        Assert.Equal("School", Assert.Single(loaded.NotebookFolders).Name);
-        Assert.Equal("#7C6CFF", Assert.Single(loaded.NotebookFolders).Color);
+        var loadedFolder = Assert.Single(loaded.NotebookFolders, item => item.Id == folder.Id);
+        Assert.Equal("School", loadedFolder.Name);
+        Assert.Equal("#7C6CFF", loadedFolder.Color);
+        var loadedChild = Assert.Single(loaded.NotebookFolders, item => item.Id == childFolder.Id);
+        Assert.Equal(folder.Id, loadedChild.ParentId);
+        Assert.Equal("Biology", loadedChild.Name);
+        Assert.Equal("#38B26C", loadedChild.Color);
         Assert.Equal(folder.Id.ToString("D"), loaded.DocumentFolders[documentId.ToString("D")]);
         Assert.Equal("#4BAEFF", loaded.DocumentColors[documentId.ToString("D")]);
         Assert.Equal(documentId.ToString("D"), Assert.Single(loaded.NotebookOrder));
         Assert.Equal("Graph", loaded.DefaultPageTemplate);
         Assert.Equal("#202124", loaded.DefaultPageColor);
+
+        var childIndex = loaded.NotebookFolders.FindIndex(item => item.Id == childFolder.Id);
+        loaded.NotebookFolders[childIndex] = loadedChild with { Color = "#F05D7A" };
+        await new LocalUserSettingsStore(path).SaveAsync(loaded);
+        var recolored = await new LocalUserSettingsStore(path).LoadAsync();
+        var recoloredChild = Assert.Single(recolored.NotebookFolders, item => item.Id == childFolder.Id);
+        Assert.Equal(folder.Id, recoloredChild.ParentId);
+        Assert.Equal("#F05D7A", recoloredChild.Color);
     }
 
     private static NotePage AddPage(HoomNoteDocument document)
