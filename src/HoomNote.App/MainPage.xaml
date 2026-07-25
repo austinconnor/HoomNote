@@ -66,6 +66,34 @@
                             <Path Data="M15,18 C17,19 19,21 21,23" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.8" />
                         </Canvas></Viewbox>
                     </ToggleButton>
+                    <ToggleButton x:Name="TemporaryGridToolbarButton"
+                                  Style="{StaticResource HoomNoteToolButtonStyle}"
+                                  Click="OnTemporaryGridToolbarClick"
+                                  ToolTipService.ToolTip="Temporary grid (G)">
+                        <TextBlock Text="#" FontSize="19" FontWeight="SemiBold"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <ToggleButton.ContextFlyout>
+                            <Flyout>
+                                <StackPanel Width="250" Spacing="10">
+                                    <TextBlock Text="Temporary grid size" FontWeight="SemiBold" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="76" />
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="TemporaryGridSizeSlider" Minimum="8" Maximum="128"
+                                                Value="32" StepFrequency="0.5" VerticalAlignment="Center" />
+                                        <NumberBox x:Name="TemporaryGridSizeNumberBox" Grid.Column="1"
+                                                   Minimum="8" Maximum="128" SmallChange="1" LargeChange="8"
+                                                   Value="32" SpinButtonPlacementMode="Hidden" />
+                                    </Grid>
+                                    <TextBlock Text="Right-click or press and hold # to change spacing."
+                                               FontSize="10" TextWrapping="Wrap"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                </StackPanel>
+                            </Flyout>
+                        </ToggleButton.ContextFlyout>
+                    </ToggleButton>
                     <Button x:Name="MoreToolsButton" Style="{StaticResource HoomNoteToolbarButtonStyle}"
                             ToolTipService.ToolTip="More tools">
                         <FontIcon Glyph="&#xE712;" FontSize="16" />
@@ -124,34 +152,6 @@
                             </MenuFlyout>
                         </Button.ContextFlyout>
                     </Button>
-                    <ToggleButton x:Name="TemporaryGridToolbarButton"
-                                  Style="{StaticResource HoomNoteToolButtonStyle}"
-                                  Click="OnTemporaryGridToolbarClick"
-                                  ToolTipService.ToolTip="Temporary grid (G)">
-                        <TextBlock Text="#" FontSize="19" FontWeight="SemiBold"
-                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
-                        <ToggleButton.ContextFlyout>
-                            <Flyout>
-                                <StackPanel Width="250" Spacing="10">
-                                    <TextBlock Text="Temporary grid size" FontWeight="SemiBold" />
-                                    <Grid ColumnSpacing="8">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="76" />
-                                        </Grid.ColumnDefinitions>
-                                        <Slider x:Name="TemporaryGridSizeSlider" Minimum="8" Maximum="128"
-                                                Value="32" StepFrequency="0.5" VerticalAlignment="Center" />
-                                        <NumberBox x:Name="TemporaryGridSizeNumberBox" Grid.Column="1"
-                                                   Minimum="8" Maximum="128" SmallChange="1" LargeChange="8"
-                                                   Value="32" SpinButtonPlacementMode="Hidden" />
-                                    </Grid>
-                                    <TextBlock Text="Right-click or press and hold # to change spacing."
-                                               FontSize="10" TextWrapping="Wrap"
-                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
-                                </StackPanel>
-                            </Flyout>
-                        </ToggleButton.ContextFlyout>
-                    </ToggleButton>
                 </StackPanel>
                 <ScrollViewer x:Name="PresetScrollViewer" Grid.Column="2" MinWidth="120" MaxWidth="420" Margin="12,0,8,0"
                               HorizontalAlignment="Left" HorizontalContentAlignment="Left"
