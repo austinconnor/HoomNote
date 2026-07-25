@@ -150,7 +150,6 @@
                                 <MenuFlyoutSeparator />
                                 <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick" />
                                 <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick" />
-                                <MenuFlyoutItem Text="Import installed Samsung Notes…" Click="OnImportInstalledSamsungNotesClick" />
                             </MenuFlyout>
                         </Button.Flyout>
                     </Button>
@@ -174,7 +173,6 @@
                             <MenuFlyoutItem Text="Import into current notebook…" Click="OnImportClick" />
                             <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick" />
                             <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick" />
-                            <MenuFlyoutItem Text="Import installed Samsung Notes…" Click="OnImportInstalledSamsungNotesClick" />
                             <MenuFlyoutItem Text="Export" Click="OnExportClick" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Check for updates" Click="OnCheckForUpdatesClick" />

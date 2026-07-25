@@ -394,23 +394,6 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
-    public void SamsungNotesBulkDiscovery_FindsInstalledWindowsLocalState()
-    {
-        var localAppData = Path.Combine(_root, "LocalAppData");
-        var notes = Path.Combine(localAppData, "Packages",
-            "SAMSUNGELECTRONICSCoLtd.SamsungNotes_test", "LocalState", "Course");
-        Directory.CreateDirectory(notes);
-        File.WriteAllBytes(Path.Combine(notes, "Lecture.sdocx"), []);
-
-        var discovered = SamsungNotesBulkImportDiscovery.DiscoverInstalledLibrary(localAppData);
-
-        var source = Assert.Single(discovered);
-        Assert.Equal("Lecture.sdocx", Path.GetFileName(source.SourcePath));
-        Assert.EndsWith(Path.Combine("LocalState", "Course"), source.RelativeFolder,
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
     public async Task SamsungNotesImport_RealSamplesPreserveFidelityWhenAvailable()
     {
         var cases = new[]

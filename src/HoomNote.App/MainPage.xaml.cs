@@ -6189,32 +6189,6 @@ public sealed partial class MainPage : Page
         catch (Exception exception) { ShowError("Samsung Notes folder could not be imported.", exception); }
     }
 
-    private async void OnImportInstalledSamsungNotesClick(object sender, RoutedEventArgs e)
-    {
-        if (_importService is null || _repository is null) return;
-        try
-        {
-            StatusText.Text = "Scanning installed Samsung Notes storage…";
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var sources = await Task.Run(() =>
-                SamsungNotesBulkImportDiscovery.DiscoverInstalledLibrary(localAppData));
-            if (sources.Count == 0)
-            {
-                ImportInfo.Title = "No importable Samsung Notes cache found";
-                ImportInfo.Message =
-                    "Samsung does not expose its live note database as a public SDOCX library. " +
-                    "In Samsung Notes, select notes and use Save as file → Samsung Notes file, " +
-                    "then choose Import Samsung Notes files or folder here.";
-                ImportInfo.Severity = InfoBarSeverity.Informational;
-                ImportInfo.IsOpen = true;
-                StatusText.Text = "No SDOCX files found in Samsung Notes local storage";
-                return;
-            }
-            await ImportSamsungNotesBatchAsync(sources, "Samsung Notes");
-        }
-        catch (Exception exception) { ShowError("Installed Samsung Notes data could not be imported.", exception); }
-    }
-
     private async Task ImportSamsungNotesBatchAsync(
         IReadOnlyList<SamsungNoteImportSource> sources,
         string? rootFolderName)
