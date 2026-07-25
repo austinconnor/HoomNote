@@ -5,13 +5,14 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 6;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
     public string PenColor { get; init; } = "#111111";
     public string HighlighterColor { get; init; } = "#FFCE56";
     public bool HighlighterStraightLine { get; init; }
+    public double TemporaryGridSize { get; init; } = 32;
     public bool TabsCollapsed { get; init; }
     public List<ToolbarPresetPreference> ToolbarPresets { get; init; } = [];
     public List<NotebookFolderPreference> NotebookFolders { get; init; } = [];

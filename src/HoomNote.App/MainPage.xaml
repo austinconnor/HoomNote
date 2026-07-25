@@ -93,9 +93,20 @@
                                 <StackPanel Width="250" Spacing="10">
                                     <TextBlock x:Name="QuickInkSettingsTitle" Text="Pen settings"
                                                FontWeight="SemiBold" />
-                                    <NumberBox x:Name="QuickStrokeWidthBox" Header="Size" Minimum="0.1" Maximum="24"
-                                               SmallChange="0.1" LargeChange="1" Value="2.4"
-                                               SpinButtonPlacementMode="Compact" />
+                                    <TextBlock Text="Size" FontSize="12"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="76" />
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="StrokeWidthSlider" Minimum="0.1" Maximum="24" Value="2.4"
+                                                StepFrequency="0.1" ValueChanged="OnInkSliderValueChanged"
+                                                VerticalAlignment="Center" />
+                                        <NumberBox x:Name="QuickStrokeWidthBox" Grid.Column="1"
+                                                   Minimum="0.1" Maximum="24" SmallChange="0.1" LargeChange="1"
+                                                   Value="2.4" SpinButtonPlacementMode="Hidden" />
+                                    </Grid>
                                     <TextBlock Text="Color" FontSize="12"
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                     <ColorPicker x:Name="QuickInkColorPicker" IsAlphaEnabled="False"
@@ -113,6 +124,34 @@
                             </MenuFlyout>
                         </Button.ContextFlyout>
                     </Button>
+                    <ToggleButton x:Name="TemporaryGridToolbarButton"
+                                  Style="{StaticResource HoomNoteToolButtonStyle}"
+                                  Click="OnTemporaryGridToolbarClick"
+                                  ToolTipService.ToolTip="Temporary grid (G)">
+                        <TextBlock Text="#" FontSize="19" FontWeight="SemiBold"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <ToggleButton.ContextFlyout>
+                            <Flyout>
+                                <StackPanel Width="250" Spacing="10">
+                                    <TextBlock Text="Temporary grid size" FontWeight="SemiBold" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="76" />
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="TemporaryGridSizeSlider" Minimum="8" Maximum="128"
+                                                Value="32" StepFrequency="0.5" VerticalAlignment="Center" />
+                                        <NumberBox x:Name="TemporaryGridSizeNumberBox" Grid.Column="1"
+                                                   Minimum="8" Maximum="128" SmallChange="1" LargeChange="8"
+                                                   Value="32" SpinButtonPlacementMode="Hidden" />
+                                    </Grid>
+                                    <TextBlock Text="Right-click or press and hold # to change spacing."
+                                               FontSize="10" TextWrapping="Wrap"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                </StackPanel>
+                            </Flyout>
+                        </ToggleButton.ContextFlyout>
+                    </ToggleButton>
                 </StackPanel>
                 <ScrollViewer x:Name="PresetScrollViewer" Grid.Column="2" MinWidth="120" MaxWidth="420" Margin="12,0,8,0"
                               HorizontalAlignment="Left" HorizontalContentAlignment="Left"
@@ -468,78 +507,6 @@
                                         Value="2.4" StepFrequency="0.1" ValueChanged="OnStyleToolWidthChanged" />
                             </StackPanel>
                         </Border>
-                        <ToggleSwitch x:Name="TemporaryGridToggle" Header="Temporary grid" OffContent="Hidden" OnContent="Visible"
-                                      Toggled="OnTemporaryGridToggled" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                            <TextBlock Text="Grid size" VerticalAlignment="Center" />
-                            <Border Grid.Column="1" Tag="Grid" Padding="8,3" CornerRadius="5" Background="{StaticResource HoomNotePanelRaisedBrush}"
-                                    PointerPressed="OnSliderReadoutPointerPressed" PointerMoved="OnSliderReadoutPointerMoved" PointerReleased="OnSliderReadoutPointerReleased">
-                                <TextBlock x:Name="TemporaryGridSizeValue" Text="32" FontWeight="SemiBold" />
-                            </Border>
-                        </Grid>
-                        <Slider x:Name="TemporaryGridSizeSlider" Minimum="8" Maximum="128" Value="32"
-                                StepFrequency="4" ValueChanged="OnTemporaryGridSizeChanged" IsEnabled="False" />
-                        <Border Height="1" Background="{StaticResource HoomNoteBorderBrush}" />
-                        <TextBlock Text="Ink preset" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                            <TextBlock Text="Width" VerticalAlignment="Center" />
-                            <Border Grid.Column="1" Tag="Width" Padding="8,3" CornerRadius="5" Background="{StaticResource HoomNotePanelRaisedBrush}"
-                                    PointerPressed="OnSliderReadoutPointerPressed" PointerMoved="OnSliderReadoutPointerMoved" PointerReleased="OnSliderReadoutPointerReleased">
-                                <TextBlock x:Name="StrokeWidthValue" Text="2.4" FontWeight="SemiBold" />
-                            </Border>
-                        </Grid>
-                        <Slider x:Name="StrokeWidthSlider" Minimum="0.1" Maximum="24" Value="2.4" StepFrequency="0.1" ValueChanged="OnInkSliderValueChanged" />
-                        <Button x:Name="InkColorButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
-                            <StackPanel Orientation="Horizontal" Spacing="10">
-                                <Border x:Name="InkColorSwatch" Width="18" Height="18" CornerRadius="9" Background="#111111"
-                                        BorderBrush="#55FFFFFF" BorderThickness="1" />
-                                <TextBlock x:Name="InkColorLabel" Text="Pen color" VerticalAlignment="Center" />
-                            </StackPanel>
-                            <Button.Flyout>
-                                <Flyout>
-                                    <ColorPicker x:Name="InkColorPicker" IsAlphaEnabled="False"
-                                                 IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False"
-                                                 ColorChanged="OnInkColorChanged" />
-                                </Flyout>
-                            </Button.Flyout>
-                        </Button>
-                        <TextBlock Text="Pen and highlighter colors are remembered separately." FontSize="10"
-                                   Foreground="{StaticResource HoomNoteMutedTextBrush}" TextWrapping="Wrap" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="Quick colors" VerticalAlignment="Center" FontSize="12"
-                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" />
-                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4">
-                                <Button Content="Save" Click="OnSaveInkColorClick" Padding="8,4" />
-                                <Button x:Name="RemoveSavedColorButton" Content="Remove" Click="OnRemoveSavedColorClick"
-                                        Padding="8,4" IsEnabled="False" />
-                            </StackPanel>
-                        </Grid>
-                        <GridView x:Name="SavedColorPalette" MaxHeight="104" SelectionMode="Single"
-                                  SelectionChanged="OnSavedColorSelected">
-                            <GridView.ItemsPanel>
-                                <ItemsPanelTemplate>
-                                    <ItemsWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="4" />
-                                </ItemsPanelTemplate>
-                            </GridView.ItemsPanel>
-                            <GridView.ItemTemplate>
-                                <DataTemplate>
-                                    <Border Width="28" Height="28" CornerRadius="14" Background="{Binding Brush}"
-                                            BorderBrush="#66FFFFFF" BorderThickness="1"
-                                            ToolTipService.ToolTip="{Binding Hex}" />
-                                </DataTemplate>
-                            </GridView.ItemTemplate>
-                        </GridView>
-                        <Grid ColumnSpacing="6">
-                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                            <Button Content="Save pen" Click="OnAddPenPresetClick" HorizontalAlignment="Stretch" />
-                            <Button Grid.Column="1" Content="Save highlighter" Click="OnAddHighlighterPresetClick" HorizontalAlignment="Stretch" />
-                        </Grid>
                         <ToggleSwitch x:Name="HighlighterStraightToggle" Header="Highlighter stroke" OffContent="Freeform" OnContent="Straight line"
                                       Toggled="OnHighlighterStraightToggled" />
                         <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" />

@@ -43,12 +43,6 @@ public sealed partial class MainPage : Page
 {
     private const string CanvasClipboardFormat = "application/x-hoomnote-canvas-objects+json";
     private const string NotebookTabDataFormat = "application/x-hoomnote-notebook-tab";
-    private sealed class SavedColorItem(string hex)
-    {
-        public string Hex { get; } = hex;
-        public SolidColorBrush Brush { get; } = new(ParseColor(hex));
-    }
-
     private sealed record FolderDisplay(Guid? Id, string Name, string Color)
     {
         public override string ToString() => Name;
@@ -96,7 +90,6 @@ public sealed partial class MainPage : Page
     private readonly List<DocumentSummary> _allDocuments = [];
     private readonly ObservableCollection<NotePage> _pages = [];
     private readonly ObservableCollection<SearchResult> _searchResults = [];
-    private readonly ObservableCollection<SavedColorItem> _savedColors = [];
     private readonly Dictionary<Guid, CommandHistory> _documentHistories = [];
     private CommandHistory _history = new();
     private SpatialIndex _spatialIndex = new();
@@ -305,15 +298,12 @@ public sealed partial class MainPage : Page
     private bool _updatingTabs;
     private bool _syncingInkColor;
     private bool _syncingInkWidth;
+    private bool _syncingTemporaryGridSize;
     private bool _syncingTextEditor;
     private bool _requiresFullSave;
     private int _fullSaveVersion;
     private bool _hasUnsavedChanges;
     private int _editVersion;
-    private Slider? _scrubSlider;
-    private UIElement? _scrubOwner;
-    private double _scrubStartX;
-    private double _scrubStartValue;
     private string? _internalClipboard;
     private bool _temporaryGridVisible;
     private bool _readMode;
@@ -380,6 +370,8 @@ public sealed partial class MainPage : Page
         // synchronization handlers before the inspector controls exist, which aborts startup.
         QuickStrokeWidthBox.ValueChanged += OnQuickStrokeWidthChanged;
         QuickInkColorPicker.ColorChanged += OnQuickInkColorChanged;
+        TemporaryGridSizeSlider.ValueChanged += OnTemporaryGridSizeChanged;
+        TemporaryGridSizeNumberBox.ValueChanged += OnTemporaryGridSizeNumberChanged;
         VersionText.Text = DisplayVersion();
         PresetScrollViewer.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnPresetScrollWheelChanged), handledEventsToo: true);
@@ -406,8 +398,6 @@ public sealed partial class MainPage : Page
         PageList.ItemsSource = _pages;
         DiagnosticsLog.Info("main.constructor.binding_search_results");
         SearchResultsList.ItemsSource = _searchResults;
-        DiagnosticsLog.Info("main.constructor.binding_saved_colors");
-        SavedColorPalette.ItemsSource = _savedColors;
         DiagnosticsLog.Info("main.constructor.bindings_complete");
         BuildContextMenus();
         SetInkColor(_inkColor, rememberForTool: false);
@@ -468,8 +458,12 @@ public sealed partial class MainPage : Page
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
             _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFCE56";
             HighlighterStraightToggle.IsOn = _userPreferences.HighlighterStraightLine;
+            _temporaryGridSize = Math.Clamp(_userPreferences.TemporaryGridSize, 8, 128);
+            _syncingTemporaryGridSize = true;
+            TemporaryGridSizeSlider.Value = _temporaryGridSize;
+            TemporaryGridSizeNumberBox.Value = _temporaryGridSize;
+            _syncingTemporaryGridSize = false;
             SetInkColor(_penColor, rememberForTool: false);
-            LoadSavedColorPalette();
             RebuildPresetToolbar();
             RebuildFolderTree();
             _assetStore = new ContentAddressedAssetStore(Path.Combine(root, "assets"));
@@ -4948,7 +4942,6 @@ public sealed partial class MainPage : Page
             _colorTool = EditorTool.Pen;
             SetInkColor(_penColor, rememberForTool: false);
         }
-        InkColorLabel.Text = _colorTool == EditorTool.Highlighter ? "Highlighter color" : "Pen color";
         QuickInkSettingsTitle.Text = _colorTool == EditorTool.Highlighter
             ? "Highlighter settings"
             : "Pen settings";
@@ -4957,7 +4950,8 @@ public sealed partial class MainPage : Page
             : "Save pen";
         ToolTipService.SetToolTip(QuickInkSettingsButton,
             _colorTool == EditorTool.Highlighter ? "Highlighter size and color" : "Pen size and color");
-        foreach (var toggle in ToolButtons.Children.OfType<ToggleButton>())
+        foreach (var toggle in ToolButtons.Children.OfType<ToggleButton>()
+                     .Where(toggle => toggle.Tag is string))
             toggle.IsChecked = selected is not null ? toggle == selected : string.Equals(toggle.Tag as string, tool.ToString(), StringComparison.Ordinal);
         MoreToolsButton.Background = tool is EditorTool.Style or EditorTool.SegmentEraser or EditorTool.Text or
             EditorTool.Shape or EditorTool.BoxSelect
@@ -5018,30 +5012,48 @@ public sealed partial class MainPage : Page
         StyleApplyModeButton.IsChecked = !_styleToolPickMode;
     }
 
-    private void OnTemporaryGridToggled(object sender, RoutedEventArgs e)
+    private void OnTemporaryGridToolbarClick(object sender, RoutedEventArgs e) =>
+        SetTemporaryGridVisible(TemporaryGridToolbarButton.IsChecked == true);
+
+    private void SetTemporaryGridVisible(bool visible)
     {
-        _temporaryGridVisible = TemporaryGridToggle.IsOn;
-        TemporaryGridSizeSlider.IsEnabled = _temporaryGridVisible;
+        _temporaryGridVisible = visible;
+        if (TemporaryGridToolbarButton.IsChecked != visible)
+            TemporaryGridToolbarButton.IsChecked = visible;
         InvalidatePageRenderCache();
         InvalidateCanvas();
     }
 
     private void OnTemporaryGridSizeChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
-        _temporaryGridSize = e.NewValue;
-        if (TemporaryGridSizeValue is not null) TemporaryGridSizeValue.Text = $"{e.NewValue:0}";
-        if (_temporaryGridVisible)
-        {
-            InvalidatePageRenderCache();
-            InvalidateCanvas();
-        }
+        if (_syncingTemporaryGridSize) return;
+        SetTemporaryGridSize(e.NewValue);
+    }
+
+    private void OnTemporaryGridSizeNumberChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingTemporaryGridSize) return;
+        SetTemporaryGridSize(double.IsFinite(args.NewValue) ? args.NewValue : _temporaryGridSize);
+    }
+
+    private void SetTemporaryGridSize(double requestedSize)
+    {
+        var size = Math.Clamp(Math.Round(requestedSize * 2) / 2, 8, 128);
+        _temporaryGridSize = size;
+        _syncingTemporaryGridSize = true;
+        TemporaryGridSizeSlider.Value = size;
+        TemporaryGridSizeNumberBox.Value = size;
+        _syncingTemporaryGridSize = false;
+        ScheduleUserPreferencesSave();
+        if (!_temporaryGridVisible) return;
+        InvalidatePageRenderCache();
+        InvalidateCanvas();
     }
 
     private void OnInkSliderValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         if (StrokeWidthSlider is null) return;
         var text = $"{StrokeWidthSlider.Value:0.#}";
-        if (StrokeWidthValue is not null) StrokeWidthValue.Text = text;
         if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
         if (!_syncingInkWidth && QuickStrokeWidthBox is not null &&
             Math.Abs(QuickStrokeWidthBox.Value - StrokeWidthSlider.Value) > 0.0001)
@@ -5063,7 +5075,6 @@ public sealed partial class MainPage : Page
         StrokeWidthSlider.Value = value;
         _syncingInkWidth = false;
         var text = $"{value:0.#}";
-        if (StrokeWidthValue is not null) StrokeWidthValue.Text = text;
         if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
     }
 
@@ -5071,44 +5082,6 @@ public sealed partial class MainPage : Page
     {
         if (_syncingInkColor) return;
         SetInkColor($"#{args.NewColor.R:X2}{args.NewColor.G:X2}{args.NewColor.B:X2}");
-    }
-
-    private void OnSliderReadoutPointerPressed(object sender, PointerRoutedEventArgs e)
-    {
-        if (sender is not FrameworkElement { Tag: string tag } owner) return;
-        _scrubSlider = tag switch
-        {
-            "Grid" => TemporaryGridSizeSlider,
-            "Width" => StrokeWidthSlider,
-            _ => null
-        };
-        if (_scrubSlider is null) return;
-        _scrubOwner = owner;
-        _scrubStartX = e.GetCurrentPoint(this).Position.X;
-        _scrubStartValue = _scrubSlider.Value;
-        owner.CapturePointer(e.Pointer);
-        e.Handled = true;
-    }
-
-    private void OnSliderReadoutPointerMoved(object sender, PointerRoutedEventArgs e)
-    {
-        if (_scrubSlider is null || _scrubOwner is null) return;
-        var point = e.GetCurrentPoint(this);
-        if (!point.Properties.IsLeftButtonPressed) return;
-        var unitsPerPixel = (_scrubSlider.Maximum - _scrubSlider.Minimum) / 180d;
-        var raw = _scrubStartValue + (point.Position.X - _scrubStartX) * unitsPerPixel;
-        var step = Math.Max(0.0001, _scrubSlider.StepFrequency);
-        _scrubSlider.Value = Math.Clamp(Math.Round(raw / step) * step,
-            _scrubSlider.Minimum, _scrubSlider.Maximum);
-        e.Handled = true;
-    }
-
-    private void OnSliderReadoutPointerReleased(object sender, PointerRoutedEventArgs e)
-    {
-        _scrubOwner?.ReleasePointerCapture(e.Pointer);
-        _scrubSlider = null;
-        _scrubOwner = null;
-        e.Handled = true;
     }
 
     private void OnHighlighterStraightToggled(object sender, RoutedEventArgs e)
@@ -5325,7 +5298,7 @@ public sealed partial class MainPage : Page
     private void OnGridShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
     {
         if (ShortcutTargetsTextInput() || _readMode) return;
-        TemporaryGridToggle.IsOn = !TemporaryGridToggle.IsOn;
+        SetTemporaryGridVisible(!_temporaryGridVisible);
         args.Handled = true;
     }
 
@@ -5446,7 +5419,7 @@ public sealed partial class MainPage : Page
         }
         if (!controlDown && args.Key == VirtualKey.G)
         {
-            if (!_readMode) TemporaryGridToggle.IsOn = !TemporaryGridToggle.IsOn;
+            if (!_readMode) SetTemporaryGridVisible(!_temporaryGridVisible);
             args.Handled = true;
             return;
         }
@@ -5552,54 +5525,6 @@ public sealed partial class MainPage : Page
         ActivateTool(tool);
         args.Handled = true;
     }
-
-    private void OnInkColorChanged(ColorPicker sender, ColorChangedEventArgs args)
-    {
-        if (_syncingInkColor) return;
-        SetInkColor($"#{args.NewColor.R:X2}{args.NewColor.G:X2}{args.NewColor.B:X2}");
-    }
-
-    private async void OnSaveInkColorClick(object sender, RoutedEventArgs e)
-    {
-        if (_savedColors.Any(item => item.Hex == _inkColor))
-        {
-            SavedColorPalette.SelectedItem = _savedColors.First(item => item.Hex == _inkColor);
-            return;
-        }
-        if (_savedColors.Count >= 24)
-        {
-            ImportInfo.Title = "Palette is full";
-            ImportInfo.Message = "Remove a saved color before adding another one.";
-            ImportInfo.Severity = InfoBarSeverity.Informational;
-            ImportInfo.IsOpen = true;
-            return;
-        }
-
-        var item = new SavedColorItem(_inkColor);
-        _savedColors.Add(item);
-        SavedColorPalette.SelectedItem = item;
-        await SaveUserPreferencesAsync();
-    }
-
-    private void OnSavedColorSelected(object sender, SelectionChangedEventArgs e)
-    {
-        RemoveSavedColorButton.IsEnabled = SavedColorPalette.SelectedItem is SavedColorItem;
-        if (SavedColorPalette.SelectedItem is SavedColorItem color) SetInkColor(color.Hex);
-    }
-
-    private async void OnRemoveSavedColorClick(object sender, RoutedEventArgs e)
-    {
-        if (SavedColorPalette.SelectedItem is not SavedColorItem color) return;
-        _savedColors.Remove(color);
-        RemoveSavedColorButton.IsEnabled = false;
-        await SaveUserPreferencesAsync();
-    }
-
-    private async void OnAddPenPresetClick(object sender, RoutedEventArgs e) =>
-        await AddToolbarPresetAsync(EditorTool.Pen);
-
-    private async void OnAddHighlighterPresetClick(object sender, RoutedEventArgs e) =>
-        await AddToolbarPresetAsync(EditorTool.Highlighter);
 
     private async void OnSaveCurrentInkPresetClick(object sender, RoutedEventArgs e) =>
         await AddToolbarPresetAsync(_colorTool == EditorTool.Highlighter
@@ -6979,42 +6904,26 @@ public sealed partial class MainPage : Page
             ScheduleUserPreferencesSave();
         }
         var parsed = ParseColor(_inkColor);
-        var inspectorPicker = InkColorPicker;
-        var quickPicker = QuickInkColorPicker;
-        var inspectorNeedsUpdate = inspectorPicker is not null && inspectorPicker.Color != parsed;
-        var quickPickerNeedsUpdate = quickPicker is not null && quickPicker.Color != parsed;
-        if (inspectorNeedsUpdate || quickPickerNeedsUpdate)
+        var quickPickerNeedsUpdate = QuickInkColorPicker is not null && QuickInkColorPicker.Color != parsed;
+        if (quickPickerNeedsUpdate)
         {
             _syncingInkColor = true;
-            if (inspectorNeedsUpdate) inspectorPicker!.Color = parsed;
-            if (quickPickerNeedsUpdate) quickPicker!.Color = parsed;
+            QuickInkColorPicker!.Color = parsed;
             _syncingInkColor = false;
         }
-        if (InkColorSwatch is not null) InkColorSwatch.Background = new SolidColorBrush(parsed);
         if (QuickInkColorSwatch is not null) QuickInkColorSwatch.Background = new SolidColorBrush(parsed);
-    }
-
-    private void LoadSavedColorPalette()
-    {
-        _savedColors.Clear();
-        foreach (var color in _userPreferences.SavedInkColors
-                     .Select(color => color.ToUpperInvariant())
-                     .Where(IsValidHexColor)
-                     .Distinct(StringComparer.OrdinalIgnoreCase)
-                     .Take(24))
-            _savedColors.Add(new SavedColorItem(color));
     }
 
     private async Task SaveUserPreferencesAsync()
     {
         _userPreferences = _userPreferences with
         {
-            SavedInkColors = _savedColors.Select(item => item.Hex).ToList(),
             PenColor = _penColor,
             HighlighterColor = _highlighterColor,
-            HighlighterStraightLine = HighlighterStraightToggle.IsOn
+            HighlighterStraightLine = HighlighterStraightToggle.IsOn,
+            TemporaryGridSize = _temporaryGridSize
         };
-        await PersistUserPreferencesAsync("Saved ink palette");
+        await PersistUserPreferencesAsync("Saved settings");
     }
 
     private void ScheduleUserPreferencesSave()

@@ -455,6 +455,7 @@ public sealed class PersistenceTests : IAsyncLifetime
             PenColor = "#2E86DE",
             HighlighterColor = "#FFCE56",
             HighlighterStraightLine = true,
+            TemporaryGridSize = 47.5,
             ToolbarPresets = [new ToolbarPresetPreference
             {
                 Tool = "Highlighter", Color = "#FFCE56", Width = 8,
@@ -481,6 +482,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#2E86DE", loaded.PenColor);
         Assert.Equal("#FFCE56", loaded.HighlighterColor);
         Assert.True(loaded.HighlighterStraightLine);
+        Assert.Equal(47.5, loaded.TemporaryGridSize);
         Assert.Equal(UserPreferences.CurrentVersion, loaded.Version);
         var preset = Assert.Single(loaded.ToolbarPresets);
         Assert.Equal("Highlighter", preset.Tool);
