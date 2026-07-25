@@ -1,5 +1,5 @@
-# HoomNote 0.7.12
+# HoomNote 0.7.13
 
-- Moved every workspace action into the top-right overflow menu.
-- Expanded the saved-preset strip across all newly available toolbar space.
-- Reduced pen and highlighter preset tile sizes so more presets remain visible.
+- Saved pen and highlighter presets now retain size edits automatically after selection.
+- Limited ink-size input and display values to one decimal place.
+- Added a transient zoom percentage badge for wheel and pinch zooming.

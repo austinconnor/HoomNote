@@ -12,6 +12,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Navigation;
 using HoomNote.Canvas.Geometry;
@@ -31,6 +32,7 @@ using Windows.Storage;
 using Windows.Storage.Pickers;
 using Windows.Storage.Streams;
 using Windows.System;
+using Windows.Globalization.NumberFormatting;
 using Windows.UI;
 using Windows.UI.Core;
 using System.Text.Json;
@@ -256,6 +258,8 @@ public sealed partial class MainPage : Page
     private CancellationTokenSource? _incrementalRecognitionCancellation;
     private readonly DispatcherQueueTimer _thumbnailRefreshTimer;
     private readonly DispatcherQueueTimer _navigationSettleTimer;
+    private readonly DispatcherQueueTimer _zoomIndicatorTimer;
+    private Storyboard? _zoomIndicatorFade;
     private Guid? _pendingThumbnailRefreshPageId;
     private EditorTool _activeTool = EditorTool.Select;
     private EditorTool _gestureTool = EditorTool.Select;
@@ -299,6 +303,8 @@ public sealed partial class MainPage : Page
     private bool _updatingTabs;
     private bool _syncingInkColor;
     private bool _syncingInkWidth;
+    private bool _applyingToolbarPreset;
+    private Guid? _activeToolbarPresetId;
     private bool _syncingTemporaryGridSize;
     private bool _syncingTextEditor;
     private bool _requiresFullSave;
@@ -370,6 +376,12 @@ public sealed partial class MainPage : Page
         // still being constructed. Subscribing in markup lets those assignments invoke our
         // synchronization handlers before the inspector controls exist, which aborts startup.
         QuickStrokeWidthBox.ValueChanged += OnQuickStrokeWidthChanged;
+        QuickStrokeWidthBox.NumberFormatter = new DecimalFormatter
+        {
+            IntegerDigits = 1,
+            FractionDigits = 1,
+            IsGrouped = false
+        };
         QuickInkColorPicker.ColorChanged += OnQuickInkColorChanged;
         TemporaryGridSizeSlider.ValueChanged += OnTemporaryGridSizeChanged;
         TemporaryGridSizeNumberBox.ValueChanged += OnTemporaryGridSizeNumberChanged;
@@ -394,6 +406,10 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.Interval = TimeSpan.FromMilliseconds(180);
         _navigationSettleTimer.IsRepeating = false;
         _navigationSettleTimer.Tick += OnNavigationSettleTick;
+        _zoomIndicatorTimer = DispatcherQueue.CreateTimer();
+        _zoomIndicatorTimer.Interval = TimeSpan.FromMilliseconds(850);
+        _zoomIndicatorTimer.IsRepeating = false;
+        _zoomIndicatorTimer.Tick += OnZoomIndicatorTimerTick;
         AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnGlobalKeyDown), handledEventsToo: true);
         DiagnosticsLog.Info("main.constructor.binding_page_list");
         PageList.ItemsSource = _pages;
@@ -504,6 +520,8 @@ public sealed partial class MainPage : Page
         _recognitionTimer.Stop();
         _thumbnailRefreshTimer.Stop();
         _navigationSettleTimer.Stop();
+        _zoomIndicatorTimer.Stop();
+        _zoomIndicatorFade?.Stop();
         _wheelZoomAnimating = false;
         StopViewportFramePump();
         StopTouchInertia(resumeBackgroundWork: false);
@@ -3460,7 +3478,7 @@ public sealed partial class MainPage : Page
                 new SizeD(DrawingSurface.ActualWidth, DrawingSurface.ActualHeight));
             _zoom = viewport.Zoom;
             _pan = viewport.Pan;
-            UpdateZoomText();
+            UpdateZoomText(showIndicator: true);
         }
         _fitPending = false;
         InvalidateCanvas();
@@ -3565,7 +3583,7 @@ public sealed partial class MainPage : Page
             Math.Log(_wheelZoomTarget / Math.Max(_wheelZoomStart, 0.0001)) * eased);
         if (progress >= 1) nextZoom = _wheelZoomTarget;
         ApplyZoomAtAnchor(nextZoom, _wheelZoomAnchorPage, _wheelZoomAnchorScreen);
-        UpdateZoomText();
+        UpdateZoomText(showIndicator: true);
 
         if (nextZoom == _wheelZoomTarget)
             StopWheelZoomAnimation(resumeBackgroundWork: true);
@@ -3665,7 +3683,7 @@ public sealed partial class MainPage : Page
         ApplyZoomAtAnchor(immediateZoom, _wheelZoomAnchorPage, _wheelZoomAnchorScreen);
         _wheelZoomStart = _zoom;
         _wheelZoomAnimationStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-        UpdateZoomText();
+        UpdateZoomText(showIndicator: true);
         InvalidateCanvas();
         e.Handled = true;
     }
@@ -4961,6 +4979,7 @@ public sealed partial class MainPage : Page
 
     private void ActivateTool(EditorTool tool, ToggleButton? selected = null)
     {
+        if (!_applyingToolbarPreset) SetActiveToolbarPreset(null);
         _presetOpacity = null;
         _presetSmoothing = null;
         _activeTool = tool;
@@ -5085,34 +5104,45 @@ public sealed partial class MainPage : Page
     private void OnInkSliderValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         if (StrokeWidthSlider is null) return;
-        var text = $"{StrokeWidthSlider.Value:0.#}";
-        if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
-        if (!_syncingInkWidth && QuickStrokeWidthBox is not null &&
-            Math.Abs(QuickStrokeWidthBox.Value - StrokeWidthSlider.Value) > 0.0001)
-        {
-            _syncingInkWidth = true;
-            QuickStrokeWidthBox.Value = StrokeWidthSlider.Value;
-            _syncingInkWidth = false;
-        }
+        if (_syncingInkWidth) return;
+        SetInkWidth(e.NewValue);
     }
 
     private void OnQuickStrokeWidthChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
     {
         if (_syncingInkWidth || StrokeWidthSlider is null) return;
-        var value = double.IsFinite(args.NewValue)
-            ? Math.Clamp(Math.Round(args.NewValue, 1), 0.1, 24)
-            : StrokeWidthSlider.Value;
+        SetInkWidth(double.IsFinite(args.NewValue) ? args.NewValue : StrokeWidthSlider.Value);
+    }
+
+    private void SetInkWidth(double requestedWidth)
+    {
+        var value = Math.Clamp(Math.Round(requestedWidth, 1), 0.1, 24);
         _syncingInkWidth = true;
-        sender.Value = value;
-        StrokeWidthSlider.Value = value;
+        if (StrokeWidthSlider is not null && Math.Abs(StrokeWidthSlider.Value - value) > 0.0001)
+            StrokeWidthSlider.Value = value;
+        if (QuickStrokeWidthBox is not null && Math.Abs(QuickStrokeWidthBox.Value - value) > 0.0001)
+            QuickStrokeWidthBox.Value = value;
         _syncingInkWidth = false;
-        var text = $"{value:0.#}";
+        var text = $"{value:0.0}";
         if (QuickInkWidthText is not null) QuickInkWidthText.Text = text;
+        if (_applyingToolbarPreset || _activeToolbarPresetId is not { } presetId) return;
+        var presetIndex = _userPreferences.ToolbarPresets.FindIndex(preset => preset.Id == presetId);
+        if (presetIndex < 0)
+        {
+            SetActiveToolbarPreset(null);
+            return;
+        }
+        var preset = _userPreferences.ToolbarPresets[presetIndex];
+        if (Math.Abs(preset.Width - value) < 0.0001) return;
+        _userPreferences.ToolbarPresets[presetIndex] = preset with { Width = value };
+        ScheduleUserPreferencesSave();
+        StatusText.Text = $"Updated saved {preset.Tool.ToLowerInvariant()} size • {value:0.0} pt";
     }
 
     private void OnQuickInkColorChanged(ColorPicker sender, ColorChangedEventArgs args)
     {
         if (_syncingInkColor) return;
+        if (!_applyingToolbarPreset) SetActiveToolbarPreset(null);
         SetInkColor($"#{args.NewColor.R:X2}{args.NewColor.G:X2}{args.NewColor.B:X2}");
     }
 
@@ -5675,6 +5705,26 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void SetActiveToolbarPreset(Guid? presetId)
+    {
+        _activeToolbarPresetId = presetId;
+        if (presetId is not { } id)
+        {
+            ActivePresetSaveText.Visibility = Visibility.Collapsed;
+            return;
+        }
+        var preset = _userPreferences.ToolbarPresets.FirstOrDefault(item => item.Id == id);
+        if (preset is null)
+        {
+            _activeToolbarPresetId = null;
+            ActivePresetSaveText.Visibility = Visibility.Collapsed;
+            return;
+        }
+        ActivePresetSaveText.Text =
+            $"{preset.Tool} preset selected • size changes save automatically.";
+        ActivePresetSaveText.Visibility = Visibility.Visible;
+    }
+
     private void OnPresetScrollWheelChanged(object sender, PointerRoutedEventArgs e)
     {
         var delta = e.GetCurrentPoint(PresetScrollViewer).Properties.MouseWheelDelta;
@@ -5743,18 +5793,29 @@ public sealed partial class MainPage : Page
             ? nameof(EditorTool.Pen)
             : preset.Tool;
         if (!Enum.TryParse<EditorTool>(presetTool, out var tool)) return;
-        ActivateTool(tool);
-        _presetOpacity = (float)Math.Clamp(preset.Opacity, 0.05, 1);
-        _presetSmoothing = (float)Math.Clamp(preset.Smoothing, 0, 1);
-        SetInkColor(preset.Color);
-        StrokeWidthSlider.Value = preset.Width;
-        if (tool == EditorTool.Highlighter) HighlighterStraightToggle.IsOn = preset.StraightLine;
+        _applyingToolbarPreset = true;
+        try
+        {
+            ActivateTool(tool);
+            _presetOpacity = (float)Math.Clamp(preset.Opacity, 0.05, 1);
+            _presetSmoothing = (float)Math.Clamp(preset.Smoothing, 0, 1);
+            SetInkColor(preset.Color);
+            SetInkWidth(preset.Width);
+            if (tool == EditorTool.Highlighter) HighlighterStraightToggle.IsOn = preset.StraightLine;
+        }
+        finally
+        {
+            _applyingToolbarPreset = false;
+        }
+        SetActiveToolbarPreset(id);
+        StatusText.Text = $"{preset.Tool} preset selected • size changes save automatically";
     }
 
     private async void OnRemoveToolbarPresetClick(object sender, RoutedEventArgs e)
     {
         if (sender is not MenuFlyoutItem { Tag: Guid id }) return;
         _userPreferences.ToolbarPresets.RemoveAll(item => item.Id == id);
+        if (_activeToolbarPresetId == id) SetActiveToolbarPreset(null);
         RebuildPresetToolbar();
         await PersistUserPreferencesAsync("Removed toolbar preset");
     }
@@ -7538,7 +7599,42 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void UpdateZoomText() => ZoomText.Text = $"{_zoom:P0}";
+    private void UpdateZoomText(bool showIndicator = false)
+    {
+        var text = $"{_zoom:P0}";
+        ZoomText.Text = text;
+        if (!showIndicator) return;
+        _zoomIndicatorFade?.Stop();
+        _zoomIndicatorFade = null;
+        ZoomIndicatorText.Text = text;
+        ZoomIndicator.Opacity = 1;
+        ZoomIndicator.Visibility = Visibility.Visible;
+        _zoomIndicatorTimer.Stop();
+        _zoomIndicatorTimer.Start();
+    }
+
+    private void OnZoomIndicatorTimerTick(DispatcherQueueTimer sender, object args)
+    {
+        sender.Stop();
+        var fade = new Storyboard();
+        var opacity = new DoubleAnimation
+        {
+            To = 0,
+            Duration = new Duration(TimeSpan.FromMilliseconds(180)),
+            EnableDependentAnimation = true
+        };
+        Storyboard.SetTarget(opacity, ZoomIndicator);
+        Storyboard.SetTargetProperty(opacity, "Opacity");
+        fade.Children.Add(opacity);
+        fade.Completed += (_, _) =>
+        {
+            if (!ReferenceEquals(_zoomIndicatorFade, fade)) return;
+            ZoomIndicator.Visibility = Visibility.Collapsed;
+            _zoomIndicatorFade = null;
+        };
+        _zoomIndicatorFade = fade;
+        fade.Begin();
+    }
 
     private void ShowError(string title, Exception exception)
     {

@@ -139,6 +139,10 @@
                                                    Minimum="0.1" Maximum="24" SmallChange="0.1" LargeChange="1"
                                                    Value="2.4" SpinButtonPlacementMode="Hidden" />
                                     </Grid>
+                                    <TextBlock x:Name="ActivePresetSaveText"
+                                               Text="Size changes save automatically to the selected preset."
+                                               Visibility="Collapsed" FontSize="10" TextWrapping="Wrap"
+                                               Foreground="{StaticResource HoomNoteAccentBrush}" />
                                     <TextBlock Text="Color" FontSize="12"
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                     <ColorPicker x:Name="QuickInkColorPicker" IsAlphaEnabled="False"
@@ -414,6 +418,13 @@
                         <FontIcon x:Name="ImageLockOverlayIcon" Glyph="&#xE785;" FontSize="17" />
                     </Button>
                 </Canvas>
+                <Border x:Name="ZoomIndicator" HorizontalAlignment="Center" VerticalAlignment="Top"
+                        Margin="0,18,0,0" Padding="12,6" CornerRadius="14"
+                        Visibility="Collapsed" Opacity="0" IsHitTestVisible="False"
+                        Background="#E61A1C20" BorderBrush="#3FFFFFFF" BorderThickness="1">
+                    <TextBlock x:Name="ZoomIndicatorText" Text="100%" FontSize="13"
+                               FontWeight="SemiBold" Foreground="{StaticResource HoomNoteTextBrush}" />
+                </Border>
                 <Border x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#F0161616" CornerRadius="12" Padding="24" Visibility="Collapsed">
                     <StackPanel HorizontalAlignment="Center" Spacing="8">
                         <TextBlock x:Name="EmptyStateTitle" Text="Create a notebook to begin" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Center" />
