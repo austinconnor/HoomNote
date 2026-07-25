@@ -1,6 +1,4 @@
-# HoomNote 0.7.15
+# HoomNote 0.7.16
 
-- Refreshed the primary tool, library, page, and overflow-action icons with a consistent local vector set.
-- Kept custom ink preset swatches and the dotted lasso treatment purpose-built for note-taking.
-- Notebook and folder names now accept up to 128 characters across create, rename, and import flows.
-- Added shared name normalization and regression coverage without adding an icon runtime dependency.
+- Fixed clipping caused by placing 24x24 vector geometry in a 16x16 layout box.
+- Icons now retain their native geometry bounds, scale visually around their center, and align consistently inside toolbar buttons.
