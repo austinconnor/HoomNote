@@ -53,7 +53,11 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
             await assetStore.AddAsync(source, Path.GetExtension(entry.Name), cancellationToken);
         }
 
-        return document with { Id = Guid.NewGuid(), Title = document.Title + " (Imported)" };
+        return document with
+        {
+            Id = Guid.NewGuid(),
+            Title = LibraryNamePolicy.Normalize(document.Title + " (Imported)") ?? "Imported notebook"
+        };
     }
 
     private static IEnumerable<string> ReferencedAssets(HoomNoteDocument document)
@@ -65,4 +69,3 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
         }
     }
 }
-

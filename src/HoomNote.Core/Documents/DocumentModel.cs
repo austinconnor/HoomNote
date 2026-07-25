@@ -106,7 +106,7 @@ public sealed record HoomNoteDocument
     {
         return new HoomNoteDocument
         {
-            Title = title,
+            Title = LibraryNamePolicy.Normalize(title) ?? "Untitled notebook",
             Kind = kind,
             Pages = [],
             Sections = [new NotebookSection()]

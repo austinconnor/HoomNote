@@ -34,35 +34,28 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" Spacing="4">
                     <Button Style="{StaticResource HoomNoteToolbarButtonStyle}" Click="OnUndoClick" ToolTipService.ToolTip="Undo">
-                        <FontIcon Glyph="&#xE7A7;" FontSize="17" />
+                        <PathIcon Data="{StaticResource IconUndo}" />
                     </Button>
                     <Button Style="{StaticResource HoomNoteToolbarButtonStyle}" Click="OnRedoClick" ToolTipService.ToolTip="Redo">
-                        <FontIcon Glyph="&#xE7A6;" FontSize="17" />
+                        <PathIcon Data="{StaticResource IconRedo}" />
                     </Button>
                 </StackPanel>
                 <Border Grid.Column="1" Width="1" Height="20" Margin="6,0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{StaticResource HoomNoteBorderBrush}" />
                 <StackPanel x:Name="ToolButtons" Grid.Column="1" Margin="13,0,0,0" Orientation="Horizontal" Spacing="4">
-                    <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><FontIcon Glyph="&#xE7C9;" FontSize="16" /></ToggleButton>
+                    <ToggleButton Tag="Select" IsChecked="True" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Select and transform (V)"><PathIcon Data="{StaticResource IconSelect}" /></ToggleButton>
                     <ToggleButton Tag="Pen" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Pen (P)">
-                        <FontIcon Glyph="&#xE76D;" FontSize="16" />
+                        <PathIcon Data="{StaticResource IconPen}" />
                     </ToggleButton>
                     <ToggleButton Tag="Highlighter" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Highlighter (H)">
-                        <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
-                            <Path Data="M6,15 L14.5,6.5 L19,11 L10.5,19.5 L6,19.5 Z" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.9" StrokeLineJoin="Round" />
-                            <Path Data="M4,22 L20,22" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.8" />
-                        </Canvas></Viewbox>
+                        <PathIcon Data="{StaticResource IconHighlighter}" />
                     </ToggleButton>
                     <ToggleButton Tag="Eyedropper" Click="OnToolClick"
                                   Style="{StaticResource HoomNoteToolButtonStyle}"
                                   ToolTipService.ToolTip="Pick ink color and thickness">
-                        <FontIcon Glyph="&#xE82F;" FontSize="16" />
+                        <PathIcon Data="{StaticResource IconEyedropper}" />
                     </ToggleButton>
                     <ToggleButton Tag="StrokeEraser" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Erase whole strokes (E)">
-                        <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
-                            <Path Data="M4,18 L12,5 L21,11 L14,21 L8,21 Z" Fill="{StaticResource HoomNotePanelRaisedBrush}" Stroke="{StaticResource HoomNoteTextBrush}" StrokeThickness="1.8" StrokeLineJoin="Round" />
-                            <Path Data="M4,4 L20,4" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="2.3" />
-                            <Path Data="M6,2 L6,6 M10,2 L10,6 M14,2 L14,6 M18,2 L18,6" Stroke="{StaticResource HoomNoteAccentBrush}" StrokeThickness="1.2" />
-                        </Canvas></Viewbox>
+                        <PathIcon Data="{StaticResource IconEraser}" />
                     </ToggleButton>
                     <ToggleButton Tag="Lasso" Click="OnToolClick" Style="{StaticResource HoomNoteToolButtonStyle}" ToolTipService.ToolTip="Freeform lasso (L)">
                         <Viewbox Width="18" Height="18"><Canvas Width="24" Height="24">
@@ -74,8 +67,7 @@
                                   Style="{StaticResource HoomNoteToolButtonStyle}"
                                   Click="OnTemporaryGridToolbarClick"
                                   ToolTipService.ToolTip="Temporary grid (G)">
-                        <TextBlock Text="#" FontSize="19" FontWeight="SemiBold"
-                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <PathIcon Data="{StaticResource IconGrid}" />
                         <ToggleButton.ContextFlyout>
                             <Flyout>
                                 <StackPanel Width="250" Spacing="10">
@@ -91,7 +83,7 @@
                                                    Minimum="8" Maximum="128" SmallChange="1" LargeChange="8"
                                                    Value="32" SpinButtonPlacementMode="Hidden" />
                                     </Grid>
-                                    <TextBlock Text="Right-click or press and hold # to change spacing."
+                                    <TextBlock Text="Right-click or press and hold the grid button to change spacing."
                                                FontSize="10" TextWrapping="Wrap"
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                 </StackPanel>
@@ -100,14 +92,24 @@
                     </ToggleButton>
                     <Button x:Name="MoreToolsButton" Style="{StaticResource HoomNoteToolbarButtonStyle}"
                             ToolTipService.ToolTip="More tools">
-                        <FontIcon Glyph="&#xE712;" FontSize="16" />
+                        <PathIcon Data="{StaticResource IconMore}" />
                         <Button.Flyout>
                             <MenuFlyout>
-                                <MenuFlyoutItem Text="Style brush" Tag="Style" Click="OnOverflowToolClick" />
-                                <MenuFlyoutItem Text="Segment eraser" Tag="SegmentEraser" Click="OnOverflowToolClick" />
-                                <MenuFlyoutItem Text="Text box" Tag="Text" Click="OnOverflowToolClick" />
-                                <MenuFlyoutItem Text="Shapes" Tag="Shape" Click="OnOverflowToolClick" />
-                                <MenuFlyoutItem Text="Box selection" Tag="BoxSelect" Click="OnOverflowToolClick" />
+                                <MenuFlyoutItem Text="Style brush" Tag="Style" Click="OnOverflowToolClick">
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconStyleBrush}" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Segment eraser" Tag="SegmentEraser" Click="OnOverflowToolClick">
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconSegmentEraser}" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Text box" Tag="Text" Click="OnOverflowToolClick">
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconTextBox}" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Shapes" Tag="Shape" Click="OnOverflowToolClick">
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconShapes}" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Box selection" Tag="BoxSelect" Click="OnOverflowToolClick">
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconBoxSelect}" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
                             </MenuFlyout>
                         </Button.Flyout>
                     </Button>
@@ -155,7 +157,7 @@
                                 <MenuFlyoutItem x:Name="SaveCurrentInkPresetMenuItem"
                                                   Text="Save pen"
                                                   Click="OnSaveCurrentInkPresetClick">
-                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE74E;" /></MenuFlyoutItem.Icon>
+                                    <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconSave}" /></MenuFlyoutItem.Icon>
                                 </MenuFlyoutItem>
                             </MenuFlyout>
                         </Button.ContextFlyout>
@@ -172,21 +174,41 @@
                 </ScrollViewer>
                 <Button x:Name="ToolbarOverflowActionsButton" Grid.Column="3"
                         Style="{StaticResource HoomNoteToolbarButtonStyle}" ToolTipService.ToolTip="Workspace actions">
-                    <FontIcon Glyph="&#xE712;" FontSize="18" />
+                    <PathIcon Data="{StaticResource IconMore}" />
                     <Button.Flyout>
                         <MenuFlyout>
-                            <MenuFlyoutItem Text="Toggle library" Tag="Library" Click="OnSidebarToggleClick" />
-                            <MenuFlyoutItem Text="Toggle pages" Tag="Pages" Click="OnSidebarToggleClick" />
-                            <MenuFlyoutItem Text="Page and selection settings" Tag="Inspector" Click="OnSidebarToggleClick" />
+                            <MenuFlyoutItem Text="Toggle library" Tag="Library" Click="OnSidebarToggleClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconLibrary}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Toggle pages" Tag="Pages" Click="OnSidebarToggleClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconPages}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Page and selection settings" Tag="Inspector" Click="OnSidebarToggleClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconInspector}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Read mode" Click="OnReadModeClick" />
-                            <MenuFlyoutItem Text="Add image" Click="OnAddImageClick" />
-                            <MenuFlyoutItem Text="Import into current notebook…" Click="OnImportClick" />
-                            <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick" />
-                            <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick" />
-                            <MenuFlyoutItem Text="Export" Click="OnExportClick" />
+                            <MenuFlyoutItem Text="Read mode" Click="OnReadModeClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconRead}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Add image" Click="OnAddImageClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImage}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Import into current notebook…" Click="OnImportClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImport}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImport}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Import Samsung Notes folder…" Click="OnImportSamsungFolderClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImport}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Export" Click="OnExportClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconExport}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Check for updates" Click="OnCheckForUpdatesClick" />
+                            <MenuFlyoutItem Text="Check for updates" Click="OnCheckForUpdatesClick">
+                                <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconUpdate}" /></MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
                         </MenuFlyout>
                     </Button.Flyout>
                 </Button>
@@ -252,15 +274,15 @@
                         </StackPanel>
                         <Button Grid.Column="1" Width="32" Height="30" Padding="5" VerticalAlignment="Center"
                                 Click="OnNewFolderClick" ToolTipService.ToolTip="New top-level folder">
-                            <FontIcon Glyph="&#xE8F4;" FontSize="13" />
+                            <PathIcon Data="{StaticResource IconFolderPlus}" />
                         </Button>
                     </Grid>
                     <Grid Grid.Row="1" ColumnSpacing="5" Margin="0,14,0,14">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                         <Button Height="36" HorizontalAlignment="Stretch" CornerRadius="8" Click="OnNewNotebookClick" ToolTipService.ToolTip="New notebook (Ctrl+N)">
-                            <StackPanel Orientation="Horizontal" Spacing="7"><FontIcon Glyph="&#xE710;" FontSize="13" /><TextBlock Text="New notebook" /></StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="7"><PathIcon Data="{StaticResource IconNotebookPlus}" /><TextBlock Text="New notebook" /></StackPanel>
                         </Button>
-                        <Button Grid.Column="1" Width="36" Height="36" Padding="6" CornerRadius="8" Click="OnNewCanvasClick" ToolTipService.ToolTip="New infinite canvas"><FontIcon Glyph="&#xE8A5;" FontSize="14" /></Button>
+                        <Button Grid.Column="1" Width="36" Height="36" Padding="6" CornerRadius="8" Click="OnNewCanvasClick" ToolTipService.ToolTip="New infinite canvas"><PathIcon Data="{StaticResource IconFilePlus}" /></Button>
                     </Grid>
                     <Grid x:Name="FolderHeader" Grid.Row="2" Margin="2,0,2,5">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
@@ -343,7 +365,7 @@
                         <TextBlock x:Name="NotebookTitle" Text="Pages" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
                         <Button Grid.Column="1" Width="28" Height="28" Padding="4" Click="OnNotebookSettingsClick"
                                 ToolTipService.ToolTip="Notebook page defaults">
-                            <FontIcon Glyph="&#xE713;" FontSize="14" />
+                            <PathIcon Data="{StaticResource IconSettings}" />
                         </Button>
                     </Grid>
                     <Grid Grid.Row="1" Margin="0,8,0,10" ColumnSpacing="5">
@@ -351,9 +373,9 @@
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <Button Height="30" HorizontalAlignment="Stretch" Padding="4" Click="OnAddPageClick" ToolTipService.ToolTip="Add page (Ctrl+Enter)"><FontIcon Glyph="&#xE710;" FontSize="13" /></Button>
+                        <Button Height="30" HorizontalAlignment="Stretch" Padding="4" Click="OnAddPageClick" ToolTipService.ToolTip="Add page (Ctrl+Enter)"><PathIcon Data="{StaticResource IconFilePlus}" /></Button>
                         <Button x:Name="DeletePageButton" Grid.Column="1" Width="30" Height="30" Padding="4" Click="OnDeletePageClick"
-                                IsEnabled="False" ToolTipService.ToolTip="Delete the selected page"><FontIcon Glyph="&#xE74D;" FontSize="13" /></Button>
+                                IsEnabled="False" ToolTipService.ToolTip="Delete the selected page"><PathIcon Data="{StaticResource IconDelete}" /></Button>
                     </Grid>
                     <ListView x:Name="PageList" Grid.Row="2" SelectionChanged="OnPageSelectionChanged" RightTapped="OnPageListRightTapped"
                               ContainerContentChanging="OnPageThumbnailContainerContentChanging"
@@ -415,7 +437,13 @@
                     <Button x:Name="ImageLockOverlayButton" Width="36" Height="36" Padding="0"
                             Visibility="Collapsed" Click="OnSelectionLockClick"
                             ToolTipService.ToolTip="Image is unlocked • click to lock">
-                        <FontIcon x:Name="ImageLockOverlayIcon" Glyph="&#xE785;" FontSize="17" />
+                        <Grid>
+                            <PathIcon x:Name="ImageLockedOverlayIcon" Width="17" Height="17"
+                                      Data="{StaticResource IconLock}"
+                                      Visibility="Collapsed" />
+                            <PathIcon x:Name="ImageUnlockedOverlayIcon" Width="17" Height="17"
+                                      Data="{StaticResource IconUnlock}" />
+                        </Grid>
                     </Button>
                 </Canvas>
                 <Border x:Name="ZoomIndicator" HorizontalAlignment="Center" VerticalAlignment="Top"

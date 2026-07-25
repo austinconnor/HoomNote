@@ -928,7 +928,11 @@ public sealed partial class MainPage : Page
     {
         if (parentId is not null && _userPreferences.NotebookFolders.All(folder => folder.Id != parentId))
             parentId = null;
-        var name = new TextBox { Header = parentId is null ? "Folder name" : "Subfolder name" };
+        var name = new TextBox
+        {
+            Header = parentId is null ? "Folder name" : "Subfolder name",
+            MaxLength = LibraryNamePolicy.MaxLength
+        };
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
@@ -938,11 +942,13 @@ public sealed partial class MainPage : Page
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary
         };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary || string.IsNullOrWhiteSpace(name.Text)) return;
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+        var normalizedName = LibraryNamePolicy.Normalize(name.Text);
+        if (normalizedName is null) return;
         DiagnosticsLog.Info("folder.create_started", ("is_subfolder", parentId is not null));
         var created = new NotebookFolderPreference
         {
-            ParentId = parentId, Name = name.Text.Trim()
+            ParentId = parentId, Name = normalizedName
         };
         _userPreferences.NotebookFolders.Add(created);
         _selectedFolderId = created.Id;
@@ -1246,7 +1252,12 @@ public sealed partial class MainPage : Page
 
     private async Task<string?> PromptForNameAsync(string title, string header, string currentValue)
     {
-        var input = new TextBox { Header = header, Text = currentValue };
+        var input = new TextBox
+        {
+            Header = header,
+            Text = currentValue,
+            MaxLength = LibraryNamePolicy.MaxLength
+        };
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
@@ -1256,8 +1267,8 @@ public sealed partial class MainPage : Page
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary
         };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary || string.IsNullOrWhiteSpace(input.Text)) return null;
-        return input.Text.Trim();
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return null;
+        return LibraryNamePolicy.Normalize(input.Text);
     }
 
     private async Task LoadDocumentAsync(Guid id, Guid? pageId = null)
@@ -1320,7 +1331,7 @@ public sealed partial class MainPage : Page
         {
             Text = _isPrimaryWindow ? "Open in new window" : "Move to main window",
             Tag = documentId,
-            Icon = new FontIcon { Glyph = _isPrimaryWindow ? "\uE8A7" : "\uE8A7" }
+            Icon = new FontIcon { Glyph = "\uE8A7" }
         };
         if (_isPrimaryWindow) action.Click += OnOpenTabInNewWindowClick;
         else action.Click += OnMoveTabToMainWindowClick;
@@ -7594,9 +7605,8 @@ public sealed partial class MainPage : Page
         if (double.IsNaN(Canvas.GetTop(ImageLockOverlayButton)) ||
             Math.Abs(Canvas.GetTop(ImageLockOverlayButton) - top) > 0.25)
             Canvas.SetTop(ImageLockOverlayButton, top);
-        var glyph = image.IsLocked ? "\uE72E" : "\uE785";
-        if (!string.Equals(ImageLockOverlayIcon.Glyph, glyph, StringComparison.Ordinal))
-            ImageLockOverlayIcon.Glyph = glyph;
+        ImageLockedOverlayIcon.Visibility = image.IsLocked ? Visibility.Visible : Visibility.Collapsed;
+        ImageUnlockedOverlayIcon.Visibility = image.IsLocked ? Visibility.Collapsed : Visibility.Visible;
         UpdateTransientToolTip(ImageLockOverlayButton,
             image.IsLocked ? "Image is locked • click to unlock" : "Image is unlocked • click to lock");
         if (ImageLockOverlayButton.Visibility != Visibility.Visible)

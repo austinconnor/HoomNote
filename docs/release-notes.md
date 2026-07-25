@@ -1,5 +1,6 @@
-# HoomNote 0.7.14
+# HoomNote 0.7.15
 
-- Folder creation now inserts only the new node without rebuilding existing hierarchy.
-- Folder color and rename changes update only that node without flattening the tree.
-- Added nested-folder persistence regression coverage.
+- Refreshed the primary tool, library, page, and overflow-action icons with a consistent local vector set.
+- Kept custom ink preset swatches and the dotted lasso treatment purpose-built for note-taking.
+- Notebook and folder names now accept up to 128 characters across create, rename, and import flows.
+- Added shared name normalization and regression coverage without adding an icon runtime dependency.
