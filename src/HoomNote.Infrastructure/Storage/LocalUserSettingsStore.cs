@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using HoomNote.Infrastructure.Serialization;
 
@@ -46,6 +47,9 @@ public sealed record NotebookFolderPreference
 
 public sealed class LocalUserSettingsStore(string settingsPath)
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> FileGates =
+        new(StringComparer.OrdinalIgnoreCase);
+
     public async Task<UserPreferences> LoadAsync(CancellationToken cancellationToken = default)
     {
         if (!File.Exists(settingsPath)) return new UserPreferences();
@@ -66,14 +70,41 @@ public sealed class LocalUserSettingsStore(string settingsPath)
     public async Task SaveAsync(UserPreferences preferences, CancellationToken cancellationToken = default)
     {
         var fullPath = Path.GetFullPath(settingsPath);
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        var temporaryPath = fullPath + ".tmp";
-        await using (var output = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None,
-                         16 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+        // Capture mutable lists and dictionaries before the first await. MainPage keeps these
+        // collections live for fast UI updates, but an async serializer must never observe a
+        // half-applied folder move or a later window's mutation.
+        var snapshot = Snapshot(preferences);
+        var fileGate = FileGates.GetOrAdd(fullPath, _ => new SemaphoreSlim(1, 1));
+        await fileGate.WaitAsync(cancellationToken);
+        var temporaryPath = fullPath + $".{Guid.NewGuid():N}.tmp";
+        try
         {
-            await JsonSerializer.SerializeAsync(output, preferences, HoomNoteJson.Options, cancellationToken);
-            await output.FlushAsync(cancellationToken);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            await using (var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                             16 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await JsonSerializer.SerializeAsync(output, snapshot, HoomNoteJson.Options, cancellationToken);
+                await output.FlushAsync(cancellationToken);
+            }
+            File.Move(temporaryPath, fullPath, overwrite: true);
         }
-        File.Move(temporaryPath, fullPath, overwrite: true);
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            fileGate.Release();
+        }
     }
+
+    public static UserPreferences Snapshot(UserPreferences preferences) => preferences with
+    {
+        SavedInkColors = [.. preferences.SavedInkColors],
+        ToolbarPresets = [.. preferences.ToolbarPresets],
+        NotebookFolders = [.. preferences.NotebookFolders],
+        ExpandedFolderIds = [.. preferences.ExpandedFolderIds],
+        DocumentFolders = new Dictionary<string, string>(
+            preferences.DocumentFolders, StringComparer.OrdinalIgnoreCase),
+        DocumentColors = new Dictionary<string, string>(
+            preferences.DocumentColors, StringComparer.OrdinalIgnoreCase),
+        NotebookOrder = [.. preferences.NotebookOrder]
+    };
 }

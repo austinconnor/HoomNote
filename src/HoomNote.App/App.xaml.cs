@@ -11,6 +11,7 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Navigation;
 using Microsoft.UI.Xaml.Shapes;
 using HoomNote_App.Services;
+using HoomNote.Infrastructure.Storage;
 using System.Runtime.InteropServices;
 using Windows.Graphics;
 
@@ -26,6 +27,8 @@ public partial class App : Application
 {
     public static Window? MainAppWindow { get; private set; }
     private readonly HashSet<MainWindow> _windows = [];
+    private readonly SemaphoreSlim _userPreferencesGate = new(1, 1);
+    private UserPreferences? _sharedUserPreferences;
     
     /// <summary>
     /// Initializes the singleton application object.  This is the first line of authored code
@@ -105,6 +108,47 @@ public partial class App : Application
     }
 
     internal static MainWindow? PrimaryWindow => MainAppWindow as MainWindow;
+
+    internal static async Task<UserPreferences> LoadSharedUserPreferencesAsync(
+        LocalUserSettingsStore store)
+    {
+        if (Current is not App app) return await store.LoadAsync();
+        await app._userPreferencesGate.WaitAsync();
+        try
+        {
+            app._sharedUserPreferences ??= await store.LoadAsync();
+            return app._sharedUserPreferences;
+        }
+        finally
+        {
+            app._userPreferencesGate.Release();
+        }
+    }
+
+    internal static async Task SaveSharedUserPreferencesAsync(
+        LocalUserSettingsStore store,
+        UserPreferences preferences)
+    {
+        if (Current is not App app)
+        {
+            await store.SaveAsync(preferences);
+            return;
+        }
+
+        await app._userPreferencesGate.WaitAsync();
+        try
+        {
+            // All MainPage instances receive the same folder lists and mappings. Shallow
+            // record updates may differ per window, but the hierarchy remains one process-
+            // wide source of truth instead of being overwritten by a stale detached window.
+            app._sharedUserPreferences = preferences;
+            await store.SaveAsync(preferences);
+        }
+        finally
+        {
+            app._userPreferencesGate.Release();
+        }
+    }
 
     internal static MainPage? FindPageHostingNotebook(Guid documentId, MainPage? except = null)
     {

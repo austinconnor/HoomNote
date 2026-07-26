@@ -315,15 +315,33 @@
                                               DragOver="OnLibraryContainerDragOver" DragLeave="OnLibraryContainerDragLeave"
                                               Drop="OnLibraryContainerDrop">
                                             <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
                                                 <ColumnDefinition Width="18" />
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" />
                                             </Grid.ColumnDefinitions>
-                                            <FontIcon Glyph="{Binding Content.Glyph}" FontSize="13" Foreground="{Binding Content.Brush}"
+                                            <ItemsControl ItemsSource="{Binding Content.AncestorGuides}"
+                                                          Margin="{Binding Content.GuideMargin}"
+                                                          IsHitTestVisible="False">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate>
+                                                        <StackPanel Orientation="Horizontal" />
+                                                    </ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Width="24" Height="30">
+                                                            <Border Width="1" Background="#24FFFFFF"
+                                                                    HorizontalAlignment="Center" />
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <FontIcon Grid.Column="1" Glyph="{Binding Content.Glyph}" FontSize="13" Foreground="{Binding Content.Brush}"
                                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Column="1" Text="{Binding Content.Name}" FontSize="12.5"
+                                            <TextBlock Grid.Column="2" Text="{Binding Content.Name}" FontSize="12.5"
                                                        TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Column="2" Text="{Binding Content.Metadata}" FontSize="9"
+                                            <TextBlock Grid.Column="3" Text="{Binding Content.Metadata}" FontSize="9"
                                                        Foreground="{StaticResource HoomNoteMutedTextBrush}" VerticalAlignment="Center"
                                                        Margin="5,0,2,0" />
                                         </Grid>

@@ -520,6 +520,65 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#F05D7A", recoloredChild.Color);
     }
 
+    [Fact]
+    public async Task UserSettings_SaveCapturesFolderHierarchyBeforeAsyncWrite()
+    {
+        var path = Path.Combine(_root, "settings-snapshot.json");
+        var parent = new NotebookFolderPreference { Name = "Parent" };
+        var child = new NotebookFolderPreference { Name = "Child", ParentId = parent.Id };
+        var preferences = new UserPreferences { NotebookFolders = [parent, child] };
+        var store = new LocalUserSettingsStore(path);
+
+        var save = store.SaveAsync(preferences);
+        preferences.NotebookFolders[1] = child with { ParentId = null };
+        await save;
+
+        var loaded = await store.LoadAsync();
+        Assert.Equal(parent.Id,
+            Assert.Single(loaded.NotebookFolders, folder => folder.Id == child.Id).ParentId);
+    }
+
+    [Fact]
+    public void FolderHierarchy_RepairsOnlyInvalidLinks()
+    {
+        var root = new NotebookFolderPreference { Name = "Root" };
+        var child = new NotebookFolderPreference { Name = "Child", ParentId = root.Id };
+        var grandchild = new NotebookFolderPreference { Name = "Grandchild", ParentId = child.Id };
+        var missing = new NotebookFolderPreference { Name = "Missing", ParentId = Guid.NewGuid() };
+        var self = new NotebookFolderPreference { Name = "Self" };
+        self = self with { ParentId = self.Id };
+        var folders = new List<NotebookFolderPreference> { root, child, grandchild, missing, self };
+
+        var repaired = NotebookFolderHierarchy.RepairInvalidParents(folders);
+
+        Assert.Equal(root.Id, Assert.Single(folders, folder => folder.Id == child.Id).ParentId);
+        Assert.Equal(child.Id, Assert.Single(folders, folder => folder.Id == grandchild.Id).ParentId);
+        Assert.Null(Assert.Single(folders, folder => folder.Id == missing.Id).ParentId);
+        Assert.Null(Assert.Single(folders, folder => folder.Id == self.Id).ParentId);
+        Assert.Equal(2, repaired.Count);
+        Assert.Equal(2, NotebookFolderHierarchy.GetDepth(folders, grandchild.Id));
+    }
+
+    [Fact]
+    public void FolderHierarchy_RejectsMovesIntoDescendantsAndRepairsCycles()
+    {
+        var root = new NotebookFolderPreference { Name = "Root" };
+        var child = new NotebookFolderPreference { Name = "Child", ParentId = root.Id };
+        var grandchild = new NotebookFolderPreference { Name = "Grandchild", ParentId = child.Id };
+        var folders = new List<NotebookFolderPreference> { root, child, grandchild };
+
+        Assert.True(NotebookFolderHierarchy.WouldCreateCycle(folders, root.Id, grandchild.Id));
+        Assert.True(NotebookFolderHierarchy.WouldCreateCycle(folders, child.Id, child.Id));
+        Assert.False(NotebookFolderHierarchy.WouldCreateCycle(folders, grandchild.Id, root.Id));
+        Assert.False(NotebookFolderHierarchy.WouldCreateCycle(folders, child.Id, null));
+
+        folders[0] = root with { ParentId = grandchild.Id };
+        var repaired = NotebookFolderHierarchy.RepairInvalidParents(folders);
+        Assert.NotEmpty(repaired);
+        Assert.DoesNotContain(folders, folder =>
+            NotebookFolderHierarchy.WouldCreateCycle(folders, folder.Id, folder.ParentId));
+    }
+
     private static NotePage AddPage(HoomNoteDocument document)
     {
         var page = new NotePage();

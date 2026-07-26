@@ -45,21 +45,34 @@ public sealed partial class MainPage : Page
 {
     private const string CanvasClipboardFormat = "application/x-hoomnote-canvas-objects+json";
     private const string NotebookTabDataFormat = "application/x-hoomnote-notebook-tab";
+    private const string LibraryNotebookDragPrefix = "notebook:";
+    private const string LibraryFolderDragPrefix = "folder:";
     private sealed record FolderDisplay(Guid? Id, string Name, string Color)
     {
         public override string ToString() => Name;
     }
 
-    private sealed class LibraryTreeEntry(Guid? folderId, DocumentSummary? document, string name, string color, string? metadata)
+    private sealed class LibraryTreeEntry(
+        Guid? folderId,
+        DocumentSummary? document,
+        string name,
+        string color,
+        string? metadata,
+        int depth)
     {
         public Guid? FolderId { get; } = folderId;
         public DocumentSummary? Document { get; } = document;
         public string Name { get; } = name;
         public string Metadata { get; } = metadata ?? string.Empty;
+        public int Depth { get; } = Math.Max(0, depth);
+        public IReadOnlyList<int> AncestorGuides { get; } =
+            Enumerable.Range(0, Math.Max(0, depth)).ToArray();
+        public Thickness GuideMargin { get; } =
+            new(-24 * Math.Max(0, depth), 0, 0, 0);
         public SolidColorBrush Brush { get; } = new(ParseColor(color));
         public bool IsFolder => FolderId is not null && Document is null;
         public bool IsContainer => Document is null;
-        public bool CanDrag => Document is not null;
+        public bool CanDrag => Document is not null || FolderId is not null;
         public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
     }
 
@@ -459,7 +472,14 @@ public sealed partial class MainPage : Page
             var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HoomNote");
             Directory.CreateDirectory(root);
             _userSettingsStore = new LocalUserSettingsStore(Path.Combine(root, "settings.json"));
-            _userPreferences = await _userSettingsStore.LoadAsync();
+            _userPreferences = await App.LoadSharedUserPreferencesAsync(_userSettingsStore);
+            var repairedFolders = NotebookFolderHierarchy.RepairInvalidParents(_userPreferences.NotebookFolders);
+            if (repairedFolders.Count > 0)
+            {
+                DiagnosticsLog.Warning("folder.invalid_parents_repaired",
+                    ("count", repairedFolders.Count));
+                await App.SaveSharedUserPreferencesAsync(_userSettingsStore, _userPreferences);
+            }
             var migratedInkPresets = false;
             for (var index = 0; index < _userPreferences.ToolbarPresets.Count; index++)
             {
@@ -475,7 +495,8 @@ public sealed partial class MainPage : Page
                 };
                 migratedInkPresets = true;
             }
-            if (migratedInkPresets) await _userSettingsStore.SaveAsync(_userPreferences);
+            if (migratedInkPresets)
+                await App.SaveSharedUserPreferencesAsync(_userSettingsStore, _userPreferences);
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
             _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFCE56";
             HighlighterStraightCheckBox.IsChecked = _userPreferences.HighlighterStraightLine;
@@ -637,17 +658,17 @@ public sealed partial class MainPage : Page
         var rebuildVersion = ++_folderTreeRebuildVersion;
         FolderTree.RootNodes.Clear();
         foreach (var document in _documents.Where(document => DocumentFolderId(document.Id) is null))
-            FolderTree.RootNodes.Add(BuildNotebookNode(document));
+            FolderTree.RootNodes.Add(BuildNotebookNode(document, 0));
         var folderIds = _userPreferences.NotebookFolders.Select(folder => folder.Id).ToHashSet();
         var renderedFolders = new HashSet<Guid>();
         foreach (var folder in _userPreferences.NotebookFolders
                      .Where(item => item.ParentId is null || !folderIds.Contains(item.ParentId.Value))
                      .OrderBy(item => item.Name))
         {
-            FolderTree.RootNodes.Add(BuildFolderNode(folder, renderedFolders, []));
+            FolderTree.RootNodes.Add(BuildFolderNode(folder, renderedFolders, [], 0));
         }
         foreach (var folder in _userPreferences.NotebookFolders.Where(item => !renderedFolders.Contains(item.Id)).OrderBy(item => item.Name))
-            FolderTree.RootNodes.Add(BuildFolderNode(folder, renderedFolders, []));
+            FolderTree.RootNodes.Add(BuildFolderNode(folder, renderedFolders, [], 0));
 
         LibraryEmptyText.Visibility = FolderTree.RootNodes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         var desiredFolder = preferredFolderId ?? _selectedFolderId;
@@ -689,12 +710,16 @@ public sealed partial class MainPage : Page
             CaptureExpandedFolders(child);
     }
 
-    private TreeViewNode BuildFolderNode(NotebookFolderPreference folder, HashSet<Guid> rendered, HashSet<Guid> ancestry)
+    private TreeViewNode BuildFolderNode(
+        NotebookFolderPreference folder,
+        HashSet<Guid> rendered,
+        HashSet<Guid> ancestry,
+        int depth)
     {
         rendered.Add(folder.Id);
         ancestry.Add(folder.Id);
         var entry = new LibraryTreeEntry(folder.Id, null, folder.Name, folder.Color,
-            _documents.Count(document => DocumentFolderId(document.Id) == folder.Id).ToString());
+            _documents.Count(document => DocumentFolderId(document.Id) == folder.Id).ToString(), depth);
         var node = new TreeViewNode
         {
             Content = entry,
@@ -704,17 +729,18 @@ public sealed partial class MainPage : Page
                      .Where(item => item.ParentId == folder.Id && !ancestry.Contains(item.Id) && !rendered.Contains(item.Id))
                      .OrderBy(item => item.Name))
         {
-            node.Children.Add(BuildFolderNode(child, rendered, ancestry));
+            node.Children.Add(BuildFolderNode(child, rendered, ancestry, depth + 1));
         }
         foreach (var document in _documents.Where(document => DocumentFolderId(document.Id) == folder.Id))
-            node.Children.Add(BuildNotebookNode(document));
+            node.Children.Add(BuildNotebookNode(document, depth + 1));
         ancestry.Remove(folder.Id);
         return node;
     }
 
-    private TreeViewNode BuildNotebookNode(DocumentSummary document)
+    private static TreeViewNode BuildNotebookNode(DocumentSummary document, int depth)
     {
-        var entry = new LibraryTreeEntry(null, document, document.Title, document.Color, $"{document.PageCount}p");
+        var entry = new LibraryTreeEntry(
+            null, document, document.Title, document.Color, $"{document.PageCount}p", depth);
         return new TreeViewNode
         {
             Content = entry
@@ -723,7 +749,8 @@ public sealed partial class MainPage : Page
 
     private void AttachNewFolderNode(NotebookFolderPreference folder)
     {
-        var node = BuildFolderNode(folder, [], []);
+        var depth = NotebookFolderHierarchy.GetDepth(_userPreferences.NotebookFolders, folder.Id);
+        var node = BuildFolderNode(folder, [], [], depth);
         if (folder.ParentId is { } parentId &&
             FindFolderNode(FolderTree.RootNodes, parentId) is { } parentNode)
         {
@@ -776,8 +803,10 @@ public sealed partial class MainPage : Page
         var folder = _userPreferences.NotebookFolders.FirstOrDefault(item => item.Id == folderId);
         var node = FindFolderNode(FolderTree.RootNodes, folderId);
         if (folder is null || node is null) return false;
+        var depth = (GetLibraryEntry(node)?.Depth)
+                    ?? NotebookFolderHierarchy.GetDepth(_userPreferences.NotebookFolders, folder.Id);
         node.Content = new LibraryTreeEntry(folder.Id, null, folder.Name, folder.Color,
-            _documents.Count(document => DocumentFolderId(document.Id) == folder.Id).ToString());
+            _documents.Count(document => DocumentFolderId(document.Id) == folder.Id).ToString(), depth);
         return true;
     }
 
@@ -902,9 +931,12 @@ public sealed partial class MainPage : Page
 
     private void OnLibraryNotebookDragStarting(UIElement sender, DragStartingEventArgs args)
     {
-        if (sender is not FrameworkElement { Tag: LibraryTreeEntry { Document: { } document } }) return;
+        if (sender is not FrameworkElement { Tag: LibraryTreeEntry entry }) return;
         args.AllowedOperations = DataPackageOperation.Move;
-        args.Data.SetText(document.Id.ToString("D"));
+        if (entry.Document is { } document)
+            args.Data.SetText(LibraryNotebookDragPrefix + document.Id.ToString("D"));
+        else if (entry.FolderId is { } folderId)
+            args.Data.SetText(LibraryFolderDragPrefix + folderId.ToString("D"));
     }
 
     private void OnLibraryContainerDragOver(object sender, DragEventArgs e)
@@ -929,13 +961,16 @@ public sealed partial class MainPage : Page
         row.Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0));
         e.Handled = true;
         var value = await e.DataView.GetTextAsync();
-        if (!Guid.TryParse(value, out var documentId))
+        if (!TryParseLibraryDragPayload(value, out var kind, out var itemId))
         {
-            DiagnosticsLog.Warning("folder.drop_rejected", ("reason", "invalid_document_id"));
+            DiagnosticsLog.Warning("folder.drop_rejected", ("reason", "invalid_payload"));
             return;
         }
         DiagnosticsLog.Info("folder.drop_received", ("to_folder", target.FolderId is not null));
-        await MoveNotebookToFolderAsync(documentId, target.FolderId);
+        if (kind == LibraryDragKind.Folder)
+            await MoveFolderToFolderAsync(itemId, target.FolderId);
+        else
+            await MoveNotebookToFolderAsync(itemId, target.FolderId);
     }
 
     private void OnNotebookDragItemsStarting(object sender, DragItemsStartingEventArgs e)
@@ -962,7 +997,7 @@ public sealed partial class MainPage : Page
     {
         if (!e.DataView.Contains(StandardDataFormats.Text)) return;
         var value = await e.DataView.GetTextAsync();
-        if (!Guid.TryParse(value, out var documentId)) return;
+        if (!TryParseLibraryDragPayload(value, out var kind, out var itemId)) return;
         var container = FindAncestor<TreeViewItem>(e.OriginalSource as DependencyObject);
         var node = container is null ? null : FolderTree.NodeFromContainer(container);
         var target = GetLibraryEntry(node);
@@ -971,8 +1006,39 @@ public sealed partial class MainPage : Page
             targetFolderId = GetLibraryEntry(node?.Parent)?.FolderId;
         else if (container is not null && target?.IsContainer != true)
             return;
-        await MoveNotebookToFolderAsync(documentId, targetFolderId);
+        if (kind == LibraryDragKind.Folder)
+            await MoveFolderToFolderAsync(itemId, targetFolderId);
+        else
+            await MoveNotebookToFolderAsync(itemId, targetFolderId);
         e.Handled = true;
+    }
+
+    private enum LibraryDragKind
+    {
+        Notebook,
+        Folder
+    }
+
+    private static bool TryParseLibraryDragPayload(
+        string value,
+        out LibraryDragKind kind,
+        out Guid itemId)
+    {
+        if (value.StartsWith(LibraryFolderDragPrefix, StringComparison.OrdinalIgnoreCase) &&
+            Guid.TryParse(value[LibraryFolderDragPrefix.Length..], out itemId))
+        {
+            kind = LibraryDragKind.Folder;
+            return true;
+        }
+        if (value.StartsWith(LibraryNotebookDragPrefix, StringComparison.OrdinalIgnoreCase) &&
+            Guid.TryParse(value[LibraryNotebookDragPrefix.Length..], out itemId))
+        {
+            kind = LibraryDragKind.Notebook;
+            return true;
+        }
+        // Preserve compatibility with the older notebook drag payload.
+        kind = LibraryDragKind.Notebook;
+        return Guid.TryParse(value, out itemId);
     }
 
     private async void OnNewFolderClick(object sender, RoutedEventArgs e)
@@ -1037,6 +1103,40 @@ public sealed partial class MainPage : Page
         SelectLibraryDocument(documentId);
         await PersistUserPreferencesAsync(folderId is null ? "Moved notebook to top level" : "Moved notebook to folder");
         DiagnosticsLog.Info("folder.notebook_moved", ("to_folder", folderId is not null));
+    }
+
+    private async Task MoveFolderToFolderAsync(Guid folderId, Guid? parentId)
+    {
+        var index = _userPreferences.NotebookFolders.FindIndex(folder => folder.Id == folderId);
+        if (index < 0)
+        {
+            DiagnosticsLog.Warning("folder.move_rejected", ("reason", "missing_source_folder"));
+            return;
+        }
+        if (parentId is not null &&
+            _userPreferences.NotebookFolders.All(folder => folder.Id != parentId))
+        {
+            DiagnosticsLog.Warning("folder.move_rejected", ("reason", "missing_parent_folder"));
+            return;
+        }
+        if (NotebookFolderHierarchy.WouldCreateCycle(
+                _userPreferences.NotebookFolders, folderId, parentId))
+        {
+            DiagnosticsLog.Warning("folder.move_rejected", ("reason", "hierarchy_cycle"));
+            StatusText.Text = "A folder cannot be moved inside itself";
+            return;
+        }
+
+        var source = _userPreferences.NotebookFolders[index];
+        if (source.ParentId == parentId) return;
+        _userPreferences.NotebookFolders[index] = source with { ParentId = parentId };
+        _selectedFolderId = folderId;
+        RebuildFolderTree(folderId);
+        await PersistUserPreferencesAsync(
+            parentId is null ? "Moved folder to top level" : "Moved folder");
+        DiagnosticsLog.Info("folder.moved",
+            ("folder_id", folderId.ToString("D")),
+            ("parent_id", parentId?.ToString("D") ?? "root"));
     }
 
     private void UpdateFolderActions() { }
@@ -7306,8 +7406,17 @@ public sealed partial class MainPage : Page
         await _settingsSaveGate.WaitAsync();
         try
         {
-            await _userSettingsStore.SaveAsync(_userPreferences);
+            var repairedFolders = NotebookFolderHierarchy.RepairInvalidParents(
+                _userPreferences.NotebookFolders);
+            if (repairedFolders.Count > 0)
+                DiagnosticsLog.Warning("folder.invalid_parents_repaired_before_save",
+                    ("count", repairedFolders.Count));
+            await App.SaveSharedUserPreferencesAsync(_userSettingsStore, _userPreferences);
             StatusText.Text = status;
+            DiagnosticsLog.Info("settings.saved",
+                ("folder_count", _userPreferences.NotebookFolders.Count),
+                ("nested_folder_count",
+                    _userPreferences.NotebookFolders.Count(folder => folder.ParentId is not null)));
         }
         catch (Exception exception)
         {
