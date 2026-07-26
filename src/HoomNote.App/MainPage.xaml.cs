@@ -180,6 +180,8 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, Guid> _tabPageSelections = [];
     private readonly List<CanvasObject> _selectedObjects = [];
     private readonly Dictionary<Guid, CanvasObject> _multiTransformPreviews = [];
+    private readonly HashSet<Guid> _selectionTransformOriginalIds = [];
+    private RectD? _selectionTransformSourceBounds;
     private readonly Dictionary<Guid, CanvasObject> _styleBrushOriginals = [];
     // The committed page is rendered by CanvasAnimatedControl on its dedicated game-loop
     // thread. UI/input mutations publish immutable page/viewport state through InvalidateCanvas.
@@ -1867,12 +1869,7 @@ public sealed partial class MainPage : Page
                 DrawObject(drawingSession, preview);
 
         if (selectionTransformPreview)
-        {
-            foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
-                DrawObject(drawingSession, preview);
-            if (_transformPreview is not null)
-                DrawObject(drawingSession, _transformPreview);
-        }
+            DrawSelectionTransformPreview(drawingSession, _page);
 
         if (_activeInk.Count > 0 && _gestureTool is EditorTool.Pen or EditorTool.Highlighter)
         {
@@ -1906,6 +1903,35 @@ public sealed partial class MainPage : Page
             DrawSelectionMarquee(drawingSession);
 
         UpdateImageLockOverlay();
+    }
+
+    private void DrawSelectionTransformPreview(CanvasDrawingSession drawingSession, NotePage page)
+    {
+        if (_selectionTransformSourceBounds is not { } sourceBounds ||
+            _selectionTransformOriginalIds.Count == 0 ||
+            (_multiTransformPreviews.Count == 0 && _transformPreview is null)) return;
+
+        // DrawingSurface sits above the retained PageSurface, so first reconstruct the source
+        // region without the objects being transformed. This removes the stale retained copy
+        // while preserving paper/PDF content, the temporary grid, and overlapping objects.
+        using (drawingSession.CreateLayer(1f,
+                   new Rect(sourceBounds.X, sourceBounds.Y, sourceBounds.Width, sourceBounds.Height)))
+        {
+            DrawPageBackground(drawingSession, page, sourceBounds);
+            DrawImportedLayer(drawingSession, page);
+            if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, sourceBounds);
+            foreach (var canvasObject in _spatialIndex.Query(sourceBounds)
+                         .Where(item => !_selectionTransformOriginalIds.Contains(item.Id))
+                         .OrderBy(item => item.ZIndex))
+            {
+                if (!canvasObject.IsHidden) DrawObject(drawingSession, canvasObject);
+            }
+        }
+
+        foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
+            DrawObject(drawingSession, preview);
+        if (_transformPreview is not null)
+            DrawObject(drawingSession, _transformPreview);
     }
 
     private void RecordCanvasFrame(long frameStarted)
@@ -3416,6 +3442,8 @@ public sealed partial class MainPage : Page
         _transformPreview = null;
         _multiTransformOriginals = null;
         _multiTransformPreviews.Clear();
+        _selectionTransformOriginalIds.Clear();
+        _selectionTransformSourceBounds = null;
         _styleBrushOriginals.Clear();
         _eraseSnapshot = null;
         _transformHandle = TransformHandle.None;
@@ -3864,6 +3892,7 @@ public sealed partial class MainPage : Page
             if (_transformHandle != TransformHandle.None)
             {
                 _multiTransformOriginals = [.. _selectedObjects];
+                PrepareSelectionTransformSource(_multiTransformOriginals);
                 return;
             }
         }
@@ -3876,6 +3905,7 @@ public sealed partial class MainPage : Page
             if (_transformHandle != TransformHandle.None)
             {
                 _transformOriginal = _selectedObject;
+                PrepareSelectionTransformSource([_transformOriginal]);
                 return;
             }
         }
@@ -3889,7 +3919,23 @@ public sealed partial class MainPage : Page
         if (_selectedObject is not null) _selectedObjects.Add(_selectedObject);
         _transformHandle = _selectedObject is null or { IsLocked: true } ? TransformHandle.None : TransformHandle.Move;
         _transformOriginal = _selectedObject is { IsLocked: false } ? _selectedObject : null;
+        if (_transformOriginal is not null) PrepareSelectionTransformSource([_transformOriginal]);
+        else
+        {
+            _selectionTransformOriginalIds.Clear();
+            _selectionTransformSourceBounds = null;
+        }
         UpdateSelectionUi();
+    }
+
+    private void PrepareSelectionTransformSource(IReadOnlyCollection<CanvasObject> originals)
+    {
+        _selectionTransformOriginalIds.Clear();
+        foreach (var original in originals)
+            _selectionTransformOriginalIds.Add(original.Id);
+        _selectionTransformSourceBounds = originals.Count == 0
+            ? null
+            : CombinedBounds(originals).Inflate(Math.Max(2, 3 / Math.Max(_zoom, 0.08)));
     }
 
     private InkStrokeObject? FindInkStrokeAt(PointD point)
