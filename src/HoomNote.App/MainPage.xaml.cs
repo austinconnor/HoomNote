@@ -192,6 +192,8 @@ public sealed partial class MainPage : Page
     private int _navigationTileClearRequested;
     private int _erasePreviewCommitVersion = -1;
     private int _erasePreviewRetireQueued;
+    private int _transformPreviewCommitVersion = -1;
+    private int _transformPreviewRetireQueued;
     private double _canvasWidth = 1;
     private double _canvasHeight = 1;
     private float _canvasDpi = 96;
@@ -1621,12 +1623,15 @@ public sealed partial class MainPage : Page
         _searchFlashStarted = 0;
         _eraseDirtyRegions.Clear();
         Volatile.Write(ref _erasePreviewCommitVersion, -1);
+        Volatile.Write(ref _transformPreviewCommitVersion, -1);
         _page = page;
         ClearStrokeGeometryCache();
         _selectedObject = null;
         _selectedObjects.Clear();
         _multiTransformPreviews.Clear();
         _transformPreview = null;
+        _selectionTransformOriginalIds.Clear();
+        _selectionTransformSourceBounds = null;
         _fitPending = true;
         _pan = Vector2.Zero;
         PrepareSpatialIndex(page);
@@ -1796,6 +1801,7 @@ public sealed partial class MainPage : Page
             }
             RecordCanvasFrame(frameStarted);
             RequestErasePreviewRetire(state.EditVersion);
+            RequestTransformPreviewRetire(state.EditVersion);
         }
     }
 
@@ -1811,6 +1817,22 @@ public sealed partial class MainPage : Page
             if (_isPointerDown || currentTarget < 0 || renderedEditVersion < currentTarget) return;
             _eraseDirtyRegions.Clear();
             Volatile.Write(ref _erasePreviewCommitVersion, -1);
+            DrawingSurface.Invalidate();
+        });
+    }
+
+    private void RequestTransformPreviewRetire(int renderedEditVersion)
+    {
+        var targetVersion = Volatile.Read(ref _transformPreviewCommitVersion);
+        if (targetVersion < 0 || renderedEditVersion < targetVersion ||
+            Interlocked.Exchange(ref _transformPreviewRetireQueued, 1) != 0) return;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            Interlocked.Exchange(ref _transformPreviewRetireQueued, 0);
+            var currentTarget = Volatile.Read(ref _transformPreviewCommitVersion);
+            if (_isPointerDown || currentTarget < 0 || renderedEditVersion < currentTarget) return;
+            ClearTransformPreviewState();
+            Volatile.Write(ref _transformPreviewCommitVersion, -1);
             DrawingSurface.Invalidate();
         });
     }
@@ -1857,7 +1879,9 @@ public sealed partial class MainPage : Page
         var drawingSession = args.DrawingSession;
         drawingSession.Transform = PageTransform();
         var styleBrushPreview = _isPointerDown && _gestureTool == EditorTool.Style && !_styleToolPickMode;
-        var selectionTransformPreview = _isPointerDown && _gestureTool == EditorTool.Select;
+        var selectionTransformPreview =
+            (_isPointerDown && _gestureTool == EditorTool.Select) ||
+            Volatile.Read(ref _transformPreviewCommitVersion) >= 0;
 
         if (_eraseDirtyRegions.Count > 0 &&
             (_gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser ||
@@ -3383,8 +3407,8 @@ public sealed partial class MainPage : Page
                     "Transform selection"), _document);
                 _selectedObjects.Clear();
                 _selectedObjects.AddRange(after);
-                _multiTransformPreviews.Clear();
                 OnDocumentChanged(recognizeInk: after.Any(item => item is InkStrokeObject));
+                Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
                 break;
             case EditorTool.Select when _transformOriginal is not null && _transformPreview is not null:
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, [_transformOriginal], [_transformPreview], "Transform object"), _document);
@@ -3392,6 +3416,7 @@ public sealed partial class MainPage : Page
                 _selectedObjects.Clear();
                 _selectedObjects.Add(_transformPreview);
                 OnDocumentChanged(recognizeInk: false);
+                Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
                 break;
         }
 
@@ -3431,6 +3456,8 @@ public sealed partial class MainPage : Page
     {
         var retainErasePreview = _eraseDirtyRegions.Count > 0 &&
                                  Volatile.Read(ref _erasePreviewCommitVersion) >= 0;
+        var retainTransformPreview = _selectionTransformOriginalIds.Count > 0 &&
+                                     Volatile.Read(ref _transformPreviewCommitVersion) >= 0;
         _isPointerDown = false;
         _penActive = false;
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
@@ -3439,11 +3466,8 @@ public sealed partial class MainPage : Page
         _eraserPath.Clear();
         if (!retainErasePreview) _eraseDirtyRegions.Clear();
         _transformOriginal = null;
-        _transformPreview = null;
         _multiTransformOriginals = null;
-        _multiTransformPreviews.Clear();
-        _selectionTransformOriginalIds.Clear();
-        _selectionTransformSourceBounds = null;
+        if (!retainTransformPreview) ClearTransformPreviewState();
         _styleBrushOriginals.Clear();
         _eraseSnapshot = null;
         _transformHandle = TransformHandle.None;
@@ -3453,6 +3477,14 @@ public sealed partial class MainPage : Page
         InvalidateCanvas();
         ResumeBackgroundRecognition();
         ResumeThumbnailRefresh();
+    }
+
+    private void ClearTransformPreviewState()
+    {
+        _transformPreview = null;
+        _multiTransformPreviews.Clear();
+        _selectionTransformOriginalIds.Clear();
+        _selectionTransformSourceBounds = null;
     }
 
     private void OnTouchPointerPressed(PointerRoutedEventArgs e, PointerPoint point)
