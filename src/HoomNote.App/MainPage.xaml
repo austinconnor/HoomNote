@@ -414,7 +414,9 @@
                         <ListView.ItemTemplate>
                             <DataTemplate>
                                 <StackPanel Width="96" Spacing="5">
-                                    <Border Height="116" Background="#050506" BorderBrush="#34363A" BorderThickness="1" CornerRadius="5">
+                                    <Border x:Name="PageThumbnailFrame" Width="96" Height="116"
+                                            HorizontalAlignment="Center" Background="Transparent"
+                                            BorderBrush="#34363A" BorderThickness="1" CornerRadius="5">
                                         <Grid>
                                             <Image x:Name="PageThumbnailImage" Stretch="Uniform" />
                                             <ProgressRing x:Name="PageThumbnailLoading" Width="18" Height="18"

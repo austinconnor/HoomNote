@@ -70,7 +70,9 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
                        LineJoin = CanvasLineJoin.Round
                    })
             {
-                session.Clear(Color.FromArgb(255, 5, 5, 6));
+                // The target uses the page's own aspect ratio. Clearing with paper color
+                // prevents a one-pixel dark seam from rounding at uncommon PDF dimensions.
+                session.Clear(ParseColor(page.Template.PaperColor));
                 var scale = (float)Math.Min(pixelWidth / Math.Max(1d, page.Size.Width),
                     pixelHeight / Math.Max(1d, page.Size.Height));
                 var offsetX = (pixelWidth - page.Size.Width * scale) / 2f;

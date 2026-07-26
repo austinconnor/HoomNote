@@ -38,6 +38,9 @@ public sealed class SlideWorkerConverter(string workerPath, string temporaryRoot
 
 public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverter? slideConverter = null) : IDocumentImportService
 {
+    private const double DipsPerPdfPoint = 96d / 72d;
+    private sealed record PdfPageInfo(double Width, double Height);
+
     public async Task<ImportResult> ImportAsync(ImportRequest request, CancellationToken cancellationToken = default)
     {
         var sourcePath = Path.GetFullPath(request.SourcePath);
@@ -84,36 +87,64 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
         if (extension != ".pdf") throw new NotSupportedException("HoomNote currently imports PDF, PPT, PPTX, and Samsung Notes SDOCX documents.");
         await using var stream = File.OpenRead(sourcePath);
         var assetTask = assetStore.AddAsync(stream, extension, cancellationToken);
-        var pageCountTask = CountPdfPagesAsync(sourcePath, cancellationToken);
-        await Task.WhenAll(assetTask, pageCountTask);
+        var pageInfoTask = ReadPdfPagesAsync(sourcePath, cancellationToken);
+        await Task.WhenAll(assetTask, pageInfoTask);
         var assetHash = await assetTask;
-        var pageCount = await pageCountTask;
-        var selected = request.PageIndexes?.Where(index => index >= 0 && index < pageCount).Distinct().ToArray()
-                       ?? Enumerable.Range(0, pageCount).ToArray();
-        var margin = Math.Clamp(request.Margin, 0, 200);
-        var fitTransform = margin <= 0
-            ? Transform2D.Identity
-            : Transform2D.Scale((816 - margin * 2) / 816d, (1056 - margin * 2) / 1056d, new PointD(0, 0))
-                .Then(Transform2D.Translation(margin, margin));
-        var pages = selected.Select((sourceIndex, ordinal) => new NotePage
+        var pageInfo = await pageInfoTask;
+        var selected = request.PageIndexes?
+                           .Where(index => index >= 0 && index < pageInfo.Count)
+                           .Distinct()
+                           .ToArray()
+                       ?? Enumerable.Range(0, pageInfo.Count).ToArray();
+        var pages = selected.Select((sourceIndex, ordinal) =>
         {
-            Title = $"Page {ordinal + 1}",
-            Template = PageTemplate.For(PageTemplateKind.Blank),
-            ImportedLayer = new ImportedDocumentLayer
+            var sourcePage = pageInfo[sourceIndex];
+            var pageSize = new SizeD(sourcePage.Width, sourcePage.Height);
+            var fitTransform = CreatePageTransform(pageSize, request.Margin, request.RotationDegrees);
+            return new NotePage
             {
-                AssetHash = assetHash,
-                SourceName = Path.GetFileName(request.SourcePath),
-                SourcePageIndex = sourceIndex,
-                Transform = request.RotationDegrees == 0
-                    ? fitTransform
-                    : fitTransform.Then(Transform2D.Rotation(request.RotationDegrees * Math.PI / 180d, new PointD(408, 528)))
-            }
+                Title = $"Page {ordinal + 1}",
+                Size = pageSize,
+                Template = PageTemplate.For(PageTemplateKind.Blank),
+                ImportedLayer = new ImportedDocumentLayer
+                {
+                    AssetHash = assetHash,
+                    SourceName = Path.GetFileName(request.SourcePath),
+                    SourcePageIndex = sourceIndex,
+                    Transform = fitTransform
+                }
+            };
         }).ToArray();
 
         return new ImportResult(assetHash, Path.GetFileName(request.SourcePath), pages, []);
     }
 
-    private static Task<int> CountPdfPagesAsync(string path, CancellationToken cancellationToken)
+    private static Transform2D CreatePageTransform(SizeD pageSize, double requestedMargin, int rotationDegrees)
+    {
+        var maximumMargin = Math.Max(0, Math.Min(pageSize.Width, pageSize.Height) / 2d - 0.5);
+        var margin = Math.Clamp(requestedMargin, 0, Math.Min(200, maximumMargin));
+        var transform = Transform2D.Identity;
+        if (margin > 0)
+        {
+            var scale = Math.Min(
+                (pageSize.Width - margin * 2) / pageSize.Width,
+                (pageSize.Height - margin * 2) / pageSize.Height);
+            var horizontalInset = (pageSize.Width - pageSize.Width * scale) / 2d;
+            var verticalInset = (pageSize.Height - pageSize.Height * scale) / 2d;
+            transform = Transform2D.Scale(scale, scale, new PointD(0, 0))
+                .Then(Transform2D.Translation(horizontalInset, verticalInset));
+        }
+        var normalizedRotation = ((rotationDegrees % 360) + 360) % 360;
+        return normalizedRotation == 0
+            ? transform
+            : transform.Then(Transform2D.Rotation(
+                normalizedRotation * Math.PI / 180d,
+                new PointD(pageSize.Width / 2d, pageSize.Height / 2d)));
+    }
+
+    private static Task<IReadOnlyList<PdfPageInfo>> ReadPdfPagesAsync(
+        string path,
+        CancellationToken cancellationToken)
     {
         return Task.Run(() =>
         {
@@ -121,7 +152,20 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
             try
             {
                 using var document = PdfReader.Open(path, PdfDocumentOpenMode.Import);
-                return document.PageCount;
+                var pages = new List<PdfPageInfo>(document.PageCount);
+                foreach (var page in document.Pages)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var width = page.Width.Point * DipsPerPdfPoint;
+                    var height = page.Height.Point * DipsPerPdfPoint;
+                    var rotation = ((page.Rotate % 360) + 360) % 360;
+                    if (rotation is 90 or 270) (width, height) = (height, width);
+                    if (!double.IsFinite(width) || !double.IsFinite(height) ||
+                        width <= 0 || height <= 0)
+                        throw new InvalidDataException("The PDF contains a page with invalid dimensions.");
+                    pages.Add(new PdfPageInfo(width, height));
+                }
+                return (IReadOnlyList<PdfPageInfo>)pages;
             }
             catch (Exception exception)
             {

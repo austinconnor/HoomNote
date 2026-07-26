@@ -6,6 +6,7 @@ using HoomNote.Core.Services;
 using HoomNote.Infrastructure.Export;
 using HoomNote.Infrastructure.Import;
 using HoomNote.Infrastructure.Storage;
+using PdfSharp.Drawing;
 using PdfSharp.Pdf;
 
 namespace HoomNote.Infrastructure.Tests;
@@ -321,14 +322,21 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task PdfImport_ImportsEveryPageWhenRangeIsAll()
+    public async Task PdfImport_PreservesEveryPageSizeAndAspectRatio()
     {
         var source = Path.Combine(_root, "three-pages.pdf");
         using (var pdf = new PdfDocument())
         {
-            pdf.AddPage();
-            pdf.AddPage();
-            pdf.AddPage();
+            var portrait = pdf.AddPage();
+            portrait.Width = XUnit.FromPoint(612);
+            portrait.Height = XUnit.FromPoint(792);
+            var landscape = pdf.AddPage();
+            landscape.Width = XUnit.FromPoint(720);
+            landscape.Height = XUnit.FromPoint(405);
+            var rotated = pdf.AddPage();
+            rotated.Width = XUnit.FromPoint(612);
+            rotated.Height = XUnit.FromPoint(792);
+            rotated.Rotate = 90;
             pdf.Save(source);
         }
         var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets"));
@@ -338,7 +346,39 @@ public sealed class PersistenceTests : IAsyncLifetime
 
         Assert.Equal(3, result.Pages.Count);
         Assert.Equal(new[] { 0, 1, 2 }, result.Pages.Select(page => page.ImportedLayer!.SourcePageIndex));
+        Assert.Equal(816, result.Pages[0].Size.Width, 3);
+        Assert.Equal(1056, result.Pages[0].Size.Height, 3);
+        Assert.Equal(960, result.Pages[1].Size.Width, 3);
+        Assert.Equal(540, result.Pages[1].Size.Height, 3);
+        Assert.Equal(1056, result.Pages[2].Size.Width, 3);
+        Assert.Equal(816, result.Pages[2].Size.Height, 3);
+        Assert.All(result.Pages, page =>
+            Assert.Equal(Transform2D.Identity, page.ImportedLayer!.Transform));
         Assert.Empty(result.Warnings);
+    }
+
+    [Fact]
+    public async Task PdfImport_MarginsScaleUniformlyWithoutChangingAspectRatio()
+    {
+        var source = Path.Combine(_root, "square.pdf");
+        using (var pdf = new PdfDocument())
+        {
+            var page = pdf.AddPage();
+            page.Width = XUnit.FromPoint(500);
+            page.Height = XUnit.FromPoint(500);
+            pdf.Save(source);
+        }
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets-square"));
+        var importer = new DocumentImportService(store);
+
+        var result = await importer.ImportAsync(new ImportRequest(source, Margin: 40));
+
+        var imported = Assert.Single(result.Pages);
+        Assert.Equal(imported.Size.Width, imported.Size.Height, 6);
+        Assert.Equal(imported.ImportedLayer!.Transform.M11,
+            imported.ImportedLayer.Transform.M22, 6);
+        Assert.Equal(0, imported.ImportedLayer.Transform.M12, 6);
+        Assert.Equal(0, imported.ImportedLayer.Transform.M21, 6);
     }
 
     [Fact]

@@ -52,6 +52,15 @@ public sealed partial class MainPage : Page
         public override string ToString() => Name;
     }
 
+    private sealed record BatchImportSource(string SourcePath, string RelativeFolder);
+
+    private sealed record BatchImportOptions(
+        bool CombineIntoOneNotebook,
+        string CombinedNotebookName,
+        IReadOnlyList<int>? PageIndexes,
+        double Margin,
+        int RotationDegrees);
+
     private sealed class LibraryTreeEntry(
         Guid? folderId,
         DocumentSummary? document,
@@ -148,8 +157,8 @@ public sealed partial class MainPage : Page
     private readonly LinkedList<Guid> _pageThumbnailLru = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _pageThumbnailLoads = [];
     private const int PageThumbnailCacheLimit = 24;
-    private const int PageThumbnailWidth = 96;
-    private const int PageThumbnailHeight = 116;
+    private const int PageThumbnailMaxWidth = 96;
+    private const int PageThumbnailMaxHeight = 116;
     private const int PageThumbnailRefreshDelayMs = 400;
     private int _thumbnailPriorityGeneration;
     private readonly List<CanvasCachedGeometry> _liveInkGeometryChunks = [];
@@ -342,6 +351,8 @@ public sealed partial class MainPage : Page
     private Guid? _selectedFolderId;
     private int _folderTreeRebuildVersion;
     private readonly HashSet<Guid> _expandedFolderIds = [];
+    private HashSet<Guid>? _libraryDragExpandedSnapshot;
+    private long _suppressLibraryTapUntil;
     private bool _rebuildingFolderTree;
     private Guid? _recognitionPageId;
     private DocumentSummary? _notebookContextTarget;
@@ -613,8 +624,8 @@ public sealed partial class MainPage : Page
     private void ApplyFolderFilter(Guid? preferredDocumentId = null)
     {
         var documents = _allDocuments
-            .OrderBy(document => NotebookOrderIndex(document.Id))
-            .ThenByDescending(document => document.UpdatedAt)
+            .OrderBy(document => document.Title, NotebookTitleComparer.Instance)
+            .ThenBy(document => document.Id)
             .ToList();
         _loading = true;
         _documents.Clear();
@@ -626,12 +637,6 @@ public sealed partial class MainPage : Page
         RebuildFolderTree(_selectedFolderId, preferredDocumentId ?? _document?.Id);
         UpdateLibrarySummary();
         UpdateFolderActions();
-    }
-
-    private int NotebookOrderIndex(Guid documentId)
-    {
-        var index = _userPreferences.NotebookOrder.IndexOf(documentId.ToString("D"));
-        return index < 0 ? int.MaxValue : index;
     }
 
     private string EffectiveDocumentColor(Guid documentId)
@@ -649,7 +654,15 @@ public sealed partial class MainPage : Page
 
     private void RebuildFolderTree(Guid? preferredFolderId = null, Guid? preferredDocumentId = null)
     {
-        if (FolderTree.RootNodes.Count > 0)
+        if (_libraryDragExpandedSnapshot is not null)
+        {
+            // TreeView can auto-expand a recycled row while completing a drag. Rebuild from
+            // the state captured at drag start, then explicitly expand only the destination
+            // ancestry below.
+            _expandedFolderIds.Clear();
+            _expandedFolderIds.UnionWith(_libraryDragExpandedSnapshot);
+        }
+        else if (FolderTree.RootNodes.Count > 0)
         {
             _expandedFolderIds.Clear();
             foreach (var existingRoot in FolderTree.RootNodes) CaptureExpandedFolders(existingRoot);
@@ -702,12 +715,17 @@ public sealed partial class MainPage : Page
 
     private void CaptureExpandedFolders(TreeViewNode node)
     {
+        CaptureExpandedFolders(node, _expandedFolderIds);
+    }
+
+    private static void CaptureExpandedFolders(TreeViewNode node, ISet<Guid> destination)
+    {
         if (GetLibraryEntry(node) is { } entry)
         {
-            if (entry.FolderId is { } folderId && node.IsExpanded) _expandedFolderIds.Add(folderId);
+            if (entry.FolderId is { } folderId && node.IsExpanded) destination.Add(folderId);
         }
         foreach (var child in node.Children)
-            CaptureExpandedFolders(child);
+            CaptureExpandedFolders(child, destination);
     }
 
     private TreeViewNode BuildFolderNode(
@@ -903,6 +921,12 @@ public sealed partial class MainPage : Page
 
     private async void OnLibraryRowTapped(object sender, TappedRoutedEventArgs e)
     {
+        if (System.Diagnostics.Stopwatch.GetTimestamp() < _suppressLibraryTapUntil)
+        {
+            e.Handled = true;
+            return;
+        }
+        _libraryDragExpandedSnapshot = null;
         if (sender is not FrameworkElement { Tag: LibraryTreeEntry entry }) return;
         if (entry.Document is { } document)
         {
@@ -932,6 +956,7 @@ public sealed partial class MainPage : Page
     private void OnLibraryNotebookDragStarting(UIElement sender, DragStartingEventArgs args)
     {
         if (sender is not FrameworkElement { Tag: LibraryTreeEntry entry }) return;
+        CaptureLibraryDragState();
         args.AllowedOperations = DataPackageOperation.Move;
         if (entry.Document is { } document)
             args.Data.SetText(LibraryNotebookDragPrefix + document.Id.ToString("D"));
@@ -960,6 +985,7 @@ public sealed partial class MainPage : Page
             !e.DataView.Contains(StandardDataFormats.Text)) return;
         row.Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0));
         e.Handled = true;
+        SuppressLibraryTap();
         var value = await e.DataView.GetTextAsync();
         if (!TryParseLibraryDragPayload(value, out var kind, out var itemId))
         {
@@ -967,15 +993,13 @@ public sealed partial class MainPage : Page
             return;
         }
         DiagnosticsLog.Info("folder.drop_received", ("to_folder", target.FolderId is not null));
-        if (kind == LibraryDragKind.Folder)
-            await MoveFolderToFolderAsync(itemId, target.FolderId);
-        else
-            await MoveNotebookToFolderAsync(itemId, target.FolderId);
+        QueueLibraryDrop(kind, itemId, target.FolderId);
     }
 
     private void OnNotebookDragItemsStarting(object sender, DragItemsStartingEventArgs e)
     {
         if (e.Items.FirstOrDefault() is not DocumentSummary document) return;
+        CaptureLibraryDragState();
         e.Data.RequestedOperation = DataPackageOperation.Move;
         e.Data.SetText(document.Id.ToString("D"));
     }
@@ -996,6 +1020,8 @@ public sealed partial class MainPage : Page
     private async void OnFolderTreeDrop(object sender, DragEventArgs e)
     {
         if (!e.DataView.Contains(StandardDataFormats.Text)) return;
+        e.Handled = true;
+        SuppressLibraryTap();
         var value = await e.DataView.GetTextAsync();
         if (!TryParseLibraryDragPayload(value, out var kind, out var itemId)) return;
         var container = FindAncestor<TreeViewItem>(e.OriginalSource as DependencyObject);
@@ -1006,11 +1032,50 @@ public sealed partial class MainPage : Page
             targetFolderId = GetLibraryEntry(node?.Parent)?.FolderId;
         else if (container is not null && target?.IsContainer != true)
             return;
-        if (kind == LibraryDragKind.Folder)
-            await MoveFolderToFolderAsync(itemId, targetFolderId);
-        else
-            await MoveNotebookToFolderAsync(itemId, targetFolderId);
-        e.Handled = true;
+        QueueLibraryDrop(kind, itemId, targetFolderId);
+    }
+
+    private void CaptureLibraryDragState()
+    {
+        _libraryDragExpandedSnapshot = [];
+        foreach (var root in FolderTree.RootNodes)
+            CaptureExpandedFolders(root, _libraryDragExpandedSnapshot);
+        SuppressLibraryTap();
+    }
+
+    private void SuppressLibraryTap(int milliseconds = 750)
+    {
+        var duration = (long)Math.Ceiling(
+            milliseconds * System.Diagnostics.Stopwatch.Frequency / 1000d);
+        _suppressLibraryTapUntil = Math.Max(
+            _suppressLibraryTapUntil,
+            System.Diagnostics.Stopwatch.GetTimestamp() + duration);
+    }
+
+    private void QueueLibraryDrop(LibraryDragKind kind, Guid itemId, Guid? targetFolderId)
+    {
+        // Let WinUI finish Drop/Tapped routing before replacing TreeView.RootNodes. Rebuilding
+        // inside the Drop stack can recycle the source row under the release pointer and toggle
+        // an unrelated sibling.
+        DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                if (kind == LibraryDragKind.Folder)
+                    await MoveFolderToFolderAsync(itemId, targetFolderId);
+                else
+                    await MoveNotebookToFolderAsync(itemId, targetFolderId);
+            }
+            catch (Exception exception)
+            {
+                ShowError("The library item could not be moved.", exception);
+            }
+            finally
+            {
+                SuppressLibraryTap();
+                _libraryDragExpandedSnapshot = null;
+            }
+        });
     }
 
     private enum LibraryDragKind
@@ -4976,8 +5041,9 @@ public sealed partial class MainPage : Page
         try
         {
             if (_pageThumbnailRenderer is null) return;
-            var bytes = await _pageThumbnailRenderer.RenderAsync(page, PageThumbnailWidth,
-                PageThumbnailHeight, cancellation.Token);
+            var thumbnailSize = PageThumbnailSize(page);
+            var bytes = await _pageThumbnailRenderer.RenderAsync(page, thumbnailSize.Width,
+                thumbnailSize.Height, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
 
             using var stream = new InMemoryRandomAccessStream();
@@ -4991,8 +5057,8 @@ public sealed partial class MainPage : Page
             stream.Seek(0);
             var bitmap = new BitmapImage
             {
-                DecodePixelWidth = PageThumbnailWidth,
-                DecodePixelHeight = PageThumbnailHeight
+                DecodePixelWidth = thumbnailSize.Width,
+                DecodePixelHeight = thumbnailSize.Height
             };
             await bitmap.SetSourceAsync(stream);
             cancellation.Token.ThrowIfCancellationRequested();
@@ -5047,8 +5113,15 @@ public sealed partial class MainPage : Page
     private void UpdatePageThumbnailContainer(NotePage page, ListViewItem container)
     {
         if (container.ContentTemplateRoot is not FrameworkElement root) return;
+        var frame = root.FindName("PageThumbnailFrame") as Border;
         var image = root.FindName("PageThumbnailImage") as Image;
         var loading = root.FindName("PageThumbnailLoading") as ProgressRing;
+        var thumbnailSize = PageThumbnailSize(page);
+        if (frame is not null)
+        {
+            frame.Width = thumbnailSize.Width;
+            frame.Height = thumbnailSize.Height;
+        }
         if (_pageThumbnailCache.TryGetValue(page.Id, out var bitmap))
         {
             if (image is not null) image.Source = bitmap;
@@ -5059,6 +5132,17 @@ public sealed partial class MainPage : Page
             if (image is not null) image.Source = null;
             if (loading is not null) loading.IsActive = true;
         }
+    }
+
+    private static (int Width, int Height) PageThumbnailSize(NotePage page)
+    {
+        var pageWidth = Math.Max(1, page.Size.Width);
+        var pageHeight = Math.Max(1, page.Size.Height);
+        var scale = Math.Min(PageThumbnailMaxWidth / pageWidth,
+            PageThumbnailMaxHeight / pageHeight);
+        return (
+            Math.Max(1, (int)Math.Round(pageWidth * scale)),
+            Math.Max(1, (int)Math.Round(pageHeight * scale)));
     }
 
     private void CachePageThumbnail(Guid pageId, BitmapImage bitmap)
@@ -6480,7 +6564,7 @@ public sealed partial class MainPage : Page
     private async void OnImportClick(object sender, RoutedEventArgs e)
     {
         var hostWindow = HostWindow;
-        if (_document is null || _importService is null || hostWindow is null) return;
+        if (_importService is null || _repository is null || hostWindow is null) return;
         try
         {
             var picker = new FileOpenPicker();
@@ -6489,8 +6573,22 @@ public sealed partial class MainPage : Page
             picker.FileTypeFilter.Add(".ppt");
             picker.FileTypeFilter.Add(".pptx");
             picker.FileTypeFilter.Add(".sdocx");
-            var file = await picker.PickSingleFileAsync();
-            if (file is null) return;
+            var files = await picker.PickMultipleFilesAsync();
+            if (files.Count == 0) return;
+            if (files.Count > 1)
+            {
+                var options = await ShowBatchImportOptionsAsync(
+                    files.Select(file => file.Path).ToArray());
+                if (options is null) return;
+                await ImportDocumentsBatchAsync(
+                    files.Select(file => new BatchImportSource(file.Path, string.Empty)).ToArray(),
+                    rootFolderName: null,
+                    options);
+                return;
+            }
+
+            if (_document is null) return;
+            var file = files[0];
             StatusText.Text = "Importing document…";
             var request = await ShowImportOptionsAsync(file.Path);
             if (request is null) return;
@@ -6540,9 +6638,12 @@ public sealed partial class MainPage : Page
             var files = await picker.PickMultipleFilesAsync();
             if (files.Count == 0) return;
             var sources = files
-                .Select(file => new SamsungNoteImportSource(file.Path, string.Empty))
+                .Select(file => new BatchImportSource(file.Path, string.Empty))
                 .ToArray();
-            await ImportSamsungNotesBatchAsync(sources, rootFolderName: null);
+            var options = await ShowBatchImportOptionsAsync(
+                sources.Select(source => source.SourcePath).ToArray());
+            if (options is null) return;
+            await ImportDocumentsBatchAsync(sources, rootFolderName: null, options);
         }
         catch (Exception exception) { ShowError("Samsung Notes files could not be imported.", exception); }
     }
@@ -6564,15 +6665,28 @@ public sealed partial class MainPage : Page
                 SamsungNotesBulkImportDiscovery.DiscoverFolder(folder.Path));
             var rootName = Path.GetFileName(folder.Path.TrimEnd(
                 Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            await ImportSamsungNotesBatchAsync(sources,
-                string.IsNullOrWhiteSpace(rootName) ? "Samsung Notes import" : rootName);
+            var batchSources = sources
+                .Select(source => new BatchImportSource(source.SourcePath, source.RelativeFolder))
+                .ToArray();
+            if (batchSources.Length == 0)
+            {
+                ShowNoImportFilesFound("Choose a folder containing exported .sdocx files.");
+                return;
+            }
+            var options = await ShowBatchImportOptionsAsync(
+                batchSources.Select(source => source.SourcePath).ToArray());
+            if (options is null) return;
+            await ImportDocumentsBatchAsync(batchSources,
+                string.IsNullOrWhiteSpace(rootName) ? "Samsung Notes import" : rootName,
+                options);
         }
         catch (Exception exception) { ShowError("Samsung Notes folder could not be imported.", exception); }
     }
 
-    private async Task ImportSamsungNotesBatchAsync(
-        IReadOnlyList<SamsungNoteImportSource> sources,
-        string? rootFolderName)
+    private async Task ImportDocumentsBatchAsync(
+        IReadOnlyList<BatchImportSource> sources,
+        string? rootFolderName,
+        BatchImportOptions options)
     {
         if (_importService is null || _repository is null) return;
         var uniqueSources = sources
@@ -6582,11 +6696,7 @@ public sealed partial class MainPage : Page
             .ToArray();
         if (uniqueSources.Length == 0)
         {
-            ImportInfo.Title = "No Samsung Notes files found";
-            ImportInfo.Message = "Choose a folder containing exported .sdocx files.";
-            ImportInfo.Severity = InfoBarSeverity.Informational;
-            ImportInfo.IsOpen = true;
-            StatusText.Text = "No Samsung Notes files found";
+            ShowNoImportFilesFound("Choose PDF, PowerPoint, or Samsung Notes files to import.");
             return;
         }
 
@@ -6601,23 +6711,35 @@ public sealed partial class MainPage : Page
             var importRootId = string.IsNullOrWhiteSpace(rootFolderName)
                 ? _selectedFolderId
                 : EnsureImportFolder(rootFolderName, _selectedFolderId);
+            HoomNoteDocument? combinedDocument = options.CombineIntoOneNotebook
+                ? HoomNoteDocument.Create(options.CombinedNotebookName, DocumentKind.PagedNotebook)
+                : null;
+            DateTime? combinedUpdatedAt = null;
             for (var index = 0; index < uniqueSources.Length; index++)
             {
                 var source = uniqueSources[index];
                 var fileName = Path.GetFileName(source.SourcePath);
-                StatusText.Text = $"Importing Samsung note {index + 1} of {uniqueSources.Length} • {fileName}";
+                StatusText.Text = $"Importing file {index + 1} of {uniqueSources.Length} • {fileName}";
                 try
                 {
-                    var result = await _importService.ImportAsync(new ImportRequest(source.SourcePath));
-                    var document = HoomNoteDocument.Create(
-                        Path.GetFileNameWithoutExtension(source.SourcePath),
-                        DocumentKind.PagedNotebook);
+                    var result = await _importService.ImportAsync(new ImportRequest(
+                        source.SourcePath,
+                        options.PageIndexes,
+                        false,
+                        options.Margin,
+                        options.RotationDegrees));
+                    var document = combinedDocument ?? HoomNoteDocument.Create(
+                        Path.GetFileNameWithoutExtension(source.SourcePath), DocumentKind.PagedNotebook);
                     foreach (var page in result.Pages)
                     {
-                        document.Pages.Add(page);
-                        document.Sections[0].PageIds.Add(page.Id);
+                        var importedPage = combinedDocument is null
+                            ? page
+                            : page with { Title = $"Page {document.Pages.Count + 1}" };
+                        document.Pages.Add(importedPage);
+                        document.Sections[0].PageIds.Add(importedPage.Id);
                     }
-                    if (document.Pages.FirstOrDefault() is { } firstPage)
+                    if (combinedDocument is null &&
+                        document.Pages.FirstOrDefault() is { } firstPage)
                     {
                         document.Settings = document.Settings with
                         {
@@ -6626,54 +6748,102 @@ public sealed partial class MainPage : Page
                         };
                     }
                     var modified = File.GetLastWriteTimeUtc(source.SourcePath);
-                    if (modified > DateTime.MinValue) document.UpdatedAt = modified;
-                    await _repository.SaveAsync(document);
-
-                    var destinationFolder = EnsureImportFolderPath(
-                        source.RelativeFolder, importRootId);
-                    if (destinationFolder is { } folderId)
-                        _userPreferences.DocumentFolders[document.Id.ToString("D")] =
-                            folderId.ToString("D");
-                    _userPreferences.NotebookOrder.Add(document.Id.ToString("D"));
-                    importedIds.Add(document.Id);
+                    if (combinedDocument is null)
+                    {
+                        if (modified > DateTime.MinValue) document.UpdatedAt = modified;
+                        await _repository.SaveAsync(document);
+                        var destinationFolder = EnsureImportFolderPath(
+                            source.RelativeFolder, importRootId);
+                        if (destinationFolder is { } folderId)
+                            _userPreferences.DocumentFolders[document.Id.ToString("D")] =
+                                folderId.ToString("D");
+                        _userPreferences.NotebookOrder.Add(document.Id.ToString("D"));
+                        importedIds.Add(document.Id);
+                    }
+                    else if (modified > DateTime.MinValue &&
+                             (combinedUpdatedAt is null || modified > combinedUpdatedAt))
+                    {
+                        combinedUpdatedAt = modified;
+                    }
                     warnings.AddRange(result.Warnings.Select(warning => $"{fileName}: {warning}"));
-                    DiagnosticsLog.Info("samsung_bulk_import.file_complete",
-                        ("pages", result.Pages.Count), ("has_folder", destinationFolder is not null));
+                    DiagnosticsLog.Info("batch_import.file_complete",
+                        ("pages", result.Pages.Count),
+                        ("combined", combinedDocument is not null));
                 }
                 catch (Exception exception)
                 {
                     failures.Add($"{fileName}: {exception.Message}");
-                    DiagnosticsLog.Error("samsung_bulk_import.file_failed", exception,
+                    DiagnosticsLog.Error("batch_import.file_failed", exception,
                         ("file", fileName));
                 }
             }
 
-            await PersistUserPreferencesAsync($"Imported {importedIds.Count} Samsung note(s)");
+            if (combinedDocument is { Pages.Count: > 0 })
+            {
+                if (combinedDocument.Pages[0] is { } firstPage)
+                {
+                    combinedDocument.Settings = combinedDocument.Settings with
+                    {
+                        DefaultPageTemplateKind = firstPage.Template.Kind,
+                        DefaultPaperColor = firstPage.Template.PaperColor
+                    };
+                }
+                if (combinedUpdatedAt is { } modified) combinedDocument.UpdatedAt = modified;
+                await _repository.SaveAsync(combinedDocument);
+                if (importRootId is { } folderId)
+                    _userPreferences.DocumentFolders[combinedDocument.Id.ToString("D")] =
+                        folderId.ToString("D");
+                _userPreferences.NotebookOrder.Add(combinedDocument.Id.ToString("D"));
+                importedIds.Add(combinedDocument.Id);
+            }
+
+            await PersistUserPreferencesAsync(
+                options.CombineIntoOneNotebook
+                    ? $"Imported {uniqueSources.Length - failures.Count} file(s) into one notebook"
+                    : $"Imported {importedIds.Count} notebook(s)");
             await RefreshLibraryAsync();
             if (importedIds.FirstOrDefault() is { } firstId && firstId != Guid.Empty)
             {
                 await LoadDocumentAsync(firstId);
                 SelectLibraryDocument(firstId);
             }
-            ImportInfo.Title = failures.Count == 0
-                ? $"Imported {importedIds.Count} Samsung note(s)"
-                : $"Imported {importedIds.Count} of {uniqueSources.Length} Samsung note(s)";
+            var successfulFiles = uniqueSources.Length - failures.Count;
+            ImportInfo.Title = options.CombineIntoOneNotebook
+                ? failures.Count == 0
+                    ? $"Combined {successfulFiles} files into one notebook"
+                    : $"Combined {successfulFiles} of {uniqueSources.Length} files"
+                : failures.Count == 0
+                    ? $"Imported {importedIds.Count} notebook(s)"
+                    : $"Imported {importedIds.Count} of {uniqueSources.Length} notebook(s)";
             ImportInfo.Message = failures.Count > 0
                 ? string.Join(Environment.NewLine, failures.Take(5))
                 : warnings.Count > 0
                     ? string.Join(" ", warnings.Take(5))
-                    : "Each SDOCX file is now an editable notebook. Source folders were preserved.";
+                    : options.CombineIntoOneNotebook
+                        ? "Every source was appended in the selected order."
+                        : "Each source file is now a separate notebook.";
             ImportInfo.Severity = failures.Count > 0
                 ? InfoBarSeverity.Warning
                 : InfoBarSeverity.Success;
             ImportInfo.IsOpen = true;
-            StatusText.Text = $"Samsung Notes import complete • {importedIds.Count} notebook(s)";
+            StatusText.Text = options.CombineIntoOneNotebook
+                ? $"Import complete • {successfulFiles} file(s), one notebook"
+                : $"Import complete • {importedIds.Count} notebook(s)";
         }
         finally
         {
             ResumeBackgroundRecognition();
             ResumeThumbnailRefresh();
         }
+    }
+
+    private void ShowNoImportFilesFound(string message)
+    {
+        ImportInfo.Title = "No importable files found";
+        ImportInfo.Message = message;
+        ImportInfo.Severity = InfoBarSeverity.Informational;
+        ImportInfo.IsOpen = true;
+        StatusText.Text = "No importable files found";
     }
 
     private Guid EnsureImportFolder(string name, Guid? parentId)
@@ -6734,6 +6904,118 @@ public sealed partial class MainPage : Page
             StatusText.Text = $"Exported {file.Name}";
         }
         catch (Exception exception) { ShowError("Export failed.", exception); }
+    }
+
+    private async Task<BatchImportOptions?> ShowBatchImportOptionsAsync(
+        IReadOnlyList<string> sourcePaths)
+    {
+        var suggestedName = sourcePaths.Count == 0
+            ? "Combined import"
+            : Path.GetFileNameWithoutExtension(sourcePaths[0]);
+        var combine = new CheckBox
+        {
+            Content = "Import all files into one notebook",
+            IsChecked = false
+        };
+        var combineDescription = new TextBlock
+        {
+            Text = "Off by default. Each file will become its own notebook.",
+            Foreground = (Brush)Application.Current.Resources["HoomNoteMutedTextBrush"],
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap
+        };
+        var combinedName = new TextBox
+        {
+            Header = "Combined notebook name",
+            Text = suggestedName,
+            MaxLength = LibraryNamePolicy.MaxLength,
+            IsEnabled = false
+        };
+        combine.Checked += (_, _) =>
+        {
+            combinedName.IsEnabled = true;
+            combineDescription.Text =
+                "Files will be appended to one notebook in the order shown below.";
+        };
+        combine.Unchecked += (_, _) =>
+        {
+            combinedName.IsEnabled = false;
+            combineDescription.Text =
+                "Off by default. Each file will become its own notebook.";
+        };
+
+        var range = new TextBox
+        {
+            Header = "Pages from each file",
+            PlaceholderText = "All, or 1-3, 7"
+        };
+        var rotation = new ComboBox
+        {
+            Header = "Rotate PDF or slide pages",
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        foreach (var degrees in new[] { 0, 90, 180, 270 })
+            rotation.Items.Add(new ComboBoxItem { Content = $"{degrees}°", Tag = degrees });
+        rotation.SelectedIndex = 0;
+        var margin = new NumberBox
+        {
+            Header = "PDF or slide page margin",
+            Minimum = 0,
+            Maximum = 200,
+            Value = 0,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact
+        };
+        var filePreview = string.Join(Environment.NewLine,
+            sourcePaths.Take(6).Select((path, index) =>
+                $"{index + 1}. {Path.GetFileName(path)}"));
+        if (sourcePaths.Count > 6)
+            filePreview += $"{Environment.NewLine}…and {sourcePaths.Count - 6} more";
+        var files = new TextBlock
+        {
+            Text = filePreview,
+            FontSize = 11,
+            Foreground = (Brush)Application.Current.Resources["HoomNoteMutedTextBrush"],
+            TextWrapping = TextWrapping.Wrap,
+            MaxHeight = 120
+        };
+        var content = new StackPanel { Spacing = 10, Width = 390 };
+        content.Children.Add(new TextBlock
+        {
+            Text = $"{sourcePaths.Count} files selected",
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
+        });
+        content.Children.Add(files);
+        content.Children.Add(combine);
+        content.Children.Add(combineDescription);
+        content.Children.Add(combinedName);
+        content.Children.Add(range);
+        content.Children.Add(rotation);
+        content.Children.Add(margin);
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Import multiple documents",
+            Content = new ScrollViewer
+            {
+                Content = content,
+                MaxHeight = 540,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+            },
+            PrimaryButtonText = "Import",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return null;
+        var normalizedName = LibraryNamePolicy.Normalize(combinedName.Text)
+                             ?? "Combined import";
+        return new BatchImportOptions(
+            combine.IsChecked == true,
+            normalizedName,
+            ParsePageRange(range.Text),
+            double.IsFinite(margin.Value) ? margin.Value : 0,
+            rotation.SelectedItem is ComboBoxItem { Tag: int rotationDegrees }
+                ? rotationDegrees
+                : 0);
     }
 
     private async Task<ImportRequest?> ShowImportOptionsAsync(string sourcePath)

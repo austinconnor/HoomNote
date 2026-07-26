@@ -1,7 +1,10 @@
-# HoomNote 0.7.20
+# HoomNote 0.7.21
 
-- Preserve nested folder relationships across restarts, rename, recolor, and multi-window updates.
-- Share folder hierarchy state across detached notebook windows to prevent stale settings overwrites.
-- Add folder-to-folder drag reparenting with top-level moves and cycle prevention.
-- Add subtle hierarchy guide lines for clearer nested-folder depth.
-- Harden settings persistence with immutable snapshots, serialized file writes, and invalid-parent repair.
+- Add optional combined-notebook imports for multiple PDFs, presentations, and Samsung Notes files.
+- Keep separate notebooks as the default multi-file import behavior.
+- Preserve source-file and page ordering when combining imports.
+- Sort notebooks naturally and case-insensitively, with numeric titles before A–Z.
+- Prevent notebook drag-and-drop from expanding unrelated sibling folders.
+- Preserve each imported PDF page’s individual size, orientation, and aspect ratio.
+- Support mixed portrait, landscape, square, and rotated PDF pages in one notebook.
+- Render page thumbnails at their actual aspect ratios without black side bars.

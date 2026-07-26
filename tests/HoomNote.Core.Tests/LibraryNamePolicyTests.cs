@@ -34,4 +34,30 @@ public sealed class LibraryNamePolicyTests
         Assert.NotNull(normalized);
         Assert.Equal(LibraryNamePolicy.MaxLength, normalized.Length);
     }
+
+    [Fact]
+    public void NotebookTitles_SortNumbersFirstThenLettersCaseInsensitively()
+    {
+        var titles = new[]
+        {
+            "zoology", "Biology", "10 Labs", "2 Labs", "anatomy", "biology",
+            "# Archive", "01 Intro"
+        };
+
+        var sorted = titles.OrderBy(title => title, NotebookTitleComparer.Instance).ToArray();
+
+        Assert.Equal(
+            ["01 Intro", "2 Labs", "10 Labs", "anatomy", "Biology", "biology", "zoology", "# Archive"],
+            sorted);
+    }
+
+    [Fact]
+    public void NotebookTitles_UseNaturalNumbersWithinAlphabeticTitles()
+    {
+        var titles = new[] { "Unit 12", "unit 2", "Unit 1", "Unit 02" };
+
+        var sorted = titles.OrderBy(title => title, NotebookTitleComparer.Instance).ToArray();
+
+        Assert.Equal(["Unit 1", "unit 2", "Unit 02", "Unit 12"], sorted);
+    }
 }
