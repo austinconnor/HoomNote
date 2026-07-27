@@ -201,6 +201,9 @@ public sealed partial class MainPage : Page
     };
     private readonly Dictionary<Guid, Guid> _tabPageSelections = [];
     private readonly List<CanvasObject> _selectedObjects = [];
+    private readonly List<RecognizedTextRegion> _selectedTextRegions = [];
+    private PointD? _textSelectionAnchor;
+    private RectD? _textSelectionDragBounds;
     private readonly Dictionary<Guid, CanvasObject> _multiTransformPreviews = [];
     private readonly HashSet<Guid> _selectionTransformOriginalIds = [];
     private RectD? _selectionTransformSourceBounds;
@@ -325,8 +328,10 @@ public sealed partial class MainPage : Page
     private bool _fitPending = true;
     private bool _isPointerDown;
     private bool _penActive;
+    private bool _gestureAllowsTextSelection;
     private bool _loading;
     private bool _updatingTabs;
+    private bool _initialLibraryLoad = true;
     private bool _syncingInkColor;
     private bool _syncingInkWidth;
     private bool _applyingToolbarPreset;
@@ -382,6 +387,7 @@ public sealed partial class MainPage : Page
     private readonly SemaphoreSlim _pasteGate = new(1, 1);
     private readonly Dictionary<ColumnDefinition, CancellationTokenSource> _sidebarAnimations = [];
     private readonly HashSet<Guid> _pageOcrIndexedThisSession = [];
+    private readonly HashSet<Guid> _semanticTextLoads = [];
     private readonly List<RectD> _searchFlashBounds = [];
     private long _searchFlashStarted;
     private long _lastSlowFrameLogTimestamp;
@@ -611,13 +617,17 @@ public sealed partial class MainPage : Page
             var requested = _startupDocumentId is { } requestedId
                 ? _allDocuments.FirstOrDefault(item => item.Id == requestedId)
                 : null;
-            var preferred = explicitlyPreferred ?? requested ?? (_document is null ? _allDocuments[0] :
-                _allDocuments.FirstOrDefault(item => item.Id == _document.Id) ?? _allDocuments[0]);
+            var current = _document is null
+                ? null
+                : _allDocuments.FirstOrDefault(item => item.Id == _document.Id);
+            var preferred = explicitlyPreferred ?? requested ?? current ??
+                (_initialLibraryLoad ? _allDocuments[0] : null);
             _startupDocumentId = null;
-            if (_document is null || _document.Id != preferred.Id)
+            if (preferred is not null && (_document is null || _document.Id != preferred.Id))
                 await LoadDocumentAsync(preferred.Id);
-            SelectLibraryDocument(preferred.Id);
+            if (preferred is not null) SelectLibraryDocument(preferred.Id);
         }
+        _initialLibraryLoad = false;
         UpdateEmptyState();
     }
 
@@ -634,7 +644,7 @@ public sealed partial class MainPage : Page
             _documents.Add(document with { Color = EffectiveDocumentColor(document.Id) });
         }
         _loading = false;
-        RebuildFolderTree(_selectedFolderId, preferredDocumentId ?? _document?.Id);
+        RebuildFolderTree(_selectedFolderId, preferredDocumentId);
         UpdateLibrarySummary();
         UpdateFolderActions();
     }
@@ -685,12 +695,12 @@ public sealed partial class MainPage : Page
 
         LibraryEmptyText.Visibility = FolderTree.RootNodes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         var desiredFolder = preferredFolderId ?? _selectedFolderId;
-        var desiredDocument = preferredDocumentId ?? _document?.Id;
+        var desiredDocument = preferredDocumentId;
         var nodeToSelect = desiredDocument is { } documentId
             ? FindDocumentNode(FolderTree.RootNodes, documentId)
             : desiredFolder is { } folderId ? FindFolderNode(FolderTree.RootNodes, folderId) : null;
-        for (var ancestor = nodeToSelect?.Parent; ancestor is not null; ancestor = ancestor.Parent)
-            ancestor.IsExpanded = true;
+        if (nodeToSelect is not null && !IsTreeNodeVisible(nodeToSelect))
+            nodeToSelect = null;
         // WinUI can fault in native TreeView code if SelectedNode is assigned in the
         // same call stack that replaced RootNodes. Restore it after the tree has attached.
         DispatcherQueue.TryEnqueue(() =>
@@ -859,12 +869,26 @@ public sealed partial class MainPage : Page
         return null;
     }
 
-    private void SelectLibraryDocument(Guid documentId)
+    private static bool IsTreeNodeVisible(TreeViewNode node)
+    {
+        for (var ancestor = node.Parent; ancestor is not null; ancestor = ancestor.Parent)
+            if (!ancestor.IsExpanded) return false;
+        return true;
+    }
+
+    private void SelectLibraryDocument(Guid documentId, bool revealInLibrary = false)
     {
         var node = FindDocumentNode(FolderTree.RootNodes, documentId);
         if (node is null) return;
-        for (var ancestor = node.Parent; ancestor is not null; ancestor = ancestor.Parent)
-            ancestor.IsExpanded = true;
+        if (revealInLibrary)
+        {
+            for (var ancestor = node.Parent; ancestor is not null; ancestor = ancestor.Parent)
+                ancestor.IsExpanded = true;
+        }
+        else if (!IsTreeNodeVisible(node))
+        {
+            return;
+        }
         var rebuildVersion = _folderTreeRebuildVersion;
         DispatcherQueue.TryEnqueue(() =>
         {
@@ -1529,6 +1553,7 @@ public sealed partial class MainPage : Page
         if (existing is null)
         {
             existing = new TabViewItem { Header = title, Tag = id, IsClosable = true };
+            existing.PointerPressed += OnNotebookTabPointerPressed;
             ConfigureNotebookTabContextMenu(existing, id);
             NotebookTabs.TabItems.Add(existing);
         }
@@ -1540,6 +1565,17 @@ public sealed partial class MainPage : Page
         _updatingTabs = true;
         NotebookTabs.SelectedItem = existing;
         _updatingTabs = false;
+    }
+
+    private void OnNotebookTabPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not TabViewItem { Tag: Guid documentId } tab ||
+            !ReferenceEquals(NotebookTabs.SelectedItem, tab) ||
+            _document?.Id != documentId) return;
+        var point = e.GetCurrentPoint(tab);
+        if (point.PointerDeviceType == PointerDeviceType.Mouse &&
+            !point.Properties.IsLeftButtonPressed) return;
+        SelectLibraryDocument(documentId, revealInLibrary: true);
     }
 
     internal bool ContainsNotebookTab(Guid documentId) =>
@@ -1701,11 +1737,11 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        ClearCurrentNotebookAfterTransfer(documentId);
+        ClearCurrentNotebook(documentId);
         if (!_isPrimaryWindow) _hostWindow?.Close();
     }
 
-    private void ClearCurrentNotebookAfterTransfer(Guid documentId)
+    private void ClearCurrentNotebook(Guid documentId)
     {
         _document = null;
         _page = null;
@@ -1731,7 +1767,7 @@ public sealed partial class MainPage : Page
 
     private async void OnNotebookTabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
     {
-        if (args.Item is not TabViewItem { Tag: Guid closingId } tab || sender.TabItems.Count <= 1) return;
+        if (args.Item is not TabViewItem { Tag: Guid closingId } tab) return;
         var wasSelected = ReferenceEquals(sender.SelectedItem, tab);
         if (!wasSelected)
         {
@@ -1761,6 +1797,11 @@ public sealed partial class MainPage : Page
                     pageId != Guid.Empty ? pageId : null);
                 RemoveCachedDocument(closingId);
                 SelectLibraryDocument(nextDocumentId);
+            }
+            else
+            {
+                ClearCurrentNotebook(closingId);
+                StatusText.Text = "No notebook open";
             }
         }
         catch (Exception exception)
@@ -1793,6 +1834,7 @@ public sealed partial class MainPage : Page
         ClearStrokeGeometryCache();
         _selectedObject = null;
         _selectedObjects.Clear();
+        ClearTextSelection();
         _multiTransformPreviews.Clear();
         _transformPreview = null;
         _selectionTransformOriginalIds.Clear();
@@ -1805,8 +1847,53 @@ public sealed partial class MainPage : Page
         UpdateLayerUi();
         DeletePageButton.IsEnabled = page is not null;
         BeginPdfPreviewLoad();
+        BeginSemanticTextLoad(page);
         UpdateEmptyState();
         InvalidateCanvas();
+    }
+
+    private void BeginSemanticTextLoad(NotePage? page)
+    {
+        var document = _document;
+        if (document is null || page?.ImportedLayer is not { } imported || _assetStore is null ||
+            page.RecognizedRegions.Any(region =>
+                string.Equals(region.Source, "Pdf", StringComparison.OrdinalIgnoreCase)) ||
+            !_semanticTextLoads.Add(page.Id)) return;
+        _ = LoadSemanticTextAsync(document, page, imported);
+    }
+
+    private async Task LoadSemanticTextAsync(
+        HoomNoteDocument document,
+        NotePage page,
+        ImportedDocumentLayer imported)
+    {
+        try
+        {
+            if (_assetStore is null) return;
+            var path = _assetStore.GetPath(imported.AssetHash);
+            var regions = await Task.Run(() => PdfSemanticTextExtractor.ExtractPage(
+                path, imported.SourcePageIndex, page.Size, imported.Transform));
+            if (regions.Count == 0) return;
+            var existing = page.RecognizedRegions.Where(region =>
+                !string.Equals(region.Source, "Pdf", StringComparison.OrdinalIgnoreCase));
+            var merged = MergeRecognizedRegions(existing, regions);
+            var sourceText = SelectedRegionText(regions);
+            var recognizedText = string.Join(Environment.NewLine,
+                new[] { sourceText, page.RecognizedText }
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Distinct(StringComparer.OrdinalIgnoreCase));
+            await PersistRecognizedTextAsync(document, page, recognizedText, merged, CancellationToken.None);
+            if (_page?.Id == page.Id) InvalidateCanvas();
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.Error("pdf.semantic_text_failed", exception,
+                ("page", page.Id), ("source_page", imported.SourcePageIndex));
+        }
+        finally
+        {
+            _semanticTextLoads.Remove(page.Id);
+        }
     }
 
     private void BeginPdfPreviewLoad(NotePage? requestedPage = null)
@@ -2078,6 +2165,7 @@ public sealed partial class MainPage : Page
         }
 
         DrawSearchFlash(drawingSession);
+        DrawTextSelection(drawingSession);
 
         if (_selectedObjects.Count > 1)
             DrawSelectionBounds(drawingSession, CombinedSelectionBounds());
@@ -2092,6 +2180,23 @@ public sealed partial class MainPage : Page
             DrawSelectionMarquee(drawingSession);
 
         UpdateImageLockOverlay();
+    }
+
+    private void DrawTextSelection(CanvasDrawingSession drawingSession)
+    {
+        if (_selectedTextRegions.Count == 0 && _textSelectionDragBounds is null) return;
+        var fill = Color.FromArgb(82, 74, 155, 255);
+        var outline = Color.FromArgb(220, 105, 178, 255);
+        foreach (var region in _selectedTextRegions)
+        {
+            var bounds = region.Bounds;
+            drawingSession.FillRectangle((float)bounds.X, (float)bounds.Y,
+                (float)bounds.Width, (float)bounds.Height, fill);
+        }
+        if (_textSelectionDragBounds is { } drag && drag.Width > 0 && drag.Height > 0)
+            drawingSession.DrawRectangle((float)drag.X, (float)drag.Y,
+                (float)drag.Width, (float)drag.Height, outline,
+                (float)(1.25 / Math.Max(_zoom, 0.08)));
     }
 
     private void DrawSelectionTransformPreview(CanvasDrawingSession drawingSession, NotePage page)
@@ -2751,10 +2856,9 @@ public sealed partial class MainPage : Page
             // Selection can happen before the async page load or after a device/resource reset.
             // Re-requesting here is cheap (the cache de-duplicates loads) and makes the canvas
             // self-healing instead of relying on an unrelated UI toggle to trigger a redraw.
+            // Keep the page clean while this finishes; a transient loading banner flashed on
+            // every PDF page switch and added no useful information.
             RequestPdfPreviewLoad(page);
-            drawingSession.FillRectangle(0, 0, (float)page.Size.Width, 42, Color.FromArgb(210, 37, 43, 54));
-            drawingSession.DrawText($"Loading {layer.SourceName} • page {layer.SourcePageIndex + 1}", 18, 12,
-                Color.FromArgb(255, 218, 225, 235));
         }
     }
 
@@ -3354,6 +3458,13 @@ public sealed partial class MainPage : Page
         _gestureInkStyle = _gestureTool is EditorTool.Pen or EditorTool.Highlighter
             ? CurrentInkStyle()
             : null;
+        var contact = point.Properties.ContactRect;
+        _gestureAllowsTextSelection = TouchInputPolicy.CanSelectText(
+            point.PointerDeviceType == PointerDeviceType.Pen,
+            point.PointerDeviceType == PointerDeviceType.Mouse,
+            e.IsGenerated,
+            NativePointerClassifier.IsTouch(point.PointerId),
+            contact.Width > 0.5 && contact.Height > 0.5);
         if (_gestureTool is EditorTool.Lasso or EditorTool.BoxSelect && SelectionContainsInteraction(_gestureStart))
             _gestureTool = EditorTool.Select;
         _activeInk.Clear();
@@ -3413,7 +3524,7 @@ public sealed partial class MainPage : Page
                 EndPointer(e);
                 return;
             case EditorTool.Select:
-                BeginSelectionGesture(_gestureStart);
+                BeginSelectionGesture(_gestureStart, _gestureAllowsTextSelection);
                 break;
             case EditorTool.Style:
                 _styleBrushOriginals.Clear();
@@ -3511,6 +3622,12 @@ public sealed partial class MainPage : Page
                     };
                 redraw = true;
                 break;
+            case EditorTool.Select when _textSelectionAnchor is { } textAnchor:
+                var textCurrent = ScreenToPage(current.Position);
+                _textSelectionDragBounds = NormalizeRect(textAnchor, textCurrent);
+                UpdateTextRegionSelection(textCurrent);
+                redraw = true;
+                break;
             case EditorTool.Select when _transformOriginal is not null && _transformHandle != TransformHandle.None:
                 var currentPage = ScreenToPage(current.Position);
                 var singlePreserveAspect = IsCornerHandle(_transformHandle) && !IsShiftDown();
@@ -3566,6 +3683,15 @@ public sealed partial class MainPage : Page
             case EditorTool.Style:
                 CommitStyleBrush();
                 break;
+            case EditorTool.Select when _textSelectionAnchor is not null:
+                UpdateTextRegionSelection(ScreenToPage(current.Position), finalize: true);
+                _textSelectionAnchor = null;
+                _textSelectionDragBounds = null;
+                StatusText.Text = _selectedTextRegions.Count == 0
+                    ? "No text selected"
+                    : $"Selected {_selectedTextRegions.Count} text region(s) • Ctrl+C to copy";
+                UpdateSelectionUi();
+                break;
             case EditorTool.Select when _multiTransformOriginals is { Count: > 1 } && _multiTransformPreviews.Count > 0:
                 var after = _multiTransformOriginals.Select(item => _multiTransformPreviews[item.Id]).ToArray();
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, _multiTransformOriginals, after,
@@ -3599,6 +3725,8 @@ public sealed partial class MainPage : Page
         if (current.PointerDeviceType == PointerDeviceType.Pen)
             _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         RestoreEraseSnapshot();
+        _textSelectionAnchor = null;
+        _textSelectionDragBounds = null;
         EndPointer(e);
     }
 
@@ -3637,6 +3765,7 @@ public sealed partial class MainPage : Page
         _eraseSnapshot = null;
         _transformHandle = TransformHandle.None;
         _gestureInkStyle = null;
+        _gestureAllowsTextSelection = false;
         _gestureScreenToPageValid = false;
         e.Handled = true;
         InvalidateCanvas();
@@ -4078,7 +4207,7 @@ public sealed partial class MainPage : Page
         e.Handled = true;
     }
 
-    private void BeginSelectionGesture(PointD point)
+    private void BeginSelectionGesture(PointD point, bool allowTextSelection)
     {
         if (_selectedObjects.Count > 1)
         {
@@ -4090,6 +4219,7 @@ public sealed partial class MainPage : Page
             {
                 _multiTransformOriginals = [.. _selectedObjects];
                 PrepareSelectionTransformSource(_multiTransformOriginals);
+                ClearTextSelection();
                 return;
             }
         }
@@ -4103,6 +4233,7 @@ public sealed partial class MainPage : Page
             {
                 _transformOriginal = _selectedObject;
                 PrepareSelectionTransformSource([_transformOriginal]);
+                ClearTextSelection();
                 return;
             }
         }
@@ -4114,6 +4245,20 @@ public sealed partial class MainPage : Page
             .FirstOrDefault();
         _selectedObjects.Clear();
         if (_selectedObject is not null) _selectedObjects.Add(_selectedObject);
+        if (_selectedObject is not null)
+        {
+            ClearTextSelection();
+        }
+        else if (allowTextSelection && _page?.RecognizedRegions.Count > 0)
+        {
+            _textSelectionAnchor = point;
+            _textSelectionDragBounds = new RectD(point.X, point.Y, 0, 0);
+            _selectedTextRegions.Clear();
+        }
+        else
+        {
+            ClearTextSelection();
+        }
         _transformHandle = _selectedObject is null or { IsLocked: true } ? TransformHandle.None : TransformHandle.Move;
         _transformOriginal = _selectedObject is { IsLocked: false } ? _selectedObject : null;
         if (_transformOriginal is not null) PrepareSelectionTransformSource([_transformOriginal]);
@@ -4123,6 +4268,38 @@ public sealed partial class MainPage : Page
             _selectionTransformSourceBounds = null;
         }
         UpdateSelectionUi();
+    }
+
+    private void UpdateTextRegionSelection(PointD current, bool finalize = false)
+    {
+        if (_page is null || _textSelectionAnchor is not { } anchor) return;
+        var bounds = NormalizeRect(anchor, current);
+        var clickTolerance = 6 / Math.Max(_zoom, 0.08);
+        _selectedTextRegions.Clear();
+        if (bounds.Width <= clickTolerance && bounds.Height <= clickTolerance)
+        {
+            if (!finalize) return;
+            var hitArea = new RectD(current.X - clickTolerance, current.Y - clickTolerance,
+                clickTolerance * 2, clickTolerance * 2);
+            var hit = _page.RecognizedRegions
+                .Where(region => region.Bounds.Intersects(hitArea))
+                .OrderBy(region => Math.Abs(region.Bounds.Center.X - current.X) +
+                                   Math.Abs(region.Bounds.Center.Y - current.Y))
+                .FirstOrDefault();
+            if (hit is not null) _selectedTextRegions.Add(hit);
+            return;
+        }
+
+        foreach (var region in _page.RecognizedRegions)
+            if (region.Bounds.Intersects(bounds))
+                _selectedTextRegions.Add(region);
+    }
+
+    private void ClearTextSelection()
+    {
+        _selectedTextRegions.Clear();
+        _textSelectionAnchor = null;
+        _textSelectionDragBounds = null;
     }
 
     private void PrepareSelectionTransformSource(IReadOnlyCollection<CanvasObject> originals)
@@ -4386,6 +4563,7 @@ public sealed partial class MainPage : Page
         _selectedObjects.Clear();
         _selectedObjects.AddRange(selected);
         _selectedObject = selected.Length == 1 ? selected[0] : null;
+        ClearTextSelection();
         UpdateSelectionUi();
     }
 
@@ -4531,6 +4709,7 @@ public sealed partial class MainPage : Page
 
     private void SelectSingleObject(CanvasObject canvasObject)
     {
+        ClearTextSelection();
         _selectedObject = canvasObject;
         _selectedObjects.Clear();
         _selectedObjects.Add(canvasObject);
@@ -4810,8 +4989,12 @@ public sealed partial class MainPage : Page
                     DispatcherQueue.TryEnqueue(() => StatusText.Text = $"Indexing page content • {page.Title}");
                     // A complete page pass is authoritative. Starting from the old text kept
                     // inaccurate legacy guesses in FTS forever and produced irrelevant matches.
+                    var sourcePdfRegions = page.RecognizedRegions.Where(region =>
+                        string.Equals(region.Source, "Pdf", StringComparison.OrdinalIgnoreCase)).ToArray();
                     var recognizedParts = new List<string>();
-                    var recognizedRegions = new List<RecognizedTextRegion>();
+                    if (sourcePdfRegions.Length > 0)
+                        AddUniqueRecognizedText(recognizedParts, SelectedRegionText(sourcePdfRegions));
+                    var recognizedRegions = new List<RecognizedTextRegion>(sourcePdfRegions);
                     var objectSnapshot = page.Objects.ToArray();
                     var pageIndexInput = await Task.Run(() =>
                     {
@@ -5702,6 +5885,7 @@ public sealed partial class MainPage : Page
             EditorOverlay.IsHitTestVisible = false;
             _selectedObject = null;
             _selectedObjects.Clear();
+            ClearTextSelection();
             UpdateSelectionUi();
         }
         else
@@ -5912,6 +6096,7 @@ public sealed partial class MainPage : Page
             {
                 _selectedObject = null;
                 _selectedObjects.Clear();
+                ClearTextSelection();
                 _transformPreview = null;
                 _multiTransformPreviews.Clear();
                 UpdateSelectionUi();
@@ -6445,19 +6630,71 @@ public sealed partial class MainPage : Page
 
     private void CopySelectionToClipboard()
     {
+        if (_selectedTextRegions.Count > 0)
+        {
+            var text = SelectedRegionText();
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var textPackage = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            textPackage.SetText(text);
+            Clipboard.SetContent(textPackage);
+            StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s)";
+            return;
+        }
         var selected = SelectedCanvasObjects();
         if (selected.Count == 0) return;
         _internalClipboard = JsonSerializer.Serialize(selected, HoomNoteJson.Options);
         var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
         package.SetData(CanvasClipboardFormat, _internalClipboard);
+        var plainText = string.Join(Environment.NewLine,
+            selected.OfType<RichTextObject>()
+                .Select(item => item.Content.PlainText)
+                .Where(item => !string.IsNullOrWhiteSpace(item)));
+        if (!string.IsNullOrWhiteSpace(plainText)) package.SetText(plainText);
         Clipboard.SetContent(package);
         StatusText.Text = $"Copied {selected.Count} object(s)";
+    }
+
+    private string SelectedRegionText() => SelectedRegionText(_selectedTextRegions);
+
+    private static string SelectedRegionText(IReadOnlyCollection<RecognizedTextRegion> selectedRegions)
+    {
+        if (selectedRegions.Count == 0) return string.Empty;
+        var ordered = selectedRegions
+            .OrderBy(region => region.Bounds.Top)
+            .ThenBy(region => region.Bounds.Left)
+            .ToArray();
+        var lines = new List<List<RecognizedTextRegion>>();
+        foreach (var region in ordered)
+        {
+            var line = lines.LastOrDefault();
+            var lineHeight = line?.Max(item => item.Bounds.Height) ?? 0;
+            if (line is null ||
+                Math.Abs(line.Average(item => item.Bounds.Center.Y) - region.Bounds.Center.Y) >
+                Math.Max(3, Math.Max(lineHeight, region.Bounds.Height) * 0.65))
+            {
+                lines.Add([region]);
+            }
+            else
+            {
+                line.Add(region);
+            }
+        }
+        return string.Join(Environment.NewLine, lines.Select(line =>
+            string.Join(' ', line.OrderBy(region => region.Bounds.Left)
+                .Select(region => region.Text.Trim())
+                .Where(text => text.Length > 0))));
     }
 
     private void OnCopyClick(object sender, RoutedEventArgs e) => CopySelectionToClipboard();
 
     private void OnCutClick(object sender, RoutedEventArgs e)
     {
+        if (_selectedTextRegions.Count > 0)
+        {
+            CopySelectionToClipboard();
+            StatusText.Text = "Copied source text • imported PDF text is read-only";
+            return;
+        }
         if (SelectedCanvasObjects().Count == 0) return;
         CopySelectionToClipboard();
         OnDeleteClick(sender, e);
@@ -7972,7 +8209,9 @@ public sealed partial class MainPage : Page
 
     private void UpdateSelectionUi()
     {
-        SelectionSummary.Text = _selectedObjects.Count > 1
+        SelectionSummary.Text = _selectedTextRegions.Count > 0
+            ? $"{_selectedTextRegions.Count} text region(s) selected"
+            : _selectedObjects.Count > 1
             ? $"{_selectedObjects.Count} objects selected"
             : _selectedObject switch
         {

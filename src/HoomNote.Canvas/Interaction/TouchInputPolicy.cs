@@ -16,4 +16,16 @@ public static class TouchInputPolicy
         reportedAsTouch ||
         nativePointerIsTouch ||
         (reportedAsMouse && (isPlatformGenerated || hasTouchContactArea));
+
+    public static bool CanSelectText(
+        bool reportedAsPen,
+        bool reportedAsMouse,
+        bool isPlatformGenerated,
+        bool nativePointerIsTouch,
+        bool hasTouchContactArea) =>
+        reportedAsPen ||
+        (reportedAsMouse &&
+         !isPlatformGenerated &&
+         !nativePointerIsTouch &&
+         !hasTouchContactArea);
 }

@@ -8,6 +8,10 @@ using HoomNote.Infrastructure.Import;
 using HoomNote.Infrastructure.Storage;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
+using UglyToad.PdfPig.Content;
+using UglyToad.PdfPig.Core;
+using UglyToad.PdfPig.Fonts.Standard14Fonts;
+using UglyToad.PdfPig.Writer;
 
 namespace HoomNote.Infrastructure.Tests;
 
@@ -379,6 +383,33 @@ public sealed class PersistenceTests : IAsyncLifetime
             imported.ImportedLayer.Transform.M22, 6);
         Assert.Equal(0, imported.ImportedLayer.Transform.M12, 6);
         Assert.Equal(0, imported.ImportedLayer.Transform.M21, 6);
+    }
+
+    [Fact]
+    public async Task PdfImport_RetainsUnicodeTextAndWordGeometry()
+    {
+        var source = Path.Combine(_root, "selectable-text.pdf");
+        var builder = new PdfDocumentBuilder();
+        var page = builder.AddPage(UglyToad.PdfPig.Content.PageSize.Letter);
+        var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+        page.AddText("Selectable source text", 18, new PdfPoint(72, 672), font);
+        await File.WriteAllBytesAsync(source, builder.Build());
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets-text"));
+        var importer = new DocumentImportService(store);
+
+        var result = await importer.ImportAsync(new ImportRequest(source));
+
+        var imported = Assert.Single(result.Pages);
+        Assert.Contains("Selectable", imported.RecognizedText, StringComparison.Ordinal);
+        Assert.Contains(imported.RecognizedRegions, region =>
+            region.Text == "Selectable" && region.Source == "Pdf");
+        Assert.All(imported.RecognizedRegions, region =>
+        {
+            Assert.True(region.Bounds.Width > 0);
+            Assert.True(region.Bounds.Height > 0);
+            Assert.InRange(region.Bounds.Left, 0, imported.Size.Width);
+            Assert.InRange(region.Bounds.Top, 0, imported.Size.Height);
+        });
     }
 
     [Fact]

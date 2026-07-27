@@ -70,6 +70,7 @@ public sealed class WindowsPageOcrService(IAssetStore assetStore)
             regions.Add(new RecognizedTextRegion
             {
                 Text = region.Text,
+                Source = "Ocr",
                 Bounds = TransformBounds(new RectD(target.X + region.Bounds.X * xScale,
                     target.Y + region.Bounds.Y * yScale,
                     region.Bounds.Width * xScale, region.Bounds.Height * yScale), transform)

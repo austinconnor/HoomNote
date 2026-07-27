@@ -60,6 +60,26 @@ public sealed class GeometryAndEditingTests
                 reportedAsTouch, reportedAsMouse, generated, nativeTouch, hasContactArea));
     }
 
+    [Theory]
+    [InlineData(true, false, false, false, false, true)]
+    [InlineData(false, true, false, false, false, true)]
+    [InlineData(false, true, true, false, false, false)]
+    [InlineData(false, true, false, true, false, false)]
+    [InlineData(false, true, false, false, true, false)]
+    [InlineData(false, false, false, false, false, false)]
+    public void TextSelection_AllowsPenAndGenuineMouseButNeverFingerContacts(
+        bool reportedAsPen,
+        bool reportedAsMouse,
+        bool generated,
+        bool nativeTouch,
+        bool hasContactArea,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            TouchInputPolicy.CanSelectText(
+                reportedAsPen, reportedAsMouse, generated, nativeTouch, hasContactArea));
+    }
+
     [Fact]
     public void TwoFingerPinch_IgnoresCentroidTranslationWhenSpreadIsUnchanged()
     {

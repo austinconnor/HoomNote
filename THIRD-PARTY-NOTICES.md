@@ -10,3 +10,8 @@ package or icon font is distributed.
 Material Design Icons is maintained by Pictogrammers and licensed under the
 [Apache License 2.0](https://github.com/Templarian/MaterialDesign/blob/master/LICENSE).
 
+## PdfPig
+
+HoomNote uses [PdfPig](https://github.com/UglyToad/PdfPig) to extract Unicode
+text and word geometry from imported PDF pages. PdfPig is licensed under the
+[Apache License 2.0](https://github.com/UglyToad/PdfPig/blob/master/LICENSE).

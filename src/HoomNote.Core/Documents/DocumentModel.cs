@@ -56,6 +56,7 @@ public sealed record RecognizedTextRegion
 {
     public string Text { get; init; } = string.Empty;
     public RectD Bounds { get; init; }
+    public string Source { get; init; } = "Recognition";
 }
 
 public sealed record NotePage

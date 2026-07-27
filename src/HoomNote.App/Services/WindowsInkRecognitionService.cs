@@ -79,6 +79,7 @@ public sealed class WindowsInkRecognitionService : IHandwritingRecognitionServic
                 words.Select(word => new RecognizedTextRegion
                 {
                     Text = word.RecognizedText.Trim(),
+                    Source = "Handwriting",
                     Bounds = new RectD(
                         (word.BoundingRect.X - padding) / analysisScale + minX,
                         (word.BoundingRect.Y - padding) / analysisScale + minY,
