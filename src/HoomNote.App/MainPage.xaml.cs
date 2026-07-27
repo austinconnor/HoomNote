@@ -291,6 +291,7 @@ public sealed partial class MainPage : Page
     private Storyboard? _zoomIndicatorFade;
     private Guid? _pendingThumbnailRefreshPageId;
     private EditorTool _activeTool = EditorTool.Select;
+    private ShapeKind _selectedShapeKind = ShapeKind.Square;
     private EditorTool _gestureTool = EditorTool.Select;
     private InkStyle? _gestureInkStyle;
     private Matrix3x2 _gestureScreenToPage;
@@ -312,6 +313,8 @@ public sealed partial class MainPage : Page
     private long _touchInertiaTimestamp;
     private bool _touchGestureMoved;
     private bool _touchInertiaActive;
+    private bool _touchPageScrollActive;
+    private double _touchPageScrollAnchorY;
     private bool _zoomNavigationActive;
     private bool _wheelZoomAnimating;
     private bool _viewportFramePumpActive;
@@ -325,6 +328,9 @@ public sealed partial class MainPage : Page
     private int _pointerClassificationLogCount;
     private long _lastInkMovementTimestamp;
     private double _zoom = 1;
+    private double _minimumZoom = 0.08;
+    private double _maximumZoom = 8;
+    private bool _syncingZoomLimits;
     private bool _fitPending = true;
     private bool _isPointerDown;
     private bool _penActive;
@@ -369,7 +375,7 @@ public sealed partial class MainPage : Page
     private MenuFlyoutItem _removeNotebookFolderMenuItem = null!;
     private string _inkColor = "#111111";
     private string _penColor = "#111111";
-    private string _highlighterColor = "#FFCE56";
+    private string _highlighterColor = "#FFFF00";
     private EditorTool _colorTool = EditorTool.Pen;
     private float? _presetOpacity;
     private float? _presetSmoothing;
@@ -419,6 +425,9 @@ public sealed partial class MainPage : Page
         QuickInkColorPicker.ColorChanged += OnQuickInkColorChanged;
         TemporaryGridSizeSlider.ValueChanged += OnTemporaryGridSizeChanged;
         TemporaryGridSizeNumberBox.ValueChanged += OnTemporaryGridSizeNumberChanged;
+        MinimumZoomNumberBox.ValueChanged += OnMinimumZoomChanged;
+        MaximumZoomNumberBox.ValueChanged += OnMaximumZoomChanged;
+        ShapePicker.SelectionChanged += OnInspectorShapeChanged;
         VersionText.Text = DisplayVersion();
         PresetScrollViewer.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnPresetScrollWheelChanged), handledEventsToo: true);
@@ -515,7 +524,7 @@ public sealed partial class MainPage : Page
             if (migratedInkPresets)
                 await App.SaveSharedUserPreferencesAsync(_userSettingsStore, _userPreferences);
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
-            _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFCE56";
+            _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFFF00";
             HighlighterStraightCheckBox.IsChecked = _userPreferences.HighlighterStraightLine;
             _expandedFolderIds.Clear();
             foreach (var value in _userPreferences.ExpandedFolderIds)
@@ -526,6 +535,14 @@ public sealed partial class MainPage : Page
             TemporaryGridSizeSlider.Value = _temporaryGridSize;
             TemporaryGridSizeNumberBox.Value = _temporaryGridSize;
             _syncingTemporaryGridSize = false;
+            var storedMinimumZoom = NormalizeZoomPercent(_userPreferences.MinimumZoomPercent, 8);
+            var storedMaximumZoom = NormalizeZoomPercent(_userPreferences.MaximumZoomPercent, 800);
+            _minimumZoom = Math.Min(storedMinimumZoom, storedMaximumZoom) / 100d;
+            _maximumZoom = Math.Max(storedMinimumZoom, storedMaximumZoom) / 100d;
+            _syncingZoomLimits = true;
+            MinimumZoomNumberBox.Value = _minimumZoom * 100d;
+            MaximumZoomNumberBox.Value = _maximumZoom * 100d;
+            _syncingZoomLimits = false;
             SetInkColor(_penColor, rememberForTool: false);
             RebuildPresetToolbar();
             RebuildFolderTree();
@@ -572,6 +589,7 @@ public sealed partial class MainPage : Page
         StopViewportFramePump();
         StopTouchInertia(resumeBackgroundWork: false);
         _touchPoints.Clear();
+        ResetTouchPageScroll();
         _isPointerDown = false;
         _penActive = false;
         DrawingSurface.ReleasePointerCaptures();
@@ -1945,7 +1963,7 @@ public sealed partial class MainPage : Page
         _zoom = Math.Min(1, Math.Min(
             (_canvasWidth - 72) / _page.Size.Width,
             (_canvasHeight - 72) / _page.Size.Height));
-        _zoom = Math.Max(0.08, _zoom);
+        _zoom = Math.Clamp(_zoom, _minimumZoom, _maximumZoom);
         _fitPending = false;
         UpdateZoomText();
     }
@@ -2157,9 +2175,10 @@ public sealed partial class MainPage : Page
         {
             var start = _activeInk[0].Position;
             var end = _activeInk[^1].Position;
+            var shapeKind = SelectedShapeKind();
             DrawObject(drawingSession, new ShapeObject
             {
-                Shape = SelectedShapeKind(), Bounds = NormalizeRect(start, end), StrokeColor = _inkColor,
+                Shape = shapeKind, Bounds = ShapeGeometry.BoundsFromDrag(start, end, shapeKind), StrokeColor = _inkColor,
                 StrokeWidth = (float)StrokeWidthSlider.Value, StartPoint = start, EndPoint = end
             });
         }
@@ -3269,6 +3288,7 @@ public sealed partial class MainPage : Page
         var bounds = shape.Bounds;
         switch (shape.Shape)
         {
+            case ShapeKind.Circle:
             case ShapeKind.Ellipse:
                 drawingSession.DrawEllipse((float)bounds.Center.X, (float)bounds.Center.Y,
                     (float)(bounds.Width / 2), (float)(bounds.Height / 2), color, shape.StrokeWidth);
@@ -3316,6 +3336,15 @@ public sealed partial class MainPage : Page
                     var next = vertices[(index + 1) % vertices.Length];
                     drawingSession.DrawLine((float)vertices[index].X, (float)vertices[index].Y,
                         (float)next.X, (float)next.Y, color, shape.StrokeWidth);
+                }
+                break;
+            case ShapeKind.Star:
+                var starPoints = ShapeGeometry.StarPoints(bounds);
+                for (var index = 0; index < starPoints.Count; index++)
+                {
+                    var next = starPoints[(index + 1) % starPoints.Count];
+                    drawingSession.DrawLine(starPoints[index].ToVector2(), next.ToVector2(), color,
+                        shape.StrokeWidth, _roundInkStrokeStyle);
                 }
                 break;
             default:
@@ -3797,6 +3826,17 @@ public sealed partial class MainPage : Page
 
         var firstTouch = _touchPoints.Count == 0;
         _touchPoints[point.PointerId] = point.Position;
+        if (firstTouch)
+        {
+            _touchPageScrollActive = TouchInputPolicy.ShouldBeginPageScroll(
+                point.Position.X, DrawingSurface.ActualWidth);
+            _touchPageScrollAnchorY = point.Position.Y;
+        }
+        else
+        {
+            // A second finger always means pinch. It must never change pages.
+            _touchPageScrollActive = false;
+        }
         // Pointer capture improves off-canvas continuation but is not required to recognize a
         // finger. Some touch drivers return false here even though move/release events continue.
         _ = DrawingSurface.CapturePointer(e.Pointer);
@@ -3808,7 +3848,9 @@ public sealed partial class MainPage : Page
             PauseThumbnailRefresh();
         }
         RebaseTouchGesture();
-        PointerStatus.Text = _touchPoints.Count > 1 ? "Touch • pinch to zoom • drag to pan" : "Touch • drag to pan";
+        PointerStatus.Text = _touchPageScrollActive
+            ? "Touch • swipe edge to change page"
+            : _touchPoints.Count > 1 ? "Touch • pinch to zoom" : "Touch • drag to pan";
         e.Handled = true;
     }
 
@@ -3849,6 +3891,7 @@ public sealed partial class MainPage : Page
         var canvasOrigin = DrawingSurface.TransformToVisual(null)
             .TransformPoint(new Point(0, 0));
         var hadTouches = _touchPoints.Count > 0;
+        var wasPageScroll = _touchPageScrollActive;
         var topologyChanged = false;
         var moved = false;
         var ended = false;
@@ -3868,6 +3911,16 @@ public sealed partial class MainPage : Page
                         position.Y > DrawingSurface.ActualHeight)
                         continue;
                     StopTouchInertia(resumeBackgroundWork: false);
+                    if (_touchPoints.Count == 0)
+                    {
+                        _touchPageScrollActive = TouchInputPolicy.ShouldBeginPageScroll(
+                            position.X, DrawingSurface.ActualWidth);
+                        _touchPageScrollAnchorY = position.Y;
+                    }
+                    else
+                    {
+                        _touchPageScrollActive = false;
+                    }
                     _touchPoints[pointerId] = position;
                     topologyChanged = true;
                     break;
@@ -3892,11 +3945,14 @@ public sealed partial class MainPage : Page
 
         if (_touchPoints.Count > 0)
         {
+            if (_touchPoints.Count > 1) _touchPageScrollActive = false;
             if (topologyChanged)
                 RebaseTouchGesture(resetVelocity: true);
             else if (moved)
                 ApplyTouchGesture();
-            PointerStatus.Text = _touchPoints.Count > 1
+            PointerStatus.Text = _touchPageScrollActive
+                ? "Touch • swipe edge to change page"
+                : _touchPoints.Count > 1
                 ? "Touch • pinch to zoom"
                 : "Touch • drag to pan";
             return;
@@ -3905,6 +3961,13 @@ public sealed partial class MainPage : Page
         if (!ended) return;
         PointerStatus.Text = "Windows Ink";
         InvalidateCanvas();
+        if (wasPageScroll)
+        {
+            ResetTouchPageScroll();
+            ResumeBackgroundRecognition();
+            ResumeThumbnailRefresh();
+            return;
+        }
         if (!TryStartTouchInertia())
         {
             ResumeBackgroundRecognition();
@@ -3926,6 +3989,7 @@ public sealed partial class MainPage : Page
 
     private void EndTouchPointer(PointerRoutedEventArgs e, bool releaseCapture)
     {
+        var wasPageScroll = _touchPageScrollActive;
         var removed = _touchPoints.Remove(e.Pointer.PointerId);
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         e.Handled = true;
@@ -3933,15 +3997,23 @@ public sealed partial class MainPage : Page
 
         if (_touchPoints.Count > 0)
         {
+            if (_touchPoints.Count > 1) _touchPageScrollActive = false;
             // Preserve the last centroid velocity while fingers lift one at a time so a
             // two-finger pan still transitions naturally into inertia.
             RebaseTouchGesture(resetVelocity: false);
-            PointerStatus.Text = _touchPoints.Count > 1 ? "Touch • pinch to zoom • drag to pan" : "Touch • drag to pan";
+            PointerStatus.Text = _touchPoints.Count > 1 ? "Touch • pinch to zoom" : "Touch • drag to pan";
             return;
         }
 
         PointerStatus.Text = "Windows Ink";
         InvalidateCanvas();
+        if (wasPageScroll)
+        {
+            ResetTouchPageScroll();
+            ResumeBackgroundRecognition();
+            ResumeThumbnailRefresh();
+            return;
+        }
         if (!TryStartTouchInertia())
         {
             ResumeBackgroundRecognition();
@@ -3953,6 +4025,7 @@ public sealed partial class MainPage : Page
     {
         if (_touchPoints.Count == 0) return;
         _touchPoints.Clear();
+        ResetTouchPageScroll();
         DrawingSurface.ReleasePointerCaptures();
         PointerStatus.Text = "Pen";
     }
@@ -3974,6 +4047,11 @@ public sealed partial class MainPage : Page
     {
         if (_page is null || _touchPoints.Count == 0) return;
         var centroid = TouchCentroid();
+        if (_touchPageScrollActive && _touchPoints.Count == 1)
+        {
+            ApplyTouchPageScroll(centroid);
+            return;
+        }
         UpdateTouchVelocity(centroid);
         if (_touchPoints.Count == 1)
         {
@@ -3994,13 +4072,44 @@ public sealed partial class MainPage : Page
                 new PointD(_touchStartCentroid.X, _touchStartCentroid.Y),
                 new PointD(centroid.X, centroid.Y),
                 _page.Size,
-                new SizeD(DrawingSurface.ActualWidth, DrawingSurface.ActualHeight));
+                new SizeD(DrawingSurface.ActualWidth, DrawingSurface.ActualHeight),
+                _minimumZoom,
+                _maximumZoom);
             _zoom = viewport.Zoom;
             _pan = viewport.Pan;
             UpdateZoomText(showIndicator: true);
         }
         _fitPending = false;
         InvalidateCanvas();
+    }
+
+    private void ApplyTouchPageScroll(Point centroid)
+    {
+        var steps = TouchInputPolicy.PageScrollSteps(centroid.Y - _touchPageScrollAnchorY);
+        if (steps == 0) return;
+        var currentIndex = PageList.SelectedIndex;
+        if (currentIndex < 0 || _pages.Count == 0) return;
+        var targetIndex = Math.Clamp(currentIndex + steps, 0, _pages.Count - 1);
+        if (targetIndex == currentIndex)
+        {
+            _touchPageScrollAnchorY = centroid.Y;
+            return;
+        }
+
+        PageList.SelectedIndex = targetIndex;
+        PageList.ScrollIntoView(_pages[targetIndex]);
+        _touchPageScrollAnchorY -= steps * TouchInputPolicy.PageScrollStepDistance;
+        _touchVelocity = Vector2.Zero;
+        _touchGestureMoved = false;
+        PointerStatus.Text = $"Page {targetIndex + 1} of {_pages.Count}";
+    }
+
+    private void ResetTouchPageScroll()
+    {
+        _touchPageScrollActive = false;
+        _touchPageScrollAnchorY = 0;
+        _touchVelocity = Vector2.Zero;
+        _touchGestureMoved = false;
     }
 
     private void UpdateTouchVelocity(Point centroid)
@@ -4111,7 +4220,7 @@ public sealed partial class MainPage : Page
 
     private void ApplyZoomAtAnchor(double zoom, PointD pageAnchor, Point screenAnchor)
     {
-        _zoom = Math.Clamp(zoom, 0.08, 8);
+        _zoom = Math.Clamp(zoom, _minimumZoom, _maximumZoom);
         var afterScreen = PageToScreen(pageAnchor);
         _pan += new Vector2(
             (float)(screenAnchor.X - afterScreen.X),
@@ -4194,7 +4303,7 @@ public sealed partial class MainPage : Page
         // precision wheels and touchpads to accumulate fractional targets. A short logarithmic
         // animation turns discrete 120-unit wheel notches into continuous, cursor-anchored zoom.
         var multiplier = Math.Pow(1.12, delta / 120d);
-        _wheelZoomTarget = Math.Clamp(_wheelZoomTarget * multiplier, 0.08, 8);
+        _wheelZoomTarget = Math.Clamp(_wheelZoomTarget * multiplier, _minimumZoom, _maximumZoom);
         // Apply part of the delta synchronously so the canvas never trails a physical wheel
         // notch, then animate only the small remainder over a fixed, non-queueing interval.
         var immediateZoom = _zoom * Math.Exp(
@@ -4426,10 +4535,11 @@ public sealed partial class MainPage : Page
     private void CommitShape()
     {
         if (_document is null || _page is null || _activeInk.Count < 2) return;
+        var shapeKind = SelectedShapeKind();
         var shape = new ShapeObject
         {
-            Shape = SelectedShapeKind(),
-            Bounds = NormalizeRect(_activeInk[0].Position, _activeInk[^1].Position),
+            Shape = shapeKind,
+            Bounds = ShapeGeometry.BoundsFromDrag(_activeInk[0].Position, _activeInk[^1].Position, shapeKind),
             StartPoint = _activeInk[0].Position,
             EndPoint = _activeInk[^1].Position,
             StrokeColor = _inkColor,
@@ -5612,6 +5722,7 @@ public sealed partial class MainPage : Page
         SaveCurrentInkPresetMenuItem.Text = _colorTool == EditorTool.Highlighter
             ? "Save highlighter"
             : "Save pen";
+        ShapeChoiceButton.Visibility = tool == EditorTool.Shape ? Visibility.Visible : Visibility.Collapsed;
         ToolTipService.SetToolTip(QuickInkSettingsButton,
             _colorTool == EditorTool.Highlighter ? "Highlighter size and color" : "Pen size and color");
         foreach (var toggle in ToolButtons.Children.OfType<ToggleButton>()
@@ -5634,6 +5745,43 @@ public sealed partial class MainPage : Page
         }
         else StatusText.Text = tool.ToString();
     }
+
+    private void OnShapeChoiceClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioMenuFlyoutItem { Tag: string value } ||
+            !Enum.TryParse<ShapeKind>(value, out var shape)) return;
+        SetSelectedShapeKind(shape, syncInspector: true);
+    }
+
+    private void OnInspectorShapeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ShapePicker.SelectedItem is not ComboBoxItem { Tag: string value } ||
+            !Enum.TryParse<ShapeKind>(value, out var shape)) return;
+        SetSelectedShapeKind(shape, syncInspector: false);
+    }
+
+    private void SetSelectedShapeKind(ShapeKind shape, bool syncInspector)
+    {
+        _selectedShapeKind = shape;
+        ShapeChoiceLabel.Text = ShapeDisplayName(shape);
+        ToolTipService.SetToolTip(ShapeChoiceButton, $"Shape: {ShapeDisplayName(shape)}");
+        foreach (var menuItem in ShapeChoiceFlyout.Items.OfType<RadioMenuFlyoutItem>())
+            menuItem.IsChecked = menuItem.Tag is string value &&
+                                 string.Equals(value, shape.ToString(), StringComparison.Ordinal);
+
+        if (!syncInspector) return;
+        var inspectorItem = ShapePicker.Items.OfType<ComboBoxItem>()
+            .FirstOrDefault(item => item.Tag is string value &&
+                                    string.Equals(value, shape.ToString(), StringComparison.Ordinal));
+        if (inspectorItem is not null && !ReferenceEquals(ShapePicker.SelectedItem, inspectorItem))
+            ShapePicker.SelectedItem = inspectorItem;
+    }
+
+    private static string ShapeDisplayName(ShapeKind shape) => shape switch
+    {
+        ShapeKind.RoundedRectangle => "Rounded",
+        _ => shape.ToString()
+    };
 
     private void OnStyleModeClick(object sender, RoutedEventArgs e)
     {
@@ -5712,6 +5860,53 @@ public sealed partial class MainPage : Page
         if (!_temporaryGridVisible) return;
         InvalidatePageRenderCache();
         InvalidateCanvas();
+    }
+
+    private void OnMinimumZoomChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingZoomLimits) return;
+        var minimum = NormalizeZoomPercent(args.NewValue, _minimumZoom * 100d);
+        var maximum = _maximumZoom * 100d;
+        if (minimum > maximum) maximum = minimum;
+        SetZoomLimits(minimum, maximum);
+    }
+
+    private void OnMaximumZoomChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingZoomLimits) return;
+        var minimum = _minimumZoom * 100d;
+        var maximum = NormalizeZoomPercent(args.NewValue, _maximumZoom * 100d);
+        if (maximum < minimum) minimum = maximum;
+        SetZoomLimits(minimum, maximum);
+    }
+
+    private void SetZoomLimits(double minimumPercent, double maximumPercent)
+    {
+        minimumPercent = NormalizeZoomPercent(minimumPercent, 8);
+        maximumPercent = NormalizeZoomPercent(maximumPercent, 800);
+        if (minimumPercent > maximumPercent)
+            (minimumPercent, maximumPercent) = (maximumPercent, minimumPercent);
+
+        var center = new Point(_canvasWidth / 2d, _canvasHeight / 2d);
+        var pageAnchor = _page is null ? default : ScreenToPage(center);
+        _minimumZoom = minimumPercent / 100d;
+        _maximumZoom = maximumPercent / 100d;
+        _syncingZoomLimits = true;
+        MinimumZoomNumberBox.Value = minimumPercent;
+        MaximumZoomNumberBox.Value = maximumPercent;
+        _syncingZoomLimits = false;
+
+        var constrainedZoom = Math.Clamp(_zoom, _minimumZoom, _maximumZoom);
+        if (Math.Abs(constrainedZoom - _zoom) > 0.0001)
+        {
+            StopWheelZoomAnimation(resumeBackgroundWork: false);
+            if (_page is null) _zoom = constrainedZoom;
+            else ApplyZoomAtAnchor(constrainedZoom, pageAnchor, center);
+            UpdateZoomText(showIndicator: true);
+            InvalidateCanvas();
+        }
+        ScheduleUserPreferencesSave();
+        StatusText.Text = $"Zoom range • {minimumPercent:0}%–{maximumPercent:0}%";
     }
 
     private void OnInkSliderValueChanged(object sender, RangeBaseValueChangedEventArgs e)
@@ -6243,7 +6438,7 @@ public sealed partial class MainPage : Page
                 Tool = InkToolKind.Highlighter,
                 Color = _highlighterColor,
                 Width = Math.Max(12, (float)StrokeWidthSlider.Value * 3),
-                Opacity = 0.34f,
+                Opacity = 0.60f,
                 PressureEnabled = false,
                 PressureSensitivity = 0,
                 Smoothing = 0.8f
@@ -7820,7 +8015,7 @@ public sealed partial class MainPage : Page
                 Tool = InkToolKind.Highlighter,
                 Color = _highlighterColor,
                 Width = Math.Max(12, (float)StrokeWidthSlider.Value * 3),
-                Opacity = _presetOpacity ?? 0.34f,
+                Opacity = _presetOpacity ?? 0.60f,
                 PressureEnabled = false,
                 PressureSensitivity = 0,
                 Smoothing = _presetSmoothing ?? 0.8f
@@ -7834,9 +8029,7 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private ShapeKind SelectedShapeKind() =>
-        ShapePicker.SelectedItem is ComboBoxItem { Tag: string value } &&
-        Enum.TryParse<ShapeKind>(value, out var shape) ? shape : ShapeKind.Rectangle;
+    private ShapeKind SelectedShapeKind() => _selectedShapeKind;
 
     private static bool IsCornerHandle(TransformHandle handle) => handle is TransformHandle.TopLeft or
         TransformHandle.TopRight or TransformHandle.BottomRight or TransformHandle.BottomLeft;
@@ -7896,7 +8089,9 @@ public sealed partial class MainPage : Page
             PenColor = _penColor,
             HighlighterColor = _highlighterColor,
             HighlighterStraightLine = HighlighterStraightCheckBox.IsChecked == true,
-            TemporaryGridSize = _temporaryGridSize
+            TemporaryGridSize = _temporaryGridSize,
+            MinimumZoomPercent = _minimumZoom * 100d,
+            MaximumZoomPercent = _maximumZoom * 100d
         };
         await PersistUserPreferencesAsync("Saved settings");
     }
@@ -8541,6 +8736,9 @@ public sealed partial class MainPage : Page
     private static RectD NormalizeRect(PointD start, PointD end) => new(
         Math.Min(start.X, end.X), Math.Min(start.Y, end.Y),
         Math.Max(1, Math.Abs(end.X - start.X)), Math.Max(1, Math.Abs(end.Y - start.Y)));
+
+    private static double NormalizeZoomPercent(double value, double fallback) =>
+        Math.Clamp(Math.Round(double.IsFinite(value) ? value : fallback), 8, 800);
 
     private static Color ParseColor(string value, float opacity = 1)
     {

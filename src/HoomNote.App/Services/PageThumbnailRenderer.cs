@@ -248,15 +248,16 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         if (shape.FillColor is { Length: > 0 } fill)
         {
             var fillColor = ParseColor(fill);
-            if (shape.Shape == ShapeKind.Ellipse)
+            if (shape.Shape is ShapeKind.Circle or ShapeKind.Ellipse)
                 session.FillEllipse((float)bounds.Center.X, (float)bounds.Center.Y,
                     (float)(bounds.Width / 2), (float)(bounds.Height / 2), fillColor);
-            else if (shape.Shape is ShapeKind.Rectangle or ShapeKind.RoundedRectangle)
+            else if (shape.Shape is ShapeKind.Square or ShapeKind.Rectangle or ShapeKind.RoundedRectangle)
                 session.FillRectangle((float)bounds.X, (float)bounds.Y, (float)bounds.Width,
                     (float)bounds.Height, fillColor);
         }
         switch (shape.Shape)
         {
+            case ShapeKind.Circle:
             case ShapeKind.Ellipse:
                 session.DrawEllipse((float)bounds.Center.X, (float)bounds.Center.Y,
                     (float)(bounds.Width / 2), (float)(bounds.Height / 2), color, shape.StrokeWidth);
@@ -302,6 +303,15 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
                 {
                     var next = vertices[(index + 1) % vertices.Length];
                     session.DrawLine(vertices[index].ToVector2(), next.ToVector2(), color, shape.StrokeWidth);
+                }
+                break;
+            case ShapeKind.Star:
+                var starPoints = ShapeGeometry.StarPoints(bounds);
+                for (var index = 0; index < starPoints.Count; index++)
+                {
+                    var next = starPoints[(index + 1) % starPoints.Count];
+                    session.DrawLine(starPoints[index].ToVector2(), next.ToVector2(), color,
+                        shape.StrokeWidth, roundStyle);
                 }
                 break;
             default:

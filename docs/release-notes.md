@@ -1,12 +1,13 @@
-# HoomNote 0.7.22
+# HoomNote 0.7.25
 
-- Closing the final notebook tab now leaves a clean zero-tab workspace.
-- Opening or switching to a notebook no longer expands its folder path. Click
-  the already-active tab to reveal it in the library.
-- Moving notebooks in unrelated folders preserves the exact expanded/collapsed
-  tree state.
-- Imported PDFs retain selectable Unicode words and source word geometry.
-  Drag over text with the Select tool, then press Ctrl+C to copy real text.
-- PDF page switches no longer flash a loading banner across the canvas.
-- Finger contacts always remain navigation-only: one finger pans, while PDF
-  text selection requires a pen/stylus or genuine mouse input.
+- Swipe vertically from the invisible touch strip at the right edge of the
+  canvas to move between notebook pages. Pinch remains dedicated to zoom.
+- Set persistent minimum and maximum zoom percentages from Settings. The range
+  applies consistently to touch pinch, mouse-wheel zoom, and fit-to-page.
+- The default highlighter is now pure yellow (`#FFFF00`) with substantially
+  stronger contrast on imported documents and light paper.
+- Selecting the Shape tool now exposes a compact, non-blocking shape picker.
+  True squares, true circles, and vector stars are available alongside the
+  existing manual shape choices.
+- Samsung Notes images now follow the archive's media metadata order, fixing
+  unrelated image pixels appearing in otherwise correct placements.

@@ -99,7 +99,53 @@ public enum ShapeKind
     Ellipse,
     Arrow,
     Triangle,
-    Diamond
+    Diamond,
+    // Keep new values appended: ShapeKind is stored numerically in existing documents.
+    Square,
+    Circle,
+    Star
+}
+
+public static class ShapeGeometry
+{
+    public static bool HasFixedAspectRatio(ShapeKind shape) =>
+        shape is ShapeKind.Square or ShapeKind.Circle;
+
+    public static RectD BoundsFromDrag(PointD start, PointD end, ShapeKind shape)
+    {
+        if (!HasFixedAspectRatio(shape))
+            return new RectD(
+                Math.Min(start.X, end.X),
+                Math.Min(start.Y, end.Y),
+                Math.Max(1, Math.Abs(end.X - start.X)),
+                Math.Max(1, Math.Abs(end.Y - start.Y)));
+
+        var size = Math.Max(1, Math.Max(Math.Abs(end.X - start.X), Math.Abs(end.Y - start.Y)));
+        return new RectD(
+            end.X >= start.X ? start.X : start.X - size,
+            end.Y >= start.Y ? start.Y : start.Y - size,
+            size,
+            size);
+    }
+
+    public static IReadOnlyList<PointD> StarPoints(RectD bounds)
+    {
+        const int pointCount = 10;
+        const double innerRadiusRatio = 0.45;
+        var points = new PointD[pointCount];
+        var outerRadiusX = bounds.Width / 2d;
+        var outerRadiusY = bounds.Height / 2d;
+        for (var index = 0; index < pointCount; index++)
+        {
+            var inner = index % 2 == 1;
+            var angle = -Math.PI / 2d + index * Math.PI / 5d;
+            var radiusScale = inner ? innerRadiusRatio : 1d;
+            points[index] = new PointD(
+                bounds.Center.X + Math.Cos(angle) * outerRadiusX * radiusScale,
+                bounds.Center.Y + Math.Sin(angle) * outerRadiusY * radiusScale);
+        }
+        return points;
+    }
 }
 
 public sealed record ShapeObject : CanvasObject

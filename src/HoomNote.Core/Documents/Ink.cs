@@ -45,7 +45,7 @@ public sealed record InkStyle
         // Pen and pencil are opaque pigments. Alpha accumulation changes their selected color
         // wherever strokes overlap; only the highlighter intentionally uses translucent ink.
         Opacity = Tool == InkToolKind.Highlighter
-            ? Math.Clamp(float.IsFinite(Opacity) ? Opacity : 0.34f, 0.02f, 1f)
+            ? Math.Clamp(float.IsFinite(Opacity) ? Opacity : 0.60f, 0.02f, 1f)
             : 1f,
         PressureSensitivity = Math.Clamp(float.IsFinite(PressureSensitivity) ? PressureSensitivity : 0.85f, 0f, 1f),
         Smoothing = Math.Clamp(float.IsFinite(Smoothing) ? Smoothing : 0.72f, 0f, 1f)

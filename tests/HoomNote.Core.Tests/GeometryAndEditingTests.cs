@@ -81,6 +81,17 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void RightEdgeTouchStripRoutesVerticalDragToPageNavigation()
+    {
+        Assert.False(TouchInputPolicy.ShouldBeginPageScroll(947, 1_000));
+        Assert.True(TouchInputPolicy.ShouldBeginPageScroll(948, 1_000));
+        Assert.Equal(0, TouchInputPolicy.PageScrollSteps(-71));
+        Assert.Equal(1, TouchInputPolicy.PageScrollSteps(-72));
+        Assert.Equal(2, TouchInputPolicy.PageScrollSteps(-150));
+        Assert.Equal(-1, TouchInputPolicy.PageScrollSteps(72));
+    }
+
+    [Fact]
     public void TwoFingerPinch_IgnoresCentroidTranslationWhenSpreadIsUnchanged()
     {
         var stationary = TouchViewportMath.PinchOnly(
@@ -121,6 +132,19 @@ public sealed class GeometryAndEditingTests
     {
         var result = TouchViewportMath.Pinch(1, scale, new PointD(0, 0), new PointD(0, 0),
             new SizeD(800, 1_000), new SizeD(1_200, 900));
+
+        Assert.Equal(expectedZoom, result.Zoom, 4);
+    }
+
+    [Theory]
+    [InlineData(0.01, 0.25)]
+    [InlineData(100, 3)]
+    public void TouchPinch_UsesConfiguredZoomLimits(double scale, double expectedZoom)
+    {
+        var result = TouchViewportMath.PinchOnly(
+            1, scale, new PointD(0, 0), new PointD(0, 0), new PointD(0, 0),
+            new SizeD(800, 1_000), new SizeD(1_200, 900),
+            minimumZoom: 0.25, maximumZoom: 3);
 
         Assert.Equal(expectedZoom, result.Zoom, 4);
     }
@@ -601,6 +625,28 @@ public sealed class GeometryAndEditingTests
             .ToArray();
 
         Assert.Null(ShapeRecognizer.RecognizeDetailed(points));
+    }
+
+    [Fact]
+    public void ShapeGeometry_CreatesConstrainedSquareCircleAndFiniteStar()
+    {
+        var square = ShapeGeometry.BoundsFromDrag(new PointD(20, 30), new PointD(80, 65), ShapeKind.Square);
+        var circle = ShapeGeometry.BoundsFromDrag(new PointD(80, 65), new PointD(20, 30), ShapeKind.Circle);
+
+        Assert.Equal(square.Width, square.Height);
+        Assert.Equal(circle.Width, circle.Height);
+        Assert.Equal(60, square.Width);
+        Assert.Equal(60, circle.Width);
+
+        var star = ShapeGeometry.StarPoints(new RectD(10, 20, 80, 80));
+        Assert.Equal(10, star.Count);
+        Assert.All(star, point =>
+        {
+            Assert.True(double.IsFinite(point.X));
+            Assert.True(double.IsFinite(point.Y));
+            Assert.InRange(point.X, 10, 90);
+            Assert.InRange(point.Y, 20, 100);
+        });
     }
 
     [Fact]

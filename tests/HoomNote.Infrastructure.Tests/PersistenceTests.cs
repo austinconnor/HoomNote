@@ -495,6 +495,13 @@ public sealed class PersistenceTests : IAsyncLifetime
             {
                 var images = result.Pages.SelectMany(page => page.Objects).OfType<ImageObject>().ToArray();
                 Assert.Equal(13, images.Length);
+                using var archive = ZipFile.OpenRead(source);
+                var expectedImageNames = archive.Entries
+                    .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
+                                    Path.GetExtension(entry.FullName).Equals(".png", StringComparison.OrdinalIgnoreCase))
+                    .Select(entry => Path.GetFileNameWithoutExtension(entry.FullName))
+                    .ToArray();
+                Assert.Equal(expectedImageNames, images.Select(image => image.AltText));
                 Assert.All(images, image =>
                 {
                     Assert.False(image.IsLocked);
@@ -533,6 +540,8 @@ public sealed class PersistenceTests : IAsyncLifetime
             HighlighterColor = "#FFCE56",
             HighlighterStraightLine = true,
             TemporaryGridSize = 47.5,
+            MinimumZoomPercent = 25,
+            MaximumZoomPercent = 450,
             ToolbarPresets = [new ToolbarPresetPreference
             {
                 Tool = "Highlighter", Color = "#FFCE56", Width = 8,
@@ -561,6 +570,8 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#FFCE56", loaded.HighlighterColor);
         Assert.True(loaded.HighlighterStraightLine);
         Assert.Equal(47.5, loaded.TemporaryGridSize);
+        Assert.Equal(25, loaded.MinimumZoomPercent);
+        Assert.Equal(450, loaded.MaximumZoomPercent);
         Assert.Equal(UserPreferences.CurrentVersion, loaded.Version);
         var preset = Assert.Single(loaded.ToolbarPresets);
         Assert.Equal("Highlighter", preset.Tool);
@@ -589,6 +600,25 @@ public sealed class PersistenceTests : IAsyncLifetime
         var recoloredChild = Assert.Single(recolored.NotebookFolders, item => item.Id == childFolder.Id);
         Assert.Equal(folder.Id, recoloredChild.ParentId);
         Assert.Equal("#F05D7A", recoloredChild.Color);
+    }
+
+    [Fact]
+    public async Task UserSettings_MigratesOnlyLegacyBuiltInHighlighterYellow()
+    {
+        var legacyPath = Path.Combine(_root, "legacy-highlighter.json");
+        await File.WriteAllTextAsync(legacyPath, """{"version":7,"highlighterColor":"#FFCE56"}""");
+
+        var migrated = await new LocalUserSettingsStore(legacyPath).LoadAsync();
+
+        Assert.Equal("#FFFF00", migrated.HighlighterColor);
+        Assert.Equal(UserPreferences.CurrentVersion, migrated.Version);
+
+        var customPath = Path.Combine(_root, "legacy-custom-highlighter.json");
+        await File.WriteAllTextAsync(customPath, """{"version":7,"highlighterColor":"#72FF88"}""");
+
+        var custom = await new LocalUserSettingsStore(customPath).LoadAsync();
+
+        Assert.Equal("#72FF88", custom.HighlighterColor);
     }
 
     [Fact]

@@ -43,11 +43,11 @@ internal static class SamsungNotesImportParser
             throw new InvalidDataException("This Samsung Notes file does not contain any readable .page records.");
 
         var documentPaperColor = ReadDocumentPaperColor(archive);
-        var mediaEntries = archive.Entries
-            .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
-                            IsSupportedImageExtension(Path.GetExtension(entry.FullName)))
-            .OrderBy(entry => MediaOrdinal(entry.FullName))
-            .ToArray();
+        // Image objects are serialized in the same sequence as the bitmap records in
+        // mediaInfo.dat. The numeric filename prefix is a global media id, not a placement
+        // ordinal: sorting by it assigns perfectly valid, but unrelated, pixels to each image.
+        // Prefer Samsung's metadata order and retain ZIP order as a compatibility fallback.
+        var mediaEntries = OrderedImageEntries(archive);
         var pages = new List<NotePage>(entries.Length);
         var imagePlacements = new List<SamsungImagePlacement>();
         var nextMediaIndex = 0;
@@ -223,13 +223,58 @@ internal static class SamsungNotesImportParser
     private static bool IsSupportedImageExtension(string extension) => extension.ToLowerInvariant() is
         ".png" or ".jpg" or ".jpeg" or ".webp" or ".bmp";
 
-    private static int MediaOrdinal(string fullName)
+    private static ZipArchiveEntry[] OrderedImageEntries(ZipArchive archive)
     {
-        var fileName = Path.GetFileName(fullName);
-        var separator = fileName.IndexOf('@');
-        return separator > 0 && int.TryParse(fileName.AsSpan(0, separator), out var ordinal)
-            ? ordinal
-            : int.MaxValue;
+        var archiveImages = archive.Entries
+            .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
+                            IsSupportedImageExtension(Path.GetExtension(entry.FullName)))
+            .ToArray();
+        var byName = archiveImages.ToDictionary(
+            entry => Path.GetFileName(entry.FullName),
+            StringComparer.OrdinalIgnoreCase);
+        var ordered = new List<ZipArchiveEntry>(archiveImages.Length);
+        var included = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var metadata = archive.GetEntry("media/mediaInfo.dat");
+        if (metadata is { Length: > 0 and <= MaximumEntryBytes })
+        {
+            using var input = metadata.Open();
+            using var memory = new MemoryStream((int)Math.Min(metadata.Length, int.MaxValue));
+            input.CopyTo(memory);
+            foreach (var fileName in ReadMediaFileNames(memory.ToArray()))
+            {
+                if (!byName.TryGetValue(fileName, out var entry) || !included.Add(fileName)) continue;
+                ordered.Add(entry);
+            }
+        }
+
+        foreach (var entry in archiveImages)
+        {
+            var fileName = Path.GetFileName(entry.FullName);
+            if (included.Add(fileName)) ordered.Add(entry);
+        }
+        return [.. ordered];
+    }
+
+    private static IReadOnlyList<string> ReadMediaFileNames(ReadOnlySpan<byte> data)
+    {
+        // Each mediaInfo record contains [media id:u32][name length:u16][UTF-16LE name].
+        // Scanning for validated records tolerates the version-specific fields between them.
+        var names = new List<string>();
+        for (var offset = 0; offset + 8 <= data.Length; offset++)
+        {
+            var characterCount = ReadUInt16(data, offset + 4);
+            if (characterCount is < 3 or > 512) continue;
+            var byteCount = checked(characterCount * 2);
+            if (offset + 6 > data.Length - byteCount) continue;
+            var fileName = System.Text.Encoding.Unicode.GetString(data.Slice(offset + 6, byteCount));
+            if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                !fileName.Contains('@') ||
+                !IsSupportedImageExtension(Path.GetExtension(fileName))) continue;
+            names.Add(fileName);
+            offset += 5 + byteCount;
+        }
+        return names;
     }
 
     private static InkStrokeObject? ParseStroke(ReadOnlySpan<byte> data, double scale, string defaultInkColor)

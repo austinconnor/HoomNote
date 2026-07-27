@@ -153,6 +153,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                 var shapePen = new XPen(ParseXColor(shape.StrokeColor), Dip(shape.StrokeWidth));
                 switch (shape.Shape)
                 {
+                    case ShapeKind.Circle:
                     case ShapeKind.Ellipse:
                         graphics.DrawEllipse(shapePen, Dip(rect.X), Dip(rect.Y), Dip(rect.Width), Dip(rect.Height));
                         break;
@@ -177,20 +178,24 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                         break;
                     case ShapeKind.Triangle:
                     case ShapeKind.Diamond:
-                        var localPoints = shape.Shape == ShapeKind.Triangle
-                            ? new[]
+                    case ShapeKind.Star:
+                        IReadOnlyList<PointD> localPoints = shape.Shape switch
+                        {
+                            ShapeKind.Triangle => new[]
                             {
                                 new PointD(shape.Bounds.Center.X, shape.Bounds.Top),
                                 new PointD(shape.Bounds.Right, shape.Bounds.Bottom),
                                 new PointD(shape.Bounds.Left, shape.Bounds.Bottom)
-                            }
-                            : new[]
+                            },
+                            ShapeKind.Diamond => new[]
                             {
                                 new PointD(shape.Bounds.Center.X, shape.Bounds.Top),
                                 new PointD(shape.Bounds.Right, shape.Bounds.Center.Y),
                                 new PointD(shape.Bounds.Center.X, shape.Bounds.Bottom),
                                 new PointD(shape.Bounds.Left, shape.Bounds.Center.Y)
-                            };
+                            },
+                            _ => ShapeGeometry.StarPoints(shape.Bounds)
+                        };
                         graphics.DrawPolygon(shapePen, localPoints.Select(canvasObject.Transform.Apply)
                             .Select(point => new XPoint(Dip(point.X), Dip(point.Y))).ToArray());
                         break;
@@ -276,6 +281,8 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                     var style = $"fill=\"none\" stroke=\"{Escape(shape.StrokeColor)}\" stroke-width=\"{shape.StrokeWidth.ToString(CultureInfo.InvariantCulture)}\" transform=\"{transform}\"";
                     var shapeElement = shape.Shape switch
                     {
+                        ShapeKind.Circle => FormattableString.Invariant(
+                            $"<ellipse cx=\"{shape.Bounds.Center.X}\" cy=\"{shape.Bounds.Center.Y}\" rx=\"{shape.Bounds.Width / 2}\" ry=\"{shape.Bounds.Height / 2}\" {style}/>") ,
                         ShapeKind.Ellipse => FormattableString.Invariant(
                             $"<ellipse cx=\"{shape.Bounds.Center.X}\" cy=\"{shape.Bounds.Center.Y}\" rx=\"{shape.Bounds.Width / 2}\" ry=\"{shape.Bounds.Height / 2}\" {style}/>") ,
                         ShapeKind.Line => FormattableString.Invariant(
@@ -285,6 +292,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                             $"<polygon points=\"{shape.Bounds.Center.X},{shape.Bounds.Top} {shape.Bounds.Right},{shape.Bounds.Bottom} {shape.Bounds.Left},{shape.Bounds.Bottom}\" {style}/>") ,
                         ShapeKind.Diamond => FormattableString.Invariant(
                             $"<polygon points=\"{shape.Bounds.Center.X},{shape.Bounds.Top} {shape.Bounds.Right},{shape.Bounds.Center.Y} {shape.Bounds.Center.X},{shape.Bounds.Bottom} {shape.Bounds.Left},{shape.Bounds.Center.Y}\" {style}/>") ,
+                        ShapeKind.Star => BuildSvgPolygon(ShapeGeometry.StarPoints(shape.Bounds), style),
                         ShapeKind.RoundedRectangle => FormattableString.Invariant(
                             $"<rect x=\"{shape.Bounds.X}\" y=\"{shape.Bounds.Y}\" width=\"{shape.Bounds.Width}\" height=\"{shape.Bounds.Height}\" rx=\"12\" ry=\"12\" {style}/>") ,
                         _ => FormattableString.Invariant(
@@ -352,6 +360,12 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
             end.Y - Math.Sin(angle + 0.55) * head);
         return FormattableString.Invariant(
             $"<path d=\"M {start.X} {start.Y} L {end.X} {end.Y} M {end.X} {end.Y} L {first.X} {first.Y} M {end.X} {end.Y} L {second.X} {second.Y}\" {style}/>");
+    }
+
+    private static string BuildSvgPolygon(IEnumerable<PointD> points, string style)
+    {
+        var pointList = string.Join(" ", points.Select(point => FormattableString.Invariant($"{point.X},{point.Y}")));
+        return $"<polygon points=\"{pointList}\" {style}/>";
     }
 
     private static RectD Normalize(PointD left, PointD right) => new(

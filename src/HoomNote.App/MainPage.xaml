@@ -113,6 +113,42 @@
                             </MenuFlyout>
                         </Button.Flyout>
                     </Button>
+                    <Button x:Name="ShapeChoiceButton"
+                            Style="{StaticResource HoomNoteToolbarButtonStyle}"
+                            Width="86" Padding="7,4" Visibility="Collapsed"
+                            ToolTipService.ToolTip="Choose shape">
+                        <StackPanel Orientation="Horizontal" Spacing="5">
+                            <PathIcon Data="{StaticResource IconShapes}" />
+                            <TextBlock x:Name="ShapeChoiceLabel" Text="Square"
+                                       FontSize="11" VerticalAlignment="Center" />
+                            <FontIcon Glyph="&#xE70D;" FontSize="9" VerticalAlignment="Center" />
+                        </StackPanel>
+                        <Button.Flyout>
+                            <MenuFlyout x:Name="ShapeChoiceFlyout">
+                                <RadioMenuFlyoutItem Text="Square" Tag="Square" GroupName="ShapeChoice"
+                                                   IsChecked="True" Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Circle" Tag="Circle" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Star" Tag="Star" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <MenuFlyoutSeparator />
+                                <RadioMenuFlyoutItem Text="Rectangle" Tag="Rectangle" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Ellipse" Tag="Ellipse" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Rounded rectangle" Tag="RoundedRectangle" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Line" Tag="Line" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Arrow" Tag="Arrow" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Triangle" Tag="Triangle" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                                <RadioMenuFlyoutItem Text="Diamond" Tag="Diamond" GroupName="ShapeChoice"
+                                                   Click="OnShapeChoiceClick" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
                     <Button x:Name="QuickInkSettingsButton" Style="{StaticResource HoomNoteToolbarButtonStyle}"
                             Width="40" Padding="3"
                             ToolTipService.ToolTip="Pen size and color">
@@ -187,7 +223,7 @@
                             <MenuFlyoutItem Text="Toggle pages" Tag="Pages" Click="OnSidebarToggleClick">
                                 <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconPages}" /></MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="Page and selection settings" Tag="Inspector" Click="OnSidebarToggleClick">
+                            <MenuFlyoutItem Text="Settings" Tag="Inspector" Click="OnSidebarToggleClick">
                                 <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconInspector}" /></MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
@@ -495,7 +531,33 @@
                 <ScrollViewer HorizontalScrollMode="Disabled" HorizontalScrollBarVisibility="Disabled"
                               VerticalScrollBarVisibility="Auto">
                     <StackPanel Padding="16,14" Spacing="14">
-                        <TextBlock Text="PAGE &amp; SELECTION" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <TextBlock Text="SETTINGS" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <TextBlock Text="View" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Minimum zoom (%)" FontSize="11"
+                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                            <TextBlock Grid.Column="1" Text="Maximum zoom (%)" FontSize="11"
+                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                            <NumberBox x:Name="MinimumZoomNumberBox" Grid.Row="1"
+                                       Minimum="8" Maximum="800" SmallChange="5" LargeChange="25"
+                                       Value="8" SpinButtonPlacementMode="Compact" />
+                            <NumberBox x:Name="MaximumZoomNumberBox" Grid.Row="1" Grid.Column="1"
+                                       Minimum="8" Maximum="800" SmallChange="25" LargeChange="100"
+                                       Value="800" SpinButtonPlacementMode="Compact" />
+                        </Grid>
+                        <TextBlock Text="Applies to touch pinch and mouse-wheel zoom."
+                                   FontSize="10" TextWrapping="Wrap"
+                                   Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        <Border Height="1" Background="{StaticResource HoomNoteBorderBrush}" />
+                        <TextBlock Text="Page" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                         <TextBlock Text="Page style" FontSize="12" Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                         <ComboBox x:Name="TemplatePicker" HorizontalAlignment="Stretch" SelectionChanged="OnTemplateChanged" SelectedIndex="1">
                             <ComboBoxItem Tag="Blank" Content="Blank" />
@@ -540,7 +602,11 @@
                             </StackPanel>
                         </Border>
                         <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" />
-                        <ComboBox x:Name="ShapePicker" Header="Shape tool" SelectedIndex="0" HorizontalAlignment="Stretch">
+                        <ComboBox x:Name="ShapePicker" Header="Shape tool" SelectedIndex="0"
+                                  HorizontalAlignment="Stretch">
+                            <ComboBoxItem Tag="Square" Content="Square" />
+                            <ComboBoxItem Tag="Circle" Content="Circle" />
+                            <ComboBoxItem Tag="Star" Content="Star" />
                             <ComboBoxItem Tag="Rectangle" Content="Rectangle" />
                             <ComboBoxItem Tag="RoundedRectangle" Content="Rounded rectangle" />
                             <ComboBoxItem Tag="Ellipse" Content="Ellipse" />

@@ -6,14 +6,16 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 7;
+    public const int CurrentVersion = 9;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
     public string PenColor { get; init; } = "#111111";
-    public string HighlighterColor { get; init; } = "#FFCE56";
+    public string HighlighterColor { get; init; } = "#FFFF00";
     public bool HighlighterStraightLine { get; init; }
     public double TemporaryGridSize { get; init; } = 32;
+    public double MinimumZoomPercent { get; init; } = 8;
+    public double MaximumZoomPercent { get; init; } = 800;
     public bool TabsCollapsed { get; init; }
     public List<ToolbarPresetPreference> ToolbarPresets { get; init; } = [];
     public List<NotebookFolderPreference> NotebookFolders { get; init; } = [];
@@ -59,6 +61,9 @@ public sealed class LocalUserSettingsStore(string settingsPath)
                 16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             var loaded = await JsonSerializer.DeserializeAsync<UserPreferences>(input, HoomNoteJson.Options, cancellationToken)
                          ?? new UserPreferences();
+            if (loaded.Version < 8 &&
+                string.Equals(loaded.HighlighterColor, "#FFCE56", StringComparison.OrdinalIgnoreCase))
+                loaded = loaded with { HighlighterColor = "#FFFF00" };
             return loaded with { Version = UserPreferences.CurrentVersion };
         }
         catch (JsonException)
