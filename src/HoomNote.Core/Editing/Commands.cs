@@ -103,6 +103,53 @@ public sealed class DeletePageCommand(Guid pageId) : IDocumentCommand
     }
 }
 
+public sealed class AddPageCommand(NotePage page, int index, Guid? sectionId = null) : IDocumentCommand
+{
+    public string Description => "Add page";
+
+    public void Execute(HoomNoteDocument document)
+    {
+        if (document.Pages.Any(item => item.Id == page.Id)) return;
+        var targetIndex = Math.Clamp(index, 0, document.Pages.Count);
+        document.Pages.Insert(targetIndex, page);
+        var section = sectionId is { } id
+            ? document.Sections.FirstOrDefault(item => item.Id == id)
+            : document.Sections.FirstOrDefault();
+        if (section is null || section.PageIds.Contains(page.Id)) return;
+        section.PageIds.Insert(Math.Clamp(targetIndex, 0, section.PageIds.Count), page.Id);
+    }
+
+    public void Undo(HoomNoteDocument document)
+    {
+        document.Pages.RemoveAll(item => item.Id == page.Id);
+        foreach (var section in document.Sections) section.PageIds.RemoveAll(id => id == page.Id);
+    }
+}
+
+public sealed class ReorderPagesCommand(
+    IReadOnlyList<Guid> before,
+    IReadOnlyList<Guid> after) : IDocumentCommand
+{
+    public string Description => "Reorder pages";
+
+    public void Execute(HoomNoteDocument document) => Apply(document, after);
+    public void Undo(HoomNoteDocument document) => Apply(document, before);
+
+    private static void Apply(HoomNoteDocument document, IReadOnlyList<Guid> order)
+    {
+        var pages = document.Pages.ToDictionary(page => page.Id);
+        if (order.Count != pages.Count || order.Any(id => !pages.ContainsKey(id))) return;
+        document.Pages.Clear();
+        document.Pages.AddRange(order.Select(id => pages[id]));
+        foreach (var section in document.Sections)
+        {
+            var sectionPageIds = section.PageIds.ToHashSet();
+            section.PageIds.Clear();
+            section.PageIds.AddRange(order.Where(sectionPageIds.Contains));
+        }
+    }
+}
+
 // A bounded history is essential for vector documents: segment erasure can legitimately retain
 // both the pre-split and post-split point arrays. Three hundred steps is still a deep interactive
 // undo stack without allowing an edited imported notebook to pin hundreds of MB indefinitely.

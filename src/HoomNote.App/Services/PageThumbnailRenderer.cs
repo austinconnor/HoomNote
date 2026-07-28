@@ -80,15 +80,24 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
                 session.Transform = Matrix3x2.CreateScale(scale) *
                                     Matrix3x2.CreateTranslation((float)offsetX, (float)offsetY);
 
-                DrawBackground(session, page);
-                DrawImportedPage(session, page, importedPage);
-                // Page.Objects is kept in z-order by document commands and persistence. Avoid
-                // sorting dense pages again for every thumbnail refresh.
-                foreach (var canvasObject in page.Objects)
+                var visibleObjects = page.Objects.Where(canvasObject => !canvasObject.IsHidden).ToArray();
+                if (visibleObjects.Any(IsCommittedHighlighter))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (canvasObject.IsHidden) continue;
-                    DrawObject(session, canvasObject, imageBitmaps, roundStyle);
+                    DrawPageWithCommittedHighlighters(
+                        session, page, importedPage, visibleObjects, imageBitmaps, roundStyle,
+                        cancellationToken);
+                }
+                else
+                {
+                    DrawBackground(session, page);
+                    DrawImportedPage(session, page, importedPage);
+                    // Page.Objects is kept in z-order by document commands and persistence.
+                    // Avoid sorting dense pages again for every thumbnail refresh.
+                    foreach (var canvasObject in visibleObjects)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        DrawObject(session, canvasObject, imageBitmaps, roundStyle);
+                    }
                 }
             }
 
@@ -152,15 +161,87 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         session.Transform = previous;
     }
 
-    private static void DrawObject(CanvasDrawingSession session, CanvasObject canvasObject,
-        IReadOnlyDictionary<string, CanvasBitmap> images, CanvasStrokeStyle roundStyle)
+    private static void DrawPageWithCommittedHighlighters(
+        CanvasDrawingSession session,
+        NotePage page,
+        CanvasBitmap? importedPage,
+        IReadOnlyList<CanvasObject> objects,
+        IReadOnlyDictionary<string, CanvasBitmap> images,
+        CanvasStrokeStyle roundStyle,
+        CancellationToken cancellationToken)
+    {
+        DrawBackground(session, page);
+        DrawImportedPage(session, page, importedPage);
+
+        // Committed marker ink is one stable source-over layer beneath authored
+        // ink, text, shapes, and images. This avoids paper-dependent Min/Add hue
+        // shifts and keeps thumbnails identical to the main canvas.
+        foreach (var canvasObject in objects.Where(IsCommittedHighlighter))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            DrawCommittedObject(session, page, canvasObject, images, roundStyle);
+        }
+        foreach (var canvasObject in objects.Where(item => !IsCommittedHighlighter(item)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            DrawCommittedObject(session, page, canvasObject, images, roundStyle);
+        }
+    }
+
+    private static bool IsCommittedHighlighter(CanvasObject canvasObject) =>
+        canvasObject is InkStrokeObject { Style.Tool: InkToolKind.Highlighter };
+
+    private static void DrawCommittedObject(
+        CanvasDrawingSession session,
+        NotePage page,
+        CanvasObject canvasObject,
+        IReadOnlyDictionary<string, CanvasBitmap> images,
+        CanvasStrokeStyle roundStyle)
+    {
+        if (canvasObject is InkStrokeObject { Style.Tool: InkToolKind.Highlighter } highlighter)
+            DrawObject(session, highlighter, images, roundStyle,
+                HighContrastHighlighterColor(page, highlighter.Style));
+        else
+            DrawObject(session, canvasObject, images, roundStyle);
+    }
+
+    private static bool IsDarkColor(string value)
+    {
+        var color = ParseColor(value);
+        var luminance = (0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B) / 255d;
+        return luminance < 0.45;
+    }
+
+    private static Color HighContrastHighlighterColor(NotePage page, InkStyle style)
+    {
+        var normalized = style.Normalize();
+        var marker = ParseColor(normalized.Color);
+        var paper = ParseColor(page.Template.PaperColor);
+        var paperDistanceFromWhite =
+            (Math.Abs(255 - paper.R) + Math.Abs(255 - paper.G) + Math.Abs(255 - paper.B)) / (255d * 3d);
+        var minimumOpacity = page.ImportedLayer is not null || paperDistanceFromWhite > 0.12
+            ? 0.68f
+            : 0.45f;
+        return Color.FromArgb(
+            (byte)Math.Round(255 * Math.Max(normalized.Opacity, minimumOpacity)),
+            marker.R,
+            marker.G,
+            marker.B);
+    }
+
+    private static void DrawObject(
+        CanvasDrawingSession session,
+        CanvasObject canvasObject,
+        IReadOnlyDictionary<string, CanvasBitmap> images,
+        CanvasStrokeStyle roundStyle,
+        Color? inkColorOverride = null)
     {
         var previous = session.Transform;
         session.Transform = canvasObject.Transform.ToMatrix() * previous;
         switch (canvasObject)
         {
             case InkStrokeObject ink:
-                DrawInk(session, ink, roundStyle);
+                DrawInk(session, ink, roundStyle, inkColorOverride);
                 break;
             case RichTextObject text:
                 DrawText(session, text);
@@ -176,11 +257,15 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         session.Transform = previous;
     }
 
-    private static void DrawInk(CanvasDrawingSession session, InkStrokeObject stroke, CanvasStrokeStyle roundStyle)
+    private static void DrawInk(
+        CanvasDrawingSession session,
+        InkStrokeObject stroke,
+        CanvasStrokeStyle roundStyle,
+        Color? colorOverride = null)
     {
         if (stroke.Points.Count == 0) return;
         var style = stroke.Style.Normalize();
-        var color = ParseColor(style.Color, style.Opacity);
+        var color = colorOverride ?? ParseColor(style.Color, style.Opacity);
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
             var points = StrokeOutlineBuilder.FitCenterline(stroke);

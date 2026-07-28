@@ -13,10 +13,6 @@ public static class ShapeRecognizer
         IReadOnlyList<InkPoint> samples,
         bool deliberateGesture = true)
     {
-        // Geometry alone cannot distinguish a handwritten "o" from a deliberately drawn
-        // circle. The editor supplies intent (a short terminal hold) so ordinary writing is
-        // never replaced merely because one letter happened to be geometrically regular.
-        if (!deliberateGesture) return null;
         if (samples.Count < 2) return null;
         var first = samples[0].Position;
         var previous = first;
@@ -47,6 +43,10 @@ public static class ShapeRecognizer
         // and the other supported shapes remain available through the explicit shape tool so
         // ordinary handwriting is never unexpectedly replaced.
         if (!closed) return null;
+        // A terminal hold always signals intent. Without a hold, accept only a large closed
+        // gesture: this makes normal pen-drawn diagrams snap immediately while keeping
+        // handwriting-sized loops (especially "o") as ink.
+        if (!deliberateGesture && Math.Min(bounds.Width, bounds.Height) < 60) return null;
 
         if (bounds.Width < 14 || bounds.Height < 14) return null;
         var rectangleError = 0d;

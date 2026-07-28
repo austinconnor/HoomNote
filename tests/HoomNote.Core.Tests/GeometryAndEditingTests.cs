@@ -298,6 +298,49 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void AddPageCommand_InsertsAfterCurrentPageAndRestoresOnUndo()
+    {
+        var document = HoomNoteDocument.Create("Notebook", DocumentKind.PagedNotebook);
+        var first = new NotePage { Title = "First" };
+        var third = new NotePage { Title = "Third" };
+        document.Pages.AddRange([first, third]);
+        document.Sections[0].PageIds.AddRange([first.Id, third.Id]);
+        var inserted = new NotePage { Title = "Second" };
+        var history = new CommandHistory();
+
+        history.Execute(new AddPageCommand(inserted, 1, document.Sections[0].Id), document);
+
+        Assert.Equal(["First", "Second", "Third"], document.Pages.Select(page => page.Title));
+        Assert.Equal([first.Id, inserted.Id, third.Id], document.Sections[0].PageIds);
+        history.Undo(document);
+        Assert.Equal(["First", "Third"], document.Pages.Select(page => page.Title));
+    }
+
+    [Fact]
+    public void ReorderPagesCommand_ReordersPagesAndSectionIdsAndUndoes()
+    {
+        var document = HoomNoteDocument.Create("Notebook", DocumentKind.PagedNotebook);
+        var pages = new[]
+        {
+            new NotePage { Title = "One" },
+            new NotePage { Title = "Two" },
+            new NotePage { Title = "Three" }
+        };
+        document.Pages.AddRange(pages);
+        document.Sections[0].PageIds.AddRange(pages.Select(page => page.Id));
+        var before = pages.Select(page => page.Id).ToArray();
+        var after = new[] { pages[2].Id, pages[0].Id, pages[1].Id };
+        var history = new CommandHistory();
+
+        history.Execute(new ReorderPagesCommand(before, after), document);
+
+        Assert.Equal(["Three", "One", "Two"], document.Pages.Select(page => page.Title));
+        Assert.Equal(after, document.Sections[0].PageIds);
+        history.Undo(document);
+        Assert.Equal(["One", "Two", "Three"], document.Pages.Select(page => page.Title));
+    }
+
+    [Fact]
     public void Create_PagedNotebookStartsWithNoPages()
     {
         var document = HoomNoteDocument.Create("Empty notebook");
@@ -324,6 +367,8 @@ public sealed class GeometryAndEditingTests
         Assert.Equal(1f, new InkStyle { Tool = InkToolKind.Pen, Opacity = 0.3f }.Normalize().Opacity);
         Assert.Equal(1f, new InkStyle { Tool = InkToolKind.Pencil, Opacity = 0.3f }.Normalize().Opacity);
         Assert.Equal(0.3f, new InkStyle { Tool = InkToolKind.Highlighter, Opacity = 0.3f }.Normalize().Opacity);
+        Assert.Equal(InkStyle.DefaultHighlighterOpacity,
+            new InkStyle { Tool = InkToolKind.Highlighter, Opacity = float.NaN }.Normalize().Opacity);
     }
 
     [Fact]
@@ -601,6 +646,8 @@ public sealed class GeometryAndEditingTests
             .ToArray();
 
         Assert.Equal(ShapeKind.Ellipse, ShapeRecognizer.Recognize(points));
+        Assert.Equal(ShapeKind.Ellipse,
+            ShapeRecognizer.RecognizeDetailed(points, deliberateGesture: false)?.Kind);
     }
 
     [Fact]

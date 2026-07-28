@@ -192,6 +192,31 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         return document;
     }
 
+    public async Task<NotePage?> LoadFirstPageAsync(
+        Guid documentId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            SELECT page_json, recognized_text, recognized_regions_json, updated_utc
+            FROM pages
+            WHERE document_id = $id
+            ORDER BY ordinal
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$id", documentId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var page = Deserialize<NotePage>(reader.GetString(0));
+        if (page is null) return null;
+        page.RecognizedText = reader.GetString(1);
+        page.RecognizedRegions =
+            Deserialize<List<RecognizedTextRegion>>(reader.GetString(2)) ?? [];
+        if (DateTimeOffset.TryParse(reader.GetString(3), out var updatedAt))
+            page.UpdatedAt = updatedAt;
+        return page;
+    }
+
     public async Task SaveAsync(HoomNoteDocument document, CancellationToken cancellationToken = default)
     {
         document.UpdatedAt = DateTimeOffset.UtcNow;

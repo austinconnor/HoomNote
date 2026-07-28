@@ -27,6 +27,11 @@ internal static class SamsungNotesImportParser
         IReadOnlyList<string> Warnings);
     private sealed record DecodedStroke(List<PointD> Points, int PointCount, int DeltaOffset);
     private sealed record StrokeMetadata(string Color, float Width, int MarkerOffset);
+    private sealed record ShapeStyle(
+        string Color,
+        float Width,
+        bool HasBeginArrow,
+        bool HasEndArrow);
     private sealed record SamsungImagePlacement(int PageIndex, RectD Bounds, int ZIndex, int MediaIndex);
 
     public static Task<ParsedSamsungNote> ParseAsync(string path, CancellationToken cancellationToken) =>
@@ -91,6 +96,9 @@ internal static class SamsungNotesImportParser
         };
         if (images.Count > 0)
             warnings.Add($"{images.Count} placed Samsung image(s) were imported at their original page positions.");
+        var shapeCount = pages.SelectMany(page => page.Objects).OfType<ShapeObject>().Count();
+        if (shapeCount > 0)
+            warnings.Add($"{shapeCount} Samsung shape(s) and line(s) were imported as editable vectors.");
         if (skippedObjects > 0)
             warnings.Add($"{skippedObjects} unsupported Samsung object(s), such as placed media or typed content, were skipped safely.");
         return new ParsedSamsungNote(pages, images, warnings);
@@ -112,7 +120,7 @@ internal static class SamsungNotesImportParser
         var targetHeight = Math.Clamp(sourceHeight * scale, 256, 16384);
         var paperColor = ReadPagePaperColor(data, baseOffset) ?? documentPaperColor ?? "#FFFDF8";
         var defaultInkColor = IsDarkColor(paperColor) ? "#F5F5F5" : "#111111";
-        var strokes = ReadStrokes(data, baseOffset, scale, defaultInkColor, pageIndex, imagePlacements,
+        var objects = ReadObjects(data, baseOffset, scale, defaultInkColor, pageIndex, imagePlacements,
             ref nextMediaIndex, ref skippedObjects);
 
         return new NotePage
@@ -120,14 +128,14 @@ internal static class SamsungNotesImportParser
             Title = $"Page {pageNumber}",
             Size = new SizeD(targetWidth, targetHeight),
             Template = PageTemplate.For(PageTemplateKind.Blank) with { PaperColor = paperColor },
-            Objects = [.. strokes]
+            Objects = [.. objects]
         };
     }
 
-    private static List<InkStrokeObject> ReadStrokes(byte[] data, int position, double scale, string defaultInkColor,
+    private static List<CanvasObject> ReadObjects(byte[] data, int position, double scale, string defaultInkColor,
         int pageIndex, List<SamsungImagePlacement> imagePlacements, ref int nextMediaIndex, ref int skippedObjects)
     {
-        var strokes = new List<InkStrokeObject>();
+        var objects = new List<CanvasObject>();
         try
         {
             var layerCount = ReadUInt16(data, position);
@@ -169,8 +177,18 @@ internal static class SamsungNotesImportParser
                     if (StrokeObjectTypes.Contains(type))
                     {
                         var stroke = ParseStroke(data.AsSpan(position, size), scale, defaultInkColor);
-                        if (stroke is not null) strokes.Add(stroke with { ZIndex = checked((int)objectIndex) });
+                        if (stroke is not null) objects.Add(stroke with { ZIndex = checked((int)objectIndex) });
                         else skippedObjects++;
+                    }
+                    else if (type == 7 &&
+                             ParseShape(data.AsSpan(position, size), scale, defaultInkColor) is { } shape)
+                    {
+                        objects.Add(shape with { ZIndex = checked((int)objectIndex) });
+                    }
+                    else if (type == 8 &&
+                             ParseLine(data.AsSpan(position, size), scale, defaultInkColor) is { } line)
+                    {
+                        objects.Add(line with { ZIndex = checked((int)objectIndex) });
                     }
                     else if (type == 3 && ParseObjectBounds(data.AsSpan(position, size), scale) is { } bounds)
                     {
@@ -188,7 +206,7 @@ internal static class SamsungNotesImportParser
         {
             throw new InvalidDataException("A Samsung Notes page record is malformed or unsupported.", exception);
         }
-        return strokes;
+        return objects;
     }
 
     private static RectD? ParseObjectBounds(ReadOnlySpan<byte> data, double scale)
@@ -218,6 +236,284 @@ internal static class SamsungNotesImportParser
         {
             return null;
         }
+    }
+
+    // Samsung shapes are a sequence of three inclusive length-prefixed records:
+    // ObjectBase (type 0), ShapeBase (type 6), then Shape/Line (type 7/8).
+    // This mirrors the independently documented MIT sdocx2pdf parser while decoding only
+    // the stable geometry/style fields HoomNote can represent without flattening.
+    private static ShapeObject? ParseShape(
+        ReadOnlySpan<byte> data,
+        double scale,
+        string defaultColor)
+    {
+        try
+        {
+            if (!TryReadObjectBlock(data, 0, 0, out var shapeBaseOffset) ||
+                !TryReadObjectBlock(data, shapeBaseOffset, 6, out var shapeOffset) ||
+                !TryReadObjectBlock(data, shapeOffset, 7, out _))
+                return null;
+            if (!TryReadFlagBlock(data, shapeOffset, out var fixedOffset, out _, out var fieldFlags))
+                return null;
+
+            Ensure(data, fixedOffset, 40);
+            var samsungShapeType = ReadUInt32(data, fixedOffset);
+            var originalBounds = ReadRect(data, fixedOffset + 4, scale);
+            if (originalBounds is null) return null;
+            var bounds = originalBounds.Value;
+            var shapeKind = samsungShapeType switch
+            {
+                1 => Math.Abs(bounds.Width - bounds.Height) <= Math.Max(bounds.Width, bounds.Height) * 0.03
+                    ? ShapeKind.Circle
+                    : ShapeKind.Ellipse,
+                2 or 3 => ShapeKind.Triangle,
+                4 => ShapeKind.Rectangle,
+                5 => ShapeKind.RoundedRectangle,
+                8 => ShapeKind.Diamond,
+                12 or 13 or 14 or 15 or 16 => ShapeKind.Star,
+                _ => (ShapeKind?)null
+            };
+            if (shapeKind is null) return null;
+
+            var style = ParseShapeStyle(data, shapeBaseOffset, scale, defaultColor);
+            var fill = TryReadSolidShapeFill(data, shapeOffset, fieldFlags);
+            var originalAngle = ReadSingle(data, fixedOffset + 36);
+            var transform = float.IsFinite(originalAngle) && Math.Abs(originalAngle) > 0.001f &&
+                            Math.Abs(originalAngle) <= 360
+                ? Transform2D.Rotation(originalAngle * Math.PI / 180d, bounds.Center)
+                : Transform2D.Identity;
+            return new ShapeObject
+            {
+                Shape = shapeKind.Value,
+                Bounds = bounds,
+                StrokeColor = style.Color,
+                StrokeWidth = style.Width,
+                FillColor = fill,
+                Transform = transform
+            };
+        }
+        catch (Exception exception) when (exception is ArgumentOutOfRangeException or
+                                          OverflowException or EndOfStreamException)
+        {
+            return null;
+        }
+    }
+
+    private static ShapeObject? ParseLine(
+        ReadOnlySpan<byte> data,
+        double scale,
+        string defaultColor)
+    {
+        try
+        {
+            if (!TryReadObjectBlock(data, 0, 0, out var shapeBaseOffset) ||
+                !TryReadObjectBlock(data, shapeBaseOffset, 6, out var lineOffset) ||
+                !TryReadObjectBlock(data, lineOffset, 8, out _) ||
+                !TryReadFlagBlock(data, lineOffset, out var position, out _, out _))
+                return null;
+
+            Ensure(data, position, 3);
+            position += 2; // connector type and initial direction
+            var controlPointCount = data[position++];
+            position = checked(position + controlPointCount * 16);
+            Ensure(data, position, 32);
+            var start = new PointD(
+                ReadDouble(data, position) * scale,
+                ReadDouble(data, position + 8) * scale);
+            var end = new PointD(
+                ReadDouble(data, position + 16) * scale,
+                ReadDouble(data, position + 24) * scale);
+            if (!double.IsFinite(start.X) || !double.IsFinite(start.Y) ||
+                !double.IsFinite(end.X) || !double.IsFinite(end.Y)) return null;
+
+            var style = ParseShapeStyle(data, shapeBaseOffset, scale, defaultColor);
+            if (style.HasBeginArrow && !style.HasEndArrow)
+                (start, end) = (end, start);
+            var bounds = RectD.FromPoints([start, end]);
+            return new ShapeObject
+            {
+                Shape = style.HasBeginArrow || style.HasEndArrow
+                    ? ShapeKind.Arrow
+                    : ShapeKind.Line,
+                Bounds = bounds,
+                StartPoint = start,
+                EndPoint = end,
+                StrokeColor = style.Color,
+                StrokeWidth = style.Width
+            };
+        }
+        catch (Exception exception) when (exception is ArgumentOutOfRangeException or
+                                          OverflowException or EndOfStreamException)
+        {
+            return null;
+        }
+    }
+
+    private static ShapeStyle ParseShapeStyle(
+        ReadOnlySpan<byte> data,
+        int shapeBaseOffset,
+        double scale,
+        string defaultColor)
+    {
+        var color = defaultColor;
+        var width = 2f;
+        var beginArrow = false;
+        var endArrow = false;
+        if (!TryReadFlagBlock(data, shapeBaseOffset, out _, out var flexOffset, out var fieldFlags) ||
+            flexOffset < 0)
+            return new ShapeStyle(color, Math.Clamp(width * (float)scale, 0.25f, 96f), false, false);
+
+        var position = flexOffset;
+        if ((fieldFlags & (1u << 2)) != 0)
+        {
+            Ensure(data, position, 4);
+            var payloadLength = checked((int)ReadUInt32(data, position));
+            Ensure(data, position + 4, payloadLength);
+            var effectPosition = position + 4;
+            if (TryReadVariableBitfield(data, ref effectPosition, out _) &&
+                effectPosition + 5 <= position + 4 + payloadLength)
+            {
+                effectPosition++; // colour type
+                color = BgraToRgb(data.Slice(effectPosition, 4), defaultColor) ?? defaultColor;
+            }
+            position = checked(position + 4 + payloadLength);
+        }
+        if ((fieldFlags & (1u << 3)) != 0)
+        {
+            Ensure(data, position, 16);
+            var payloadLength = ReadUInt32(data, position);
+            if (payloadLength == 12)
+            {
+                var parsedWidth = ReadSingle(data, position + 4);
+                if (float.IsFinite(parsedWidth) && parsedWidth is >= 0.05f and <= 96f)
+                    width = parsedWidth;
+                beginArrow = data[position + 12] != 0;
+                endArrow = data[position + 14] != 0;
+            }
+        }
+        return new ShapeStyle(
+            color,
+            Math.Clamp(width * (float)scale, 0.25f, 96f),
+            beginArrow,
+            endArrow);
+    }
+
+    private static string? TryReadSolidShapeFill(
+        ReadOnlySpan<byte> data,
+        int shapeOffset,
+        uint fieldFlags)
+    {
+        if ((fieldFlags & (1u << 5)) == 0 ||
+            !TryReadFlagBlock(data, shapeOffset, out _, out var flexOffset, out _) ||
+            flexOffset < 0)
+            return null;
+
+        // Fields 1-4 precede fill and have fixed sizes. Field 0 is rich text with a
+        // variable schema; if present, leave the fill unset rather than risk misalignment.
+        if ((fieldFlags & 1) != 0) return null;
+        var position = flexOffset;
+        if ((fieldFlags & (1u << 1)) != 0) position += 1;
+        for (var bit = 2; bit <= 4; bit++)
+            if ((fieldFlags & (1u << bit)) != 0) position += 4;
+
+        Ensure(data, position, 5);
+        var effectType = data[position + 4];
+        if (effectType != 1) return null;
+        position += 5;
+        if (!TryReadVariableBitfield(data, ref position, out _)) return null;
+        Ensure(data, position, 4);
+        return BgraToRgb(data.Slice(position, 4), fallback: null);
+    }
+
+    private static bool TryReadObjectBlock(
+        ReadOnlySpan<byte> data,
+        int offset,
+        ushort expectedType,
+        out int nextOffset)
+    {
+        nextOffset = 0;
+        if (offset < 0 || offset > data.Length - 6) return false;
+        var size = ReadUInt32(data, offset);
+        if (size < 6 || size > int.MaxValue || offset > data.Length - (int)size ||
+            ReadUInt16(data, offset + 4) != expectedType)
+            return false;
+        nextOffset = checked(offset + (int)size);
+        return true;
+    }
+
+    private static bool TryReadFlagBlock(
+        ReadOnlySpan<byte> data,
+        int objectOffset,
+        out int fixedOffset,
+        out int flexOffset,
+        out uint fieldFlags)
+    {
+        fixedOffset = 0;
+        flexOffset = -1;
+        fieldFlags = 0;
+        try
+        {
+            var position = checked(objectOffset + 6);
+            Ensure(data, position, 4);
+            var relativeFlexOffset = ReadUInt32(data, position);
+            position += 4;
+            if (!TryReadVariableBitfield(data, ref position, out _) ||
+                !TryReadVariableBitfield(data, ref position, out fieldFlags))
+                return false;
+            fixedOffset = position;
+            if (relativeFlexOffset > 0)
+            {
+                if (relativeFlexOffset > int.MaxValue) return false;
+                flexOffset = checked(objectOffset + (int)relativeFlexOffset);
+                if (flexOffset < fixedOffset || flexOffset > data.Length) return false;
+            }
+            return true;
+        }
+        catch (Exception exception) when (exception is ArgumentOutOfRangeException or
+                                          OverflowException or EndOfStreamException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadVariableBitfield(
+        ReadOnlySpan<byte> data,
+        ref int position,
+        out uint value)
+    {
+        value = 0;
+        Ensure(data, position, 1);
+        var byteCount = data[position++];
+        if (byteCount > 4) return false;
+        Ensure(data, position, byteCount);
+        for (var index = 0; index < byteCount; index++)
+            value |= (uint)data[position + index] << (index * 8);
+        position += byteCount;
+        return true;
+    }
+
+    private static RectD? ReadRect(ReadOnlySpan<byte> data, int position, double scale)
+    {
+        Ensure(data, position, 32);
+        var left = ReadDouble(data, position);
+        var top = ReadDouble(data, position + 8);
+        var right = ReadDouble(data, position + 16);
+        var bottom = ReadDouble(data, position + 24);
+        if (!double.IsFinite(left) || !double.IsFinite(top) ||
+            !double.IsFinite(right) || !double.IsFinite(bottom) ||
+            right <= left || bottom <= top)
+            return null;
+        return new RectD(
+            left * scale,
+            top * scale,
+            (right - left) * scale,
+            (bottom - top) * scale);
+    }
+
+    private static string? BgraToRgb(ReadOnlySpan<byte> bgra, string? fallback)
+    {
+        if (bgra.Length < 4 || bgra[3] == 0) return fallback;
+        return $"#{bgra[2]:X2}{bgra[1]:X2}{bgra[0]:X2}";
     }
 
     private static bool IsSupportedImageExtension(string extension) => extension.ToLowerInvariant() is
@@ -517,5 +813,11 @@ internal static class SamsungNotesImportParser
     {
         Ensure(data, offset, 8);
         return BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data[offset..]));
+    }
+
+    private static float ReadSingle(ReadOnlySpan<byte> data, int offset)
+    {
+        Ensure(data, offset, 4);
+        return BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data[offset..]));
     }
 }

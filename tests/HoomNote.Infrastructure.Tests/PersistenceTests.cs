@@ -68,6 +68,27 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_LoadFirstPageReturnsOnlyTheLeadingPage()
+    {
+        await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "first-page.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Visual library");
+        var first = AddPage(document);
+        first.Title = "Cover";
+        first.RecognizedText = "cover text";
+        var second = AddPage(document);
+        second.Title = "Details";
+        await repository.SaveAsync(document);
+
+        var loaded = await repository.LoadFirstPageAsync(document.Id);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(first.Id, loaded.Id);
+        Assert.Equal("Cover", loaded.Title);
+        Assert.Equal("cover text", loaded.RecognizedText);
+    }
+
+    [Fact]
     public async Task Repository_DeleteRemovesNotebookAndSearchRows()
     {
         await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "delete-library.db"));
@@ -493,6 +514,14 @@ public sealed class PersistenceTests : IAsyncLifetime
             Assert.Equal(item.Paper, result.Pages[0].Template.PaperColor);
             if (item.File == "samsung_note.sdocx")
             {
+                var shapes = result.Pages.SelectMany(page => page.Objects).OfType<ShapeObject>().ToArray();
+                var shape = Assert.Single(shapes);
+                Assert.Equal(ShapeKind.Rectangle, shape.Shape);
+                Assert.Equal("#0D0088", shape.StrokeColor);
+                Assert.InRange(shape.StrokeWidth, 0.25f, 4f);
+                Assert.True(shape.Bounds.Width > 0);
+                Assert.True(shape.Bounds.Height > 0);
+
                 var images = result.Pages.SelectMany(page => page.Objects).OfType<ImageObject>().ToArray();
                 Assert.Equal(13, images.Length);
                 using var archive = ZipFile.OpenRead(source);
@@ -540,6 +569,9 @@ public sealed class PersistenceTests : IAsyncLifetime
             HighlighterColor = "#FFCE56",
             HighlighterStraightLine = true,
             TemporaryGridSize = 47.5,
+            StyleBrushSize = 64,
+            EraserSize = 28,
+            ScaleStrokeWidthsOnTransform = true,
             MinimumZoomPercent = 25,
             MaximumZoomPercent = 450,
             ToolbarPresets = [new ToolbarPresetPreference
@@ -570,6 +602,9 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#FFCE56", loaded.HighlighterColor);
         Assert.True(loaded.HighlighterStraightLine);
         Assert.Equal(47.5, loaded.TemporaryGridSize);
+        Assert.Equal(64, loaded.StyleBrushSize);
+        Assert.Equal(28, loaded.EraserSize);
+        Assert.True(loaded.ScaleStrokeWidthsOnTransform);
         Assert.Equal(25, loaded.MinimumZoomPercent);
         Assert.Equal(450, loaded.MaximumZoomPercent);
         Assert.Equal(UserPreferences.CurrentVersion, loaded.Version);

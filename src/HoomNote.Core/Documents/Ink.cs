@@ -30,6 +30,8 @@ public readonly record struct InkPoint(
 
 public sealed record InkStyle
 {
+    public const float DefaultHighlighterOpacity = 0.45f;
+
     public InkToolKind Tool { get; init; } = InkToolKind.Pen;
     public string Color { get; init; } = "#111111";
     public float Width { get; init; } = 2.4f;
@@ -45,7 +47,7 @@ public sealed record InkStyle
         // Pen and pencil are opaque pigments. Alpha accumulation changes their selected color
         // wherever strokes overlap; only the highlighter intentionally uses translucent ink.
         Opacity = Tool == InkToolKind.Highlighter
-            ? Math.Clamp(float.IsFinite(Opacity) ? Opacity : 0.60f, 0.02f, 1f)
+            ? Math.Clamp(float.IsFinite(Opacity) ? Opacity : DefaultHighlighterOpacity, 0.02f, 1f)
             : 1f,
         PressureSensitivity = Math.Clamp(float.IsFinite(PressureSensitivity) ? PressureSensitivity : 0.85f, 0f, 1f),
         Smoothing = Math.Clamp(float.IsFinite(Smoothing) ? Smoothing : 0.72f, 0f, 1f)

@@ -6,7 +6,7 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 9;
+    public const int CurrentVersion = 11;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
@@ -14,6 +14,9 @@ public sealed record UserPreferences
     public string HighlighterColor { get; init; } = "#FFFF00";
     public bool HighlighterStraightLine { get; init; }
     public double TemporaryGridSize { get; init; } = 32;
+    public double StyleBrushSize { get; init; } = 36;
+    public double EraserSize { get; init; } = 12;
+    public bool ScaleStrokeWidthsOnTransform { get; init; }
     public double MinimumZoomPercent { get; init; } = 8;
     public double MaximumZoomPercent { get; init; } = 800;
     public bool TabsCollapsed { get; init; }

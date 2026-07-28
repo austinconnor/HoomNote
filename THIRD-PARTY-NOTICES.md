@@ -15,3 +15,10 @@ Material Design Icons is maintained by Pictogrammers and licensed under the
 HoomNote uses [PdfPig](https://github.com/UglyToad/PdfPig) to extract Unicode
 text and word geometry from imported PDF pages. PdfPig is licensed under the
 [Apache License 2.0](https://github.com/UglyToad/PdfPig/blob/master/LICENSE).
+
+## sdocx2pdf format research
+
+HoomNote's Samsung Notes shape and line decoder is based in part on the
+independently documented binary structures in
+[squ1dd13/sdocx2pdf](https://github.com/squ1dd13/sdocx2pdf).
+sdocx2pdf is licensed under the [MIT License](https://github.com/squ1dd13/sdocx2pdf/blob/master/LICENSE).
