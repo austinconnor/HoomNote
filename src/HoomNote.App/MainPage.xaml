@@ -122,7 +122,7 @@
                     <Button x:Name="StyleBrushSettingsButton"
                             Style="{StaticResource HoomNoteToolbarButtonStyle}"
                             Width="42" Padding="3" Visibility="Collapsed"
-                            ToolTipService.ToolTip="Style brush preset and size">
+                            ToolTipService.ToolTip="Style brush preset, stroke size, and coverage">
                         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="1">
                             <Border x:Name="StyleBrushColorSwatch" Width="15" Height="10" CornerRadius="3"
                                     Background="#111111" BorderBrush="#88FFFFFF" BorderThickness="1" />
@@ -144,6 +144,19 @@
                                                Text="Choose a saved pen preset."
                                                FontSize="10" TextWrapping="Wrap"
                                                Foreground="{StaticResource HoomNoteAccentBrush}" />
+                                    <TextBlock Text="Applied stroke size" FontSize="11"
+                                               Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="72" />
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="StyleStrokeWidthSlider" Minimum="0.1" Maximum="48"
+                                                Value="2.4" StepFrequency="0.1" VerticalAlignment="Center" />
+                                        <NumberBox x:Name="StyleStrokeWidthNumberBox" Grid.Column="1"
+                                                   Minimum="0.1" Maximum="48" SmallChange="0.1" LargeChange="1"
+                                                   Value="2.4" SpinButtonPlacementMode="Compact" />
+                                    </Grid>
                                     <Grid ColumnSpacing="6">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*" />
@@ -156,7 +169,7 @@
                                                       Content="Apply preset" Click="OnStyleModeClick"
                                                       HorizontalAlignment="Stretch" />
                                     </Grid>
-                                    <TextBlock Text="Brush size" FontSize="11"
+                                    <TextBlock Text="Brush coverage" FontSize="11"
                                                Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                                     <Grid ColumnSpacing="8">
                                         <Grid.ColumnDefinitions>
@@ -351,7 +364,12 @@
 
         <Border x:Name="NotebookTabBar" Grid.Row="0" Background="#0D0E10" BorderBrush="{StaticResource HoomNoteBorderBrush}" BorderThickness="0,0,0,1">
             <Grid>
-                <TabView x:Name="NotebookTabs" Height="28" Margin="6,0,100,0"
+                <Button x:Name="HomeLibraryButton" Width="30" Height="26" Margin="5,0,0,0"
+                        Padding="5" HorizontalAlignment="Left" VerticalAlignment="Center"
+                        Click="OnHomeLibraryButtonClick" ToolTipService.ToolTip="Home library">
+                    <PathIcon Data="{StaticResource IconLibrary}" />
+                </Button>
+                <TabView x:Name="NotebookTabs" Height="28" Margin="40,0,100,0"
                          VerticalAlignment="Center" IsAddTabButtonVisible="False" TabWidthMode="SizeToContent"
                          CanDragTabs="True" CanReorderTabs="True" AllowDropTabs="True"
                          SelectionChanged="OnNotebookTabSelectionChanged"
@@ -641,8 +659,10 @@
                         <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
                     <StackPanel MaxWidth="1040" HorizontalAlignment="Stretch" Spacing="4">
-                        <TextBlock Text="Your library" FontSize="26" FontWeight="SemiBold" />
-                        <TextBlock Text="Pick up where you left off or browse your notebooks."
+                        <TextBlock x:Name="HomeLibraryTitle" Text="Your library"
+                                   FontSize="26" FontWeight="SemiBold" />
+                        <TextBlock x:Name="HomeLibrarySubtitle"
+                                   Text="Browse folders first, then pick up a recently edited notebook."
                                    Foreground="{StaticResource HoomNoteMutedTextBrush}" />
                     </StackPanel>
                     <GridView x:Name="HomeLibraryGrid" Grid.Row="1" Margin="0,18,0,0"
@@ -688,7 +708,7 @@
                                         <Border CornerRadius="6" Background="#090A0C" BorderBrush="#2D3035"
                                                 BorderThickness="1">
                                             <Grid>
-                                                <FontIcon Glyph="&#xE8A5;" FontSize="30" Opacity="0.22"
+                                                <FontIcon Glyph="{Binding Glyph}" FontSize="30" Opacity="0.22"
                                                           Foreground="{Binding AccentBrush}" />
                                                 <Image Source="{Binding Thumbnail}" Stretch="Uniform" />
                                                 <ProgressRing Width="20" Height="20" IsActive="{Binding IsLoading}" />

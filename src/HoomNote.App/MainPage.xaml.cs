@@ -87,16 +87,41 @@ public sealed partial class MainPage : Page
         public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
     }
 
-    private sealed class HomeNotebookCard(DocumentSummary document) : INotifyPropertyChanged
+    private sealed class HomeNotebookCard : INotifyPropertyChanged
     {
         private BitmapImage? _thumbnail;
-        private bool _isLoading = true;
+        private bool _isLoading;
 
-        public Guid Id { get; } = document.Id;
-        public string Title { get; } = document.Title;
-        public string Metadata { get; } =
-            $"{document.PageCount} {(document.PageCount == 1 ? "page" : "pages")} • {document.UpdatedAt.LocalDateTime:g}";
-        public SolidColorBrush AccentBrush { get; } = new(ParseColor(document.Color));
+        public HomeNotebookCard(DocumentSummary document)
+        {
+            DocumentId = document.Id;
+            Title = document.Title;
+            Metadata =
+                $"{document.PageCount} {(document.PageCount == 1 ? "page" : "pages")} • {document.UpdatedAt.LocalDateTime:g}";
+            AccentBrush = new SolidColorBrush(ParseColor(document.Color));
+            _isLoading = true;
+        }
+
+        public HomeNotebookCard(
+            NotebookFolderPreference folder,
+            int childFolderCount,
+            int notebookCount)
+        {
+            FolderId = folder.Id;
+            Title = folder.Name;
+            Metadata = $"{childFolderCount} {(childFolderCount == 1 ? "folder" : "folders")} • " +
+                       $"{notebookCount} {(notebookCount == 1 ? "notebook" : "notebooks")}";
+            AccentBrush = new SolidColorBrush(ParseColor(folder.Color));
+        }
+
+        public Guid? DocumentId { get; }
+        public Guid? FolderId { get; }
+        public Guid Id => DocumentId ?? Guid.Empty;
+        public bool IsFolder => FolderId is not null;
+        public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
+        public string Title { get; }
+        public string Metadata { get; }
+        public SolidColorBrush AccentBrush { get; }
         public BitmapImage? Thumbnail
         {
             get => _thumbnail;
@@ -157,6 +182,7 @@ public sealed partial class MainPage : Page
     private readonly ObservableCollection<NotePage> _pages = [];
     private readonly ObservableCollection<SearchResult> _searchResults = [];
     private readonly ObservableCollection<HomeNotebookGroup> _homeLibraryGroups = [];
+    private Guid? _homeFolderId;
     private readonly Dictionary<Guid, CommandHistory> _documentHistories = [];
     private CommandHistory _history = new();
     private SpatialIndex _spatialIndex = new();
@@ -512,6 +538,8 @@ public sealed partial class MainPage : Page
         TemporaryGridSizeNumberBox.ValueChanged += OnTemporaryGridSizeNumberChanged;
         StyleBrushSizeSlider.ValueChanged += OnStyleBrushSizeChanged;
         StyleBrushSizeNumberBox.ValueChanged += OnStyleBrushSizeNumberChanged;
+        StyleStrokeWidthSlider.ValueChanged += OnStyleStrokeWidthChanged;
+        StyleStrokeWidthNumberBox.ValueChanged += OnStyleStrokeWidthNumberChanged;
         EraserSizeSlider.ValueChanged += OnEraserSizeChanged;
         EraserSizeNumberBox.ValueChanged += OnEraserSizeNumberChanged;
         MinimumZoomNumberBox.ValueChanged += OnMinimumZoomChanged;
@@ -774,13 +802,37 @@ public sealed partial class MainPage : Page
         _homeThumbnailLoads.Clear();
         _homeLibraryGroups.Clear();
 
-        var recent = _allDocuments
-            .OrderByDescending(document => document.UpdatedAt)
-            .ThenBy(document => document.Title, NotebookTitleComparer.Instance)
-            .Take(6)
-            .ToArray();
-        var recentIds = recent.Select(document => document.Id).ToHashSet();
-        if (recent.Length > 0)
+        var layout = HomeLibraryOrdering.Build(
+            _allDocuments,
+            _userPreferences.NotebookFolders,
+            _userPreferences.DocumentFolders,
+            _homeFolderId);
+        _homeFolderId = layout.CurrentFolderId;
+        var currentFolder = layout.CurrentFolderId is { } currentFolderId
+            ? _userPreferences.NotebookFolders.FirstOrDefault(folder => folder.Id == currentFolderId)
+            : null;
+        HomeLibraryTitle.Text = currentFolder?.Name ?? "Your library";
+        HomeLibrarySubtitle.Text = currentFolder is null
+            ? "Browse folders first, then pick up a recently edited notebook."
+            : "Open a subfolder or choose a notebook. Use Home to return to the main library.";
+
+        var childFolders = layout.ChildFolders;
+        if (childFolders.Count > 0)
+        {
+            var group = new HomeNotebookGroup("Folders");
+            foreach (var folder in childFolders)
+            {
+                var childFolderCount = _userPreferences.NotebookFolders.Count(item =>
+                    item.ParentId == folder.Id);
+                var notebookCount = _allDocuments.Count(document =>
+                    DocumentFolderId(document.Id) == folder.Id);
+                group.Add(new HomeNotebookCard(folder, childFolderCount, notebookCount));
+            }
+            _homeLibraryGroups.Add(group);
+        }
+
+        var recent = layout.RecentDocuments;
+        if (recent.Count > 0)
         {
             var group = new HomeNotebookGroup("Recently edited");
             foreach (var document in recent)
@@ -789,12 +841,8 @@ public sealed partial class MainPage : Page
             _homeLibraryGroups.Add(group);
         }
 
-        var remaining = _allDocuments
-            .Where(document => !recentIds.Contains(document.Id))
-            .OrderBy(document => document.Title, NotebookTitleComparer.Instance)
-            .ThenBy(document => document.Id)
-            .ToArray();
-        if (remaining.Length > 0)
+        var remaining = layout.RemainingDocuments;
+        if (remaining.Count > 0)
         {
             var group = new HomeNotebookGroup("All notebooks");
             foreach (var document in remaining)
@@ -809,7 +857,8 @@ public sealed partial class MainPage : Page
         ContainerContentChangingEventArgs args)
     {
         if (args.InRecycleQueue || args.Item is not HomeNotebookCard card ||
-            card.Thumbnail is not null || _homeThumbnailLoads.ContainsKey(card.Id)) return;
+            card.DocumentId is null || card.Thumbnail is not null ||
+            _homeThumbnailLoads.ContainsKey(card.Id)) return;
         var cancellation = new CancellationTokenSource();
         _homeThumbnailLoads[card.Id] = cancellation;
         _ = LoadHomeNotebookThumbnailAsync(card, cancellation);
@@ -821,11 +870,12 @@ public sealed partial class MainPage : Page
     {
         try
         {
-            if (_repository is null || _pageThumbnailRenderer is null) return;
+            if (_repository is null || _pageThumbnailRenderer is null ||
+                card.DocumentId is not { } documentId) return;
             await _homeThumbnailLoadGate.WaitAsync(cancellation.Token);
             try
             {
-                var page = await _repository.LoadFirstPageAsync(card.Id, cancellation.Token);
+                var page = await _repository.LoadFirstPageAsync(documentId, cancellation.Token);
                 if (page is null)
                 {
                     card.IsLoading = false;
@@ -888,8 +938,15 @@ public sealed partial class MainPage : Page
     private async void OnHomeNotebookClick(object sender, ItemClickEventArgs e)
     {
         if (e.ClickedItem is not HomeNotebookCard card) return;
-        await LoadDocumentAsync(card.Id);
-        SelectLibraryDocument(card.Id);
+        if (card.FolderId is { } folderId)
+        {
+            _homeFolderId = folderId;
+            RebuildHomeLibrary();
+            return;
+        }
+        if (card.DocumentId is not { } documentId) return;
+        await LoadDocumentAsync(documentId);
+        SelectLibraryDocument(documentId);
     }
 
     private string EffectiveDocumentColor(Guid documentId)
@@ -2114,6 +2171,43 @@ public sealed partial class MainPage : Page
         UpdateFolderActions();
         RebuildHomeLibrary();
         UpdateEmptyState();
+    }
+
+    private async void OnHomeLibraryButtonClick(object sender, RoutedEventArgs e)
+    {
+        _homeFolderId = null;
+        if (_document is null)
+        {
+            RebuildHomeLibrary();
+            UpdateEmptyState();
+            StatusText.Text = "Home library";
+            return;
+        }
+
+        try
+        {
+            CommitOrDiscardTextEditor();
+            await SaveNowAsync();
+            if (_document is null) return;
+            if (_page is not null) _tabPageSelections[_document.Id] = _page.Id;
+
+            _updatingTabs = true;
+            NotebookTabs.SelectedItem = null;
+            _updatingTabs = false;
+            _document = null;
+            _page = null;
+            _pages.Clear();
+            NotebookTitle.Text = "No notebook";
+            _hostWindow?.UpdateNotebookTitle(null);
+            SelectPage(null);
+            UpdateFolderActions();
+            await RefreshLibraryAsync();
+            StatusText.Text = "Home library";
+        }
+        catch (Exception exception)
+        {
+            ShowError("The home library could not be opened.", exception);
+        }
     }
 
     private async void OnNotebookTabSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -5354,8 +5448,8 @@ public sealed partial class MainPage : Page
                 ZIndex = NextZIndex()
             };
             _history.Execute(new AddObjectCommand(_page.Id, shape), _document);
+            RetainInkCommitPreview(shape, _editVersion + 1);
             OnDocumentChanged(recognizeInk: false, appendedObject: shape);
-            RetainInkCommitPreview(shape);
             return;
         }
         var style = _gestureInkStyle ?? CurrentInkStyle();
@@ -5369,14 +5463,14 @@ public sealed partial class MainPage : Page
             ZIndex = NextZIndex()
         };
         _history.Execute(new AddObjectCommand(_page.Id, stroke), _document);
+        RetainInkCommitPreview(stroke, _editVersion + 1);
         OnDocumentChanged(recognizeInk: true, appendedObject: stroke);
-        RetainInkCommitPreview(stroke);
     }
 
-    private void RetainInkCommitPreview(CanvasObject canvasObject)
+    private void RetainInkCommitPreview(CanvasObject canvasObject, int commitVersion)
     {
-        _pendingInkCommitPreviews.Add((canvasObject, _editVersion));
-        Volatile.Write(ref _inkPreviewCommitVersion, _editVersion);
+        _pendingInkCommitPreviews.Add((canvasObject, commitVersion));
+        Volatile.Write(ref _inkPreviewCommitVersion, commitVersion);
     }
 
     private static InkPoint SnapHighlighterEnd(InkPoint start, InkPoint end)
@@ -5410,8 +5504,8 @@ public sealed partial class MainPage : Page
             ZIndex = NextZIndex()
         };
         _history.Execute(new AddObjectCommand(_page.Id, shape), _document);
+        RetainInkCommitPreview(shape, _editVersion + 1);
         OnDocumentChanged(recognizeInk: false, appendedObject: shape);
-        RetainInkCommitPreview(shape);
     }
 
     private void ApplyRealtimeErase()
@@ -6580,7 +6674,7 @@ public sealed partial class MainPage : Page
         var narrowToolbar = e.NewSize.Width < 760;
         ToolbarOverflowActionsButton.Visibility = Visibility.Visible;
         AutosavedStatusBadge.Visibility = narrowToolbar ? Visibility.Collapsed : Visibility.Visible;
-        NotebookTabs.Margin = new Thickness(6, 0, narrowToolbar ? 6 : 100, 0);
+        NotebookTabs.Margin = new Thickness(40, 0, narrowToolbar ? 6 : 100, 0);
         PresetScrollViewer.MinWidth = narrowToolbar ? 72 : 120;
 
         var compact = e.NewSize.Width < 980 || e.NewSize.Height < 620;
@@ -6766,6 +6860,31 @@ public sealed partial class MainPage : Page
         SetStyleBrushSize(double.IsFinite(args.NewValue) ? args.NewValue : _styleBrushSize);
     }
 
+    private void OnStyleStrokeWidthChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_syncingStyleTool) return;
+        SetStyleStrokeWidth(e.NewValue);
+    }
+
+    private void OnStyleStrokeWidthNumberChanged(
+        NumberBox sender,
+        NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingStyleTool) return;
+        SetStyleStrokeWidth(double.IsFinite(args.NewValue) ? args.NewValue : _styleToolWidth);
+    }
+
+    private void SetStyleStrokeWidth(double requestedWidth)
+    {
+        _styleToolWidth = (float)Math.Clamp(Math.Round(requestedWidth, 1), 0.1, 48);
+        _activeStylePresetId = null;
+        _styleToolPickMode = false;
+        UpdateStyleToolUi();
+        RebuildStylePresetPicker();
+        StatusText.Text =
+            $"Style brush • {_styleToolColor} • {_styleToolWidth:0.#} pt • drag to apply";
+    }
+
     private void SetStyleBrushSize(double requestedSize)
     {
         _styleBrushSize = (float)Math.Clamp(Math.Round(requestedSize), 8, 120);
@@ -6818,9 +6937,11 @@ public sealed partial class MainPage : Page
         _syncingStyleTool = true;
         StyleBrushSizeSlider.Value = _styleBrushSize;
         StyleBrushSizeNumberBox.Value = _styleBrushSize;
+        StyleStrokeWidthSlider.Value = _styleToolWidth;
+        StyleStrokeWidthNumberBox.Value = _styleToolWidth;
         StyleBrushColorSwatch.Background = new SolidColorBrush(ParseColor(_styleToolColor));
         StyleBrushPresetSummary.Text = _activeStylePresetId is null
-            ? $"Sampled style • {_styleToolColor} • {_styleToolWidth:0.#} pt"
+            ? $"Current style • {_styleToolColor} • {_styleToolWidth:0.#} pt"
             : $"Preset • {_styleToolColor} • {_styleToolWidth:0.#} pt";
         _syncingStyleTool = false;
         UpdateStyleToolModeButtons();
