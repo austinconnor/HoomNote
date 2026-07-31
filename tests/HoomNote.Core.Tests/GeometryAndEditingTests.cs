@@ -1,6 +1,7 @@
 using System.Numerics;
 using HoomNote.Canvas.Geometry;
 using HoomNote.Canvas.Interaction;
+using HoomNote.Canvas.Rendering;
 using HoomNote.Canvas.Spatial;
 using HoomNote.Core.Documents;
 using HoomNote.Core.Editing;
@@ -367,8 +368,40 @@ public sealed class GeometryAndEditingTests
         Assert.Equal(1f, new InkStyle { Tool = InkToolKind.Pen, Opacity = 0.3f }.Normalize().Opacity);
         Assert.Equal(1f, new InkStyle { Tool = InkToolKind.Pencil, Opacity = 0.3f }.Normalize().Opacity);
         Assert.Equal(0.3f, new InkStyle { Tool = InkToolKind.Highlighter, Opacity = 0.3f }.Normalize().Opacity);
+        Assert.Equal(0.60f, InkStyle.DefaultHighlighterOpacity);
         Assert.Equal(InkStyle.DefaultHighlighterOpacity,
             new InkStyle { Tool = InkToolKind.Highlighter, Opacity = float.NaN }.Normalize().Opacity);
+    }
+
+    [Fact]
+    public void CanvasObjectRenderPolicy_PreservesAuthoredHighlighterOrder()
+    {
+        var handwriting = new InkStrokeObject
+        {
+            ZIndex = 10,
+            Points = [new InkPoint(0, 0), new InkPoint(10, 10)]
+        };
+        var highlighter = new InkStrokeObject
+        {
+            ZIndex = 11,
+            Style = new InkStyle
+            {
+                Tool = InkToolKind.Highlighter,
+                Opacity = InkStyle.DefaultHighlighterOpacity
+            },
+            Points = [new InkPoint(0, 5), new InkPoint(10, 5)]
+        };
+        var hidden = handwriting with { Id = Guid.NewGuid(), ZIndex = 12, IsHidden = true };
+
+        var rendered = CanvasObjectRenderPolicy.VisibleInAuthoredOrder(
+            [handwriting, highlighter, hidden]).ToArray();
+
+        Assert.Equal([handwriting.Id, highlighter.Id], rendered.Select(item => item.Id));
+        Assert.Equal(0.60f,
+            CanvasObjectRenderPolicy.SourceOverOpacity(
+                Assert.IsType<InkStrokeObject>(rendered[1]).Style));
+        Assert.Equal(0.42f, CanvasObjectRenderPolicy.SourceOverOpacity(
+            highlighter.Style with { Opacity = 0.42f }));
     }
 
     [Fact]

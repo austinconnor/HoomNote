@@ -2857,7 +2857,7 @@ public sealed partial class MainPage : Page
 
         foreach (var pending in _pendingInkCommitPreviews.OrderBy(item => item.Object.ZIndex))
             if (!pending.Object.IsHidden)
-                DrawCommittedObject(drawingSession, _page, pending.Object);
+                DrawObject(drawingSession, pending.Object);
 
         if (_activeInk.Count > 0 && _gestureTool is EditorTool.Pen or EditorTool.Highlighter)
         {
@@ -3032,8 +3032,8 @@ public sealed partial class MainPage : Page
             using (var batchSession = batch.CreateDrawingSession())
             {
                 for (var index = 0; index < OverlayBatchSize; index++)
-                    DrawCommittedObject(
-                        batchSession, page, _pageRenderOverlays[index], cacheInkGeometry: true);
+                    DrawObject(
+                        batchSession, _pageRenderOverlays[index], cacheInkGeometry: true);
             }
             _pageRenderOverlayBatches.Add(batch);
             _pageRenderOverlays.RemoveRange(0, OverlayBatchSize);
@@ -3057,7 +3057,7 @@ public sealed partial class MainPage : Page
         foreach (var appended in _pageRenderOverlays)
         {
             if (appended.IsHidden) continue;
-            DrawCommittedObject(drawingSession, page, appended, cacheInkGeometry: true);
+            DrawObject(drawingSession, appended, cacheInkGeometry: true);
         }
     }
 
@@ -3234,23 +3234,14 @@ public sealed partial class MainPage : Page
                     _visibleObjects.Add(canvasObject);
                 }
             }
-            var tileObjects = _visibleObjects
-                .Where(canvasObject => !canvasObject.IsHidden &&
-                                       _pageRenderCacheObjectIds.Contains(canvasObject.Id))
-                .ToArray();
-            if (tileObjects.Any(IsCommittedHighlighter))
-            {
-                DrawPageWithCommittedHighlighters(
-                    session, page, tileObjects, tileBounds, cacheInkGeometry: true);
-            }
-            else
-            {
-                DrawPageBackground(session, page, tileBounds);
-                DrawImportedLayer(session, page);
-                if (_temporaryGridVisible) DrawTemporaryGrid(session, page, tileBounds);
-                foreach (var canvasObject in tileObjects)
-                    DrawObject(session, canvasObject, cacheInkGeometry: true);
-            }
+            DrawPageBackground(session, page, tileBounds);
+            DrawImportedLayer(session, page);
+            if (_temporaryGridVisible) DrawTemporaryGrid(session, page, tileBounds);
+            var tileObjects = _visibleObjects.Where(canvasObject =>
+                _pageRenderCacheObjectIds.Contains(canvasObject.Id));
+            foreach (var canvasObject in
+                     CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects))
+                DrawObject(session, canvasObject, cacheInkGeometry: true);
         }
 
         _navigationTiles[key] = tile;
@@ -3306,18 +3297,11 @@ public sealed partial class MainPage : Page
             }
         }
         PruneStrokeGeometryCacheToViewport();
-        var visibleObjects = _visibleObjects.Where(canvasObject => !canvasObject.IsHidden).ToArray();
-        if (visibleObjects.Any(IsCommittedHighlighter))
-        {
-            DrawPageWithCommittedHighlighters(
-                drawingSession, page, visibleObjects, visibleBounds, cacheInkGeometry: true);
-            return;
-        }
-
         DrawPageBackground(drawingSession, page, visibleBounds);
         DrawImportedLayer(drawingSession, page);
         if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, visibleBounds);
-        foreach (var canvasObject in visibleObjects)
+        foreach (var canvasObject in
+                 CanvasObjectRenderPolicy.VisibleInAuthoredOrder(_visibleObjects))
             DrawObject(drawingSession, canvasObject, cacheInkGeometry: true);
     }
 
@@ -3406,7 +3390,7 @@ public sealed partial class MainPage : Page
             session.Transform = Matrix3x2.CreateScale((float)NavigationSnapshotScale(page));
             foreach (var batch in _pageRenderOverlayBatches) session.DrawImage(batch);
             foreach (var overlay in _pageRenderOverlays)
-                if (!overlay.IsHidden) DrawCommittedObject(session, page, overlay);
+                if (!overlay.IsHidden) DrawObject(session, overlay);
         }
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
@@ -3435,13 +3419,6 @@ public sealed partial class MainPage : Page
                             _textPreview?.Id == canvasObject.Id ? _textPreview : canvasObject)
                 .ToArray()
             : page.Objects;
-        if (renderedObjects.Any(IsCommittedHighlighter))
-        {
-            DrawPageWithCommittedHighlighters(
-                drawingSession, page, renderedObjects, visibleBounds: null, cacheInkGeometry: false);
-            return;
-        }
-
         DrawPageBackground(drawingSession, page);
         DrawImportedLayer(drawingSession, page);
         // The temporary grid sits above paper/PDF backgrounds but below all authored content.
@@ -3449,78 +3426,16 @@ public sealed partial class MainPage : Page
         if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page);
         // Document commands maintain z-order, so sorting this dense list again whenever a
         // cache is recorded is redundant O(n log n) work on the UI thread.
-        foreach (var canvasObject in renderedObjects)
-        {
-            if (canvasObject.IsHidden) continue;
+        foreach (var canvasObject in
+                 CanvasObjectRenderPolicy.VisibleInAuthoredOrder(renderedObjects))
             DrawObject(drawingSession, canvasObject);
-        }
-    }
-
-    private void DrawPageWithCommittedHighlighters(
-        CanvasDrawingSession drawingSession,
-        NotePage page,
-        IReadOnlyList<CanvasObject> objects,
-        RectD? visibleBounds,
-        bool cacheInkGeometry)
-    {
-        DrawPageBackground(drawingSession, page, visibleBounds);
-        DrawImportedLayer(drawingSession, page);
-        if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, visibleBounds);
-
-        // Keep marker ink in one source-over layer beneath normal authored content.
-        // The former paper-dependent Min/Add path changed colors across cached,
-        // tiled, and live rendering and visibly flashed whenever zoom changed.
-        foreach (var canvasObject in objects.Where(IsCommittedHighlighter))
-        {
-            if (canvasObject.IsHidden) continue;
-            DrawCommittedObject(drawingSession, page, canvasObject, cacheInkGeometry);
-        }
-        foreach (var canvasObject in objects.Where(item => !IsCommittedHighlighter(item)))
-        {
-            if (canvasObject.IsHidden) continue;
-            DrawCommittedObject(drawingSession, page, canvasObject, cacheInkGeometry);
-        }
-    }
-
-    private static bool IsCommittedHighlighter(CanvasObject canvasObject) =>
-        canvasObject is InkStrokeObject { Style.Tool: InkToolKind.Highlighter };
-
-    private void DrawCommittedObject(
-        CanvasDrawingSession drawingSession,
-        NotePage page,
-        CanvasObject canvasObject,
-        bool cacheInkGeometry = false)
-    {
-        if (canvasObject is InkStrokeObject { Style.Tool: InkToolKind.Highlighter } highlighter)
-            DrawObject(drawingSession, highlighter, cacheInkGeometry,
-                HighContrastHighlighterColor(page, highlighter.Style));
-        else
-            DrawObject(drawingSession, canvasObject, cacheInkGeometry);
-    }
-
-    private static Color HighContrastHighlighterColor(NotePage page, InkStyle style)
-    {
-        var normalized = style.Normalize();
-        var marker = ParseColor(normalized.Color);
-        var paper = ParseColor(page.Template.PaperColor);
-        var paperDistanceFromWhite =
-            (Math.Abs(255 - paper.R) + Math.Abs(255 - paper.G) + Math.Abs(255 - paper.B)) / (255d * 3d);
-        var minimumOpacity = page.ImportedLayer is not null || paperDistanceFromWhite > 0.12
-            ? 0.68f
-            : 0.45f;
-        return Color.FromArgb(
-            (byte)Math.Round(255 * Math.Max(normalized.Opacity, minimumOpacity)),
-            marker.R,
-            marker.G,
-            marker.B);
     }
 
     private void DrawLiveInk(CanvasDrawingSession drawingSession)
     {
-        var style = _gestureInkStyle ?? CurrentInkStyle();
-        var color = style.Tool == InkToolKind.Highlighter && _page is not null
-            ? HighContrastHighlighterColor(_page, style)
-            : ParseColor(style.Color, style.Opacity);
+        var style = (_gestureInkStyle ?? CurrentInkStyle()).Normalize();
+        var color = ParseColor(
+            style.Color, CanvasObjectRenderPolicy.SourceOverOpacity(style));
         var width = style.Width;
         if (style.Tool == InkToolKind.Highlighter && HighlighterStraightCheckBox.IsChecked == true && _activeInk.Count > 1)
         {
@@ -3686,15 +3601,14 @@ public sealed partial class MainPage : Page
     private void DrawObject(
         CanvasDrawingSession drawingSession,
         CanvasObject canvasObject,
-        bool cacheInkGeometry = false,
-        Color? inkColorOverride = null)
+        bool cacheInkGeometry = false)
     {
         var previous = drawingSession.Transform;
         drawingSession.Transform = canvasObject.Transform.ToMatrix() * previous;
         switch (canvasObject)
         {
             case InkStrokeObject ink:
-                DrawInk(drawingSession, ink, cacheInkGeometry, inkColorOverride);
+                DrawInk(drawingSession, ink, cacheInkGeometry);
                 break;
             case RichTextObject text:
                 using (var format = CreateTextFormat(text))
@@ -3860,12 +3774,13 @@ public sealed partial class MainPage : Page
     private void DrawInk(
         CanvasDrawingSession drawingSession,
         InkStrokeObject stroke,
-        bool cacheGeometry = false,
-        Color? colorOverride = null)
+        bool cacheGeometry = false)
     {
         if (stroke.Points.Count == 0) return;
         var normalizedStyle = stroke.Style.Normalize();
-        var color = colorOverride ?? ParseColor(normalizedStyle.Color, normalizedStyle.Opacity);
+        var color = ParseColor(
+            normalizedStyle.Color,
+            CanvasObjectRenderPolicy.SourceOverOpacity(normalizedStyle));
         if (cacheGeometry && TryDrawCachedInk(drawingSession, stroke, color)) return;
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {

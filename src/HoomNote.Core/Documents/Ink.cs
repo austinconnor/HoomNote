@@ -30,7 +30,7 @@ public readonly record struct InkPoint(
 
 public sealed record InkStyle
 {
-    public const float DefaultHighlighterOpacity = 0.45f;
+    public const float DefaultHighlighterOpacity = 0.60f;
 
     public InkToolKind Tool { get; init; } = InkToolKind.Pen;
     public string Color { get; init; } = "#111111";

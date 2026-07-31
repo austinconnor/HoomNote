@@ -1,10 +1,8 @@
-# HoomNote 0.7.33
+# HoomNote 0.7.34
 
-- Made the home library responsive with dense notebooks by skipping oversized
-  cover previews, limiting background preview work, and avoiding large
-  thumbnail-related memory spikes.
-- Made notebook switching faster and interruptible. Obsolete loads are now
-  cancelled, large page data is parsed away from the UI thread, and the two
-  most recently opened notebooks stay ready for quick switching.
-- Reduced page-switch buffering by prioritizing the selected page thumbnail
-  and delaying smaller adjacent-page previews until navigation settles.
+- Restored authored highlighter layering across the live canvas, retained page
+  cache, navigation tiles, and thumbnails. Highlighting no longer moves beneath
+  handwriting after a notebook is saved or reopened.
+- Highlighter opacity is now preserved exactly on light, dark, colored, and
+  imported backgrounds instead of being silently raised or lowered by the
+  renderer. New highlighters use the restored 60% default opacity.
