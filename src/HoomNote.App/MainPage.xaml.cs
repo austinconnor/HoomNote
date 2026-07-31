@@ -92,14 +92,15 @@ public sealed partial class MainPage : Page
         private BitmapImage? _thumbnail;
         private bool _isLoading;
 
-        public HomeNotebookCard(DocumentSummary document)
+        public HomeNotebookCard(DocumentSummary document, bool shouldLoadThumbnail = true)
         {
             DocumentId = document.Id;
             Title = document.Title;
             Metadata =
                 $"{document.PageCount} {(document.PageCount == 1 ? "page" : "pages")} • {document.UpdatedAt.LocalDateTime:g}";
             AccentBrush = new SolidColorBrush(ParseColor(document.Color));
-            _isLoading = true;
+            ShouldLoadThumbnail = shouldLoadThumbnail;
+            _isLoading = shouldLoadThumbnail;
         }
 
         public HomeNotebookCard(
@@ -118,6 +119,7 @@ public sealed partial class MainPage : Page
         public Guid? FolderId { get; }
         public Guid Id => DocumentId ?? Guid.Empty;
         public bool IsFolder => FolderId is not null;
+        public bool ShouldLoadThumbnail { get; }
         public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
         public string Title { get; }
         public string Metadata { get; }
@@ -189,8 +191,8 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, HoomNoteDocument> _openDocumentCache = [];
     private readonly LinkedList<Guid> _openDocumentLru = [];
     private readonly Dictionary<Guid, int> _openDocumentPointCounts = [];
-    private const int OpenDocumentCacheLimit = 1;
-    private const int OpenDocumentCachePointBudget = 250_000;
+    private const int OpenDocumentCacheLimit = 2;
+    private const int OpenDocumentCachePointBudget = 400_000;
     private const int ToolbarPresetLimit = 50;
     private readonly Dictionary<Guid, SpatialIndex> _pageSpatialIndexCache = [];
     private readonly LinkedList<Guid> _pageSpatialIndexLru = [];
@@ -200,6 +202,8 @@ public sealed partial class MainPage : Page
     private CancellationTokenSource? _spatialIndexBuildCancellation;
     private readonly PdfPreviewCache _pdfPreview = new();
     private readonly SemaphoreSlim _saveGate = new(1, 1);
+    private readonly SemaphoreSlim _documentLoadGate = new(1, 1);
+    private CancellationTokenSource? _documentLoadCancellation;
     private readonly SemaphoreSlim _settingsSaveGate = new(1, 1);
     private readonly SemaphoreSlim _handwritingIndexGate = new(1, 1);
     private readonly List<InkPoint> _activeInk = [];
@@ -225,10 +229,11 @@ public sealed partial class MainPage : Page
     private readonly LinkedList<Guid> _pageThumbnailLru = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _pageThumbnailLoads = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _homeThumbnailLoads = [];
-    private readonly SemaphoreSlim _homeThumbnailLoadGate = new(2, 2);
+    private readonly SemaphoreSlim _homeThumbnailLoadGate = new(1, 1);
     private const int PageThumbnailCacheLimit = 24;
     private const int PageThumbnailMaxWidth = 96;
     private const int PageThumbnailMaxHeight = 116;
+    private const int HomeThumbnailMaxSerializedCharacters = 1_000_000;
     private const int PageThumbnailRefreshDelayMs = 400;
     private int _thumbnailPriorityGeneration;
     private readonly List<CanvasCachedGeometry> _liveInkGeometryChunks = [];
@@ -348,7 +353,8 @@ public sealed partial class MainPage : Page
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
     private const int NavigationTileObjectThreshold = 256;
     private const float ContinuousPageGap = 28;
-    private const int AdjacentPagePreviewLongEdge = 1_024;
+    private const int AdjacentPagePreviewLongEdge = 512;
+    private const int AdjacentPagePreviewDelayMs = 180;
 
     private SqliteDocumentRepository? _repository;
     private MainWindow? _hostWindow;
@@ -720,6 +726,7 @@ public sealed partial class MainPage : Page
         _pageThumbnailLoads.Clear();
         foreach (var cancellation in _homeThumbnailLoads.Values) cancellation.Cancel();
         _homeThumbnailLoads.Clear();
+        _documentLoadCancellation?.Cancel();
         _adjacentPagePreviewCancellation?.Cancel();
         _adjacentPagePreviewCancellation = null;
         _pageThumbnailCache.Clear();
@@ -730,6 +737,8 @@ public sealed partial class MainPage : Page
         _toolTipCloseCancellation?.Cancel();
         _spatialIndexBuildCancellation?.Cancel();
         foreach (var animation in _sidebarAnimations.Values) animation.Cancel();
+        await _documentLoadGate.WaitAsync();
+        _documentLoadGate.Release();
         if (_document is not null) await SaveNowAsync();
         if (_userSettingsStore is not null) await SaveUserPreferencesAsync();
         if (_repository is not null) await _repository.DisposeAsync();
@@ -847,7 +856,8 @@ public sealed partial class MainPage : Page
             var group = new HomeNotebookGroup("All notebooks");
             foreach (var document in remaining)
                 group.Add(new HomeNotebookCard(
-                    document with { Color = EffectiveDocumentColor(document.Id) }));
+                    document with { Color = EffectiveDocumentColor(document.Id) },
+                    shouldLoadThumbnail: false));
             _homeLibraryGroups.Add(group);
         }
     }
@@ -857,7 +867,7 @@ public sealed partial class MainPage : Page
         ContainerContentChangingEventArgs args)
     {
         if (args.InRecycleQueue || args.Item is not HomeNotebookCard card ||
-            card.DocumentId is null || card.Thumbnail is not null ||
+            !card.ShouldLoadThumbnail || card.DocumentId is null || card.Thumbnail is not null ||
             _homeThumbnailLoads.ContainsKey(card.Id)) return;
         var cancellation = new CancellationTokenSource();
         _homeThumbnailLoads[card.Id] = cancellation;
@@ -875,7 +885,8 @@ public sealed partial class MainPage : Page
             await _homeThumbnailLoadGate.WaitAsync(cancellation.Token);
             try
             {
-                var page = await _repository.LoadFirstPageAsync(documentId, cancellation.Token);
+                var page = await _repository.LoadFirstPageAsync(
+                    documentId, cancellation.Token, HomeThumbnailMaxSerializedCharacters);
                 if (page is null)
                 {
                     card.IsLoading = false;
@@ -1883,31 +1894,72 @@ public sealed partial class MainPage : Page
     private async Task LoadDocumentAsync(Guid id, Guid? pageId = null)
     {
         if (_repository is null) return;
-        foreach (var cancellation in _homeThumbnailLoads.Values) cancellation.Cancel();
+        if (_document?.Id == id)
+        {
+            if (pageId is { } selectedPageId &&
+                _document.Pages.FirstOrDefault(page => page.Id == selectedPageId) is { } selectedPage)
+                PageList.SelectedItem = selectedPage;
+            return;
+        }
+
+        _documentLoadCancellation?.Cancel();
+        var cancellation = new CancellationTokenSource();
+        _documentLoadCancellation = cancellation;
+        var lockTaken = false;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        foreach (var homeCancellation in _homeThumbnailLoads.Values) homeCancellation.Cancel();
         _homeThumbnailLoads.Clear();
-        await SaveNowAsync();
-        if (_document is not null) CacheOpenDocument(_document);
-        var loaded = _openDocumentCache.GetValueOrDefault(id) ?? await _repository.LoadAsync(id);
-        if (loaded is null) return;
-        if (!_documentHistories.TryGetValue(id, out var history))
-            _documentHistories[id] = history = new CommandHistory();
-        _history = history;
-        _document = loaded;
-        CacheOpenDocument(loaded);
-        UpdateFolderActions();
-        _pendingInkAppends.Clear();
-        _requiresFullSave = false;
-        _hasUnsavedChanges = false;
-        NotebookTitle.Text = loaded.Title;
-        _hostWindow?.UpdateNotebookTitle(loaded.Title);
-        EnsureNotebookTab(loaded.Id, loaded.Title);
-        _loading = true;
-        _pages.Clear();
-        foreach (var page in loaded.Pages) _pages.Add(page);
-        _loading = false;
-        var selectedIndex = pageId is null ? 0 : loaded.Pages.FindIndex(page => page.Id == pageId);
-        PageList.SelectedIndex = Math.Max(0, selectedIndex);
-        SelectPage(loaded.Pages.ElementAtOrDefault(Math.Max(0, selectedIndex)));
+        try
+        {
+            await _documentLoadGate.WaitAsync(cancellation.Token);
+            lockTaken = true;
+            await SaveNowAsync();
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (_document is not null) CacheOpenDocument(_document);
+            var fromCache = _openDocumentCache.TryGetValue(id, out var cached);
+            var loaded = cached ?? await _repository.LoadAsync(id, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (loaded is null) return;
+            if (!_documentHistories.TryGetValue(id, out var history))
+                _documentHistories[id] = history = new CommandHistory();
+            _history = history;
+            _document = loaded;
+            CacheOpenDocument(loaded);
+            UpdateFolderActions();
+            _pendingInkAppends.Clear();
+            _requiresFullSave = false;
+            _hasUnsavedChanges = false;
+            NotebookTitle.Text = loaded.Title;
+            _hostWindow?.UpdateNotebookTitle(loaded.Title);
+            EnsureNotebookTab(loaded.Id, loaded.Title);
+            _loading = true;
+            _pages.Clear();
+            foreach (var page in loaded.Pages) _pages.Add(page);
+            _loading = false;
+            var selectedIndex = pageId is null ? 0 : loaded.Pages.FindIndex(page => page.Id == pageId);
+            PageList.SelectedIndex = Math.Max(0, selectedIndex);
+            SelectPage(loaded.Pages.ElementAtOrDefault(Math.Max(0, selectedIndex)));
+            var elapsed = MillisecondsSince(started);
+            DiagnosticsLog.Info("document.load_completed",
+                ("document_id", id),
+                ("source", fromCache ? "cache" : "database"),
+                ("pages", loaded.Pages.Count),
+                ("ink_points", CountInkPoints(loaded)),
+                ("elapsed_ms", elapsed));
+        }
+        catch (OperationCanceledException)
+        {
+            DiagnosticsLog.Info("document.load_cancelled",
+                ("document_id", id),
+                ("elapsed_ms", MillisecondsSince(started)));
+        }
+        finally
+        {
+            if (lockTaken) _documentLoadGate.Release();
+            if (ReferenceEquals(_documentLoadCancellation, cancellation))
+                _documentLoadCancellation = null;
+            cancellation.Dispose();
+        }
     }
 
     private void SeedPageIndexState(HoomNoteDocument document)
@@ -2343,6 +2395,7 @@ public sealed partial class MainPage : Page
         AdjacentPagePreview? nextPreview = null;
         try
         {
+            await Task.Delay(AdjacentPagePreviewDelayMs, cancellation.Token);
             previousPreview = await RenderAdjacentPagePreviewAsync(previous, cancellation.Token);
             nextPreview = await RenderAdjacentPagePreviewAsync(next, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
@@ -6448,6 +6501,8 @@ public sealed partial class MainPage : Page
         if (_loading) return;
         var selected = PageList.SelectedItem as NotePage;
         if (_document is not null && selected is not null) _tabPageSelections[_document.Id] = selected.Id;
+        if (selected is not null && !_pageThumbnailCache.ContainsKey(selected.Id))
+            RequestPageThumbnail(selected, prioritize: true);
         SelectPage(selected);
         foreach (var page in e.RemovedItems.OfType<NotePage>())
             if (PageList.ContainerFromItem(page) is ListViewItem container)

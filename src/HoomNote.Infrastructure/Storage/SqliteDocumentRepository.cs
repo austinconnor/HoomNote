@@ -135,37 +135,66 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) return null;
 
-        var document = new HoomNoteDocument
+        var title = reader.GetString(0);
+        var kind = (DocumentKind)reader.GetInt32(1);
+        var createdAt = reader.GetString(2);
+        var updatedAt = reader.GetString(3);
+        var schemaVersion = reader.GetInt32(4);
+        var tagsJson = reader.GetString(5);
+        var settingsJson = reader.GetString(6);
+        var sectionsJson = reader.GetString(7);
+        await reader.DisposeAsync();
+
+        // A notebook can contain hundreds of thousands of ink samples. JSON parsing is CPU
+        // intensive and must not run on the UI continuation that initiated navigation.
+        var document = await Task.Run(() => new HoomNoteDocument
         {
             Id = documentId,
-            Title = reader.GetString(0),
-            Kind = (DocumentKind)reader.GetInt32(1),
-            CreatedAt = DateTimeOffset.Parse(reader.GetString(2)),
-            UpdatedAt = DateTimeOffset.Parse(reader.GetString(3)),
-            SchemaVersion = reader.GetInt32(4),
-            Tags = Deserialize<List<string>>(reader.GetString(5)) ?? [],
-            Settings = Deserialize<DocumentSettings>(reader.GetString(6)) ?? new(),
-            Sections = Deserialize<List<NotebookSection>>(reader.GetString(7)) ?? []
-        };
-        await reader.DisposeAsync();
+            Title = title,
+            Kind = kind,
+            CreatedAt = DateTimeOffset.Parse(createdAt),
+            UpdatedAt = DateTimeOffset.Parse(updatedAt),
+            SchemaVersion = schemaVersion,
+            Tags = Deserialize<List<string>>(tagsJson) ?? [],
+            Settings = Deserialize<DocumentSettings>(settingsJson) ?? new(),
+            Sections = Deserialize<List<NotebookSection>>(sectionsJson) ?? []
+        }, cancellationToken);
 
         await using var pageCommand = _connection.CreateCommand();
         pageCommand.CommandText = "SELECT page_json, recognized_text, recognized_regions_json, updated_utc FROM pages WHERE document_id = $id ORDER BY ordinal;";
         pageCommand.Parameters.AddWithValue("$id", documentId.ToString("D"));
         await using var pageReader = await pageCommand.ExecuteReaderAsync(cancellationToken);
+        var serializedPages = new List<(string PageJson, string RecognizedText,
+            string RecognizedRegionsJson, string UpdatedAt)>();
         while (await pageReader.ReadAsync(cancellationToken))
         {
-            var page = Deserialize<NotePage>(pageReader.GetString(0));
-            if (page is not null)
-            {
-                page.RecognizedText = pageReader.GetString(1);
-                page.RecognizedRegions = Deserialize<List<RecognizedTextRegion>>(pageReader.GetString(2)) ?? [];
-                if (DateTimeOffset.TryParse(pageReader.GetString(3), out var pageUpdatedAt))
-                    page.UpdatedAt = pageUpdatedAt;
-                document.Pages.Add(page);
-            }
+            serializedPages.Add((
+                pageReader.GetString(0),
+                pageReader.GetString(1),
+                pageReader.GetString(2),
+                pageReader.GetString(3)));
         }
         await pageReader.DisposeAsync();
+
+        var pages = await Task.Run(() =>
+        {
+            var results = new List<NotePage>(serializedPages.Count);
+            foreach (var serializedPage in serializedPages)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var page = Deserialize<NotePage>(serializedPage.PageJson);
+                if (page is null) continue;
+                page.RecognizedText = serializedPage.RecognizedText;
+                page.RecognizedRegions =
+                    Deserialize<List<RecognizedTextRegion>>(serializedPage.RecognizedRegionsJson) ?? [];
+                if (DateTimeOffset.TryParse(serializedPage.UpdatedAt, out var pageUpdatedAt))
+                    page.UpdatedAt = pageUpdatedAt;
+                results.Add(page);
+            }
+            return results;
+        }, cancellationToken);
+        serializedPages.Clear();
+        document.Pages.AddRange(pages);
 
         if (document.Pages.Count > 0)
         {
@@ -177,16 +206,30 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 """;
             appendCommand.Parameters.AddWithValue("$document", documentId.ToString("D"));
             await using var appendReader = await appendCommand.ExecuteReaderAsync(cancellationToken);
-            var pagesById = document.Pages.ToDictionary(page => page.Id);
+            var serializedAppends = new List<(Guid PageId, string ObjectJson)>();
             while (await appendReader.ReadAsync(cancellationToken))
             {
-                if (!Guid.TryParse(appendReader.GetString(0), out var pageId) ||
-                    !pagesById.TryGetValue(pageId, out var page)) continue;
-                var canvasObject = Deserialize<CanvasObject>(appendReader.GetString(1));
-                if (canvasObject is not null && page.Objects.All(item => item.Id != canvasObject.Id))
-                    page.Objects.Add(canvasObject);
+                if (Guid.TryParse(appendReader.GetString(0), out var pageId))
+                    serializedAppends.Add((pageId, appendReader.GetString(1)));
             }
-            foreach (var page in document.Pages) page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+            await appendReader.DisposeAsync();
+
+            await Task.Run(() =>
+            {
+                var pagesById = document.Pages.ToDictionary(page => page.Id);
+                foreach (var serializedAppend in serializedAppends)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!pagesById.TryGetValue(serializedAppend.PageId, out var page)) continue;
+                    var canvasObject = Deserialize<CanvasObject>(serializedAppend.ObjectJson);
+                    if (canvasObject is not null &&
+                        page.Objects.All(item => item.Id != canvasObject.Id))
+                        page.Objects.Add(canvasObject);
+                }
+                foreach (var page in document.Pages)
+                    page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+            }, cancellationToken);
+            serializedAppends.Clear();
         }
 
         return document;
@@ -194,11 +237,12 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 
     public async Task<NotePage?> LoadFirstPageAsync(
         Guid documentId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int maxSerializedCharacters = int.MaxValue)
     {
         await using var command = _connection.CreateCommand();
         command.CommandText = """
-            SELECT page_json, recognized_text, recognized_regions_json, updated_utc
+            SELECT page_json, length(page_json), recognized_text, recognized_regions_json, updated_utc
             FROM pages
             WHERE document_id = $id
             ORDER BY ordinal
@@ -207,14 +251,22 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         command.Parameters.AddWithValue("$id", documentId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) return null;
-        var page = Deserialize<NotePage>(reader.GetString(0));
-        if (page is null) return null;
-        page.RecognizedText = reader.GetString(1);
-        page.RecognizedRegions =
-            Deserialize<List<RecognizedTextRegion>>(reader.GetString(2)) ?? [];
-        if (DateTimeOffset.TryParse(reader.GetString(3), out var updatedAt))
-            page.UpdatedAt = updatedAt;
-        return page;
+        if (reader.GetInt32(1) > maxSerializedCharacters) return null;
+        var pageJson = reader.GetString(0);
+        var recognizedText = reader.GetString(2);
+        var recognizedRegionsJson = reader.GetString(3);
+        var serializedUpdatedAt = reader.GetString(4);
+        return await Task.Run(() =>
+        {
+            var page = Deserialize<NotePage>(pageJson);
+            if (page is null) return null;
+            page.RecognizedText = recognizedText;
+            page.RecognizedRegions =
+                Deserialize<List<RecognizedTextRegion>>(recognizedRegionsJson) ?? [];
+            if (DateTimeOffset.TryParse(serializedUpdatedAt, out var updatedAt))
+                page.UpdatedAt = updatedAt;
+            return page;
+        }, cancellationToken);
     }
 
     public async Task SaveAsync(HoomNoteDocument document, CancellationToken cancellationToken = default)

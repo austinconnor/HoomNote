@@ -89,6 +89,29 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_LoadFirstPageSkipsPreviewAboveSerializedSizeLimit()
+    {
+        await using var repository = new SqliteDocumentRepository(
+            Path.Combine(_root, "first-page-preview-limit.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Dense cover");
+        var first = AddPage(document);
+        first.Objects.Add(new RichTextObject
+        {
+            Content = RichTextDocument.FromPlainText(new string('x', 2_000))
+        });
+        await repository.SaveAsync(document);
+
+        var skipped = await repository.LoadFirstPageAsync(
+            document.Id, maxSerializedCharacters: 64);
+        var loaded = await repository.LoadFirstPageAsync(document.Id);
+
+        Assert.Null(skipped);
+        Assert.NotNull(loaded);
+        Assert.Equal(first.Id, loaded.Id);
+    }
+
+    [Fact]
     public async Task Repository_DeleteRemovesNotebookAndSearchRows()
     {
         await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "delete-library.db"));
