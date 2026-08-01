@@ -93,6 +93,33 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void ContinuousPageLayout_HitTestsBothVisiblePagesAndPreservesTransitionPosition()
+    {
+        var viewport = new SizeD(1_200, 900);
+        var pageSize = new SizeD(800, 1_000);
+        var current = ContinuousPageLayout.CurrentBounds(
+            pageSize, zoom: 0.8, panX: 0, panY: -360, viewport);
+        var next = ContinuousPageLayout.AdjacentBounds(
+            current, pageSize, zoom: 0.8, panX: 0, viewport,
+            aboveCurrentPage: false, gap: 28);
+
+        Assert.Equal(ContinuousPageSlot.Current,
+            ContinuousPageLayout.HitTest(
+                new PointD(current.X + 20, current.Bottom - 20), current, null, next));
+        Assert.Equal(ContinuousPageSlot.Next,
+            ContinuousPageLayout.HitTest(
+                new PointD(next.X + 20, next.Y + 20), current, null, next));
+        Assert.Null(ContinuousPageLayout.HitTest(
+            new PointD(next.X + 20, current.Bottom + 14), current, null, next));
+
+        var transitionedPan = ContinuousPageLayout.PanYForPageTop(
+            next.Y, pageSize, zoom: 0.8, viewport.Height);
+        var transitioned = ContinuousPageLayout.CurrentBounds(
+            pageSize, zoom: 0.8, panX: 0, panY: transitionedPan, viewport);
+        Assert.Equal(next.Y, transitioned.Y, 5);
+    }
+
+    [Fact]
     public void TwoFingerPinch_IgnoresCentroidTranslationWhenSpreadIsUnchanged()
     {
         var stationary = TouchViewportMath.PinchOnly(
@@ -180,6 +207,28 @@ public sealed class GeometryAndEditingTests
         var result = SegmentEraser.Erase(stroke, [new PointD(100, 100)], 4);
         Assert.Single(result);
         Assert.Same(stroke, result[0]);
+    }
+
+    [Fact]
+    public void LassoSelection_SelectsAnEntireStrokeWhenOnlyOneSegmentIsCircled()
+    {
+        var stroke = new InkStrokeObject
+        {
+            Points = Enumerable.Range(0, 21)
+                .Select(index => new InkPoint(index * 10, 50))
+                .ToList()
+        };
+        PointD[] aroundMiddle =
+        [
+            new(92, 42), new(108, 42), new(108, 58), new(92, 58)
+        ];
+        PointD[] awayFromStroke =
+        [
+            new(92, 72), new(108, 72), new(108, 88), new(92, 88)
+        ];
+
+        Assert.True(LassoSelection.Intersects(stroke, aroundMiddle));
+        Assert.False(LassoSelection.Intersects(stroke, awayFromStroke));
     }
 
     [Fact]
@@ -402,6 +451,23 @@ public sealed class GeometryAndEditingTests
                 Assert.IsType<InkStrokeObject>(rendered[1]).Style));
         Assert.Equal(0.42f, CanvasObjectRenderPolicy.SourceOverOpacity(
             highlighter.Style with { Opacity = 0.42f }));
+    }
+
+    [Fact]
+    public void HighlighterBlendPolicy_UsesStableMarkerColorInsteadOfStackingAlpha()
+    {
+        var style = new InkStyle
+        {
+            Tool = InkToolKind.Highlighter,
+            Opacity = InkStyle.DefaultHighlighterOpacity
+        };
+
+        Assert.Equal(0.252f, CanvasObjectRenderPolicy.HighlighterBlendStrength(style), 3);
+        Assert.Equal(255, CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(255, style));
+        var blueChannel = CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(0, style);
+        Assert.Equal(191, blueChannel);
+        Assert.Equal(blueChannel,
+            CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(0, style));
     }
 
     [Fact]
@@ -681,6 +747,40 @@ public sealed class GeometryAndEditingTests
         Assert.Equal(ShapeKind.Ellipse, ShapeRecognizer.Recognize(points));
         Assert.Equal(ShapeKind.Ellipse,
             ShapeRecognizer.RecognizeDetailed(points, deliberateGesture: false)?.Kind);
+    }
+
+    [Fact]
+    public void ShapeRecognizer_SnapsClosedFivePointStar()
+    {
+        var vertices = ShapeGeometry.StarPoints(new RectD(20, 20, 120, 120)).ToArray();
+        var points = new List<InkPoint>();
+        for (var edge = 0; edge < vertices.Length; edge++)
+        {
+            var start = vertices[edge];
+            var end = vertices[(edge + 1) % vertices.Length];
+            for (var step = 0; step < 6; step++)
+            {
+                var amount = step / 6d;
+                points.Add(new InkPoint(
+                    start.X + (end.X - start.X) * amount,
+                    start.Y + (end.Y - start.Y) * amount));
+            }
+        }
+        points.Add(new InkPoint(vertices[0].X, vertices[0].Y));
+
+        Assert.Equal(ShapeKind.Star, ShapeRecognizer.Recognize(points));
+    }
+
+    [Fact]
+    public void ShapeRecognizer_DoesNotTurnIrregularClosedScribbleIntoOval()
+    {
+        InkPoint[] points =
+        [
+            new(10, 10), new(110, 20), new(80, 45), new(115, 90),
+            new(50, 70), new(10, 90), new(35, 50), new(10, 10)
+        ];
+
+        Assert.Null(ShapeRecognizer.Recognize(points));
     }
 
     [Fact]

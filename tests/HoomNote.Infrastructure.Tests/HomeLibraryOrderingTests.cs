@@ -7,7 +7,7 @@ namespace HoomNote.Infrastructure.Tests;
 public sealed class HomeLibraryOrderingTests
 {
     [Fact]
-    public void RootLayout_ListsFoldersAlphabeticallyAndRecentNotebooksByUse()
+    public void RootLayout_ListsFoldersThenAllNotebooksAlphabetically()
     {
         var school = new NotebookFolderPreference { Name = "School" };
         var archive = new NotebookFolderPreference { Name = "Archive" };
@@ -21,14 +21,12 @@ public sealed class HomeLibraryOrderingTests
             [older, newest, middle],
             [school, orphan, archive],
             new Dictionary<string, string>(),
-            requestedFolderId: null,
-            recentLimit: 2);
+            requestedFolderId: null);
 
         Assert.Equal(["Archive", "Recovered", "School"],
             layout.ChildFolders.Select(folder => folder.Name));
-        Assert.Equal([newest.Id, middle.Id],
-            layout.RecentDocuments.Select(document => document.Id));
-        Assert.Equal(older.Id, Assert.Single(layout.RemainingDocuments).Id);
+        Assert.Equal([middle.Id, newest.Id, older.Id],
+            layout.Documents.Select(document => document.Id));
     }
 
     [Fact]
@@ -54,8 +52,7 @@ public sealed class HomeLibraryOrderingTests
 
         Assert.Equal(parent.Id, layout.CurrentFolderId);
         Assert.Equal(child.Id, Assert.Single(layout.ChildFolders).Id);
-        Assert.Equal(direct.Id, Assert.Single(layout.RecentDocuments).Id);
-        Assert.Empty(layout.RemainingDocuments);
+        Assert.Equal(direct.Id, Assert.Single(layout.Documents).Id);
     }
 
     private static DocumentSummary Summary(string title, DateTimeOffset updatedAt) =>

@@ -6,8 +6,7 @@ namespace HoomNote.Infrastructure.Storage;
 public sealed record HomeLibraryLayout(
     Guid? CurrentFolderId,
     IReadOnlyList<NotebookFolderPreference> ChildFolders,
-    IReadOnlyList<DocumentSummary> RecentDocuments,
-    IReadOnlyList<DocumentSummary> RemainingDocuments);
+    IReadOnlyList<DocumentSummary> Documents);
 
 public static class HomeLibraryOrdering
 {
@@ -15,10 +14,8 @@ public static class HomeLibraryOrdering
         IReadOnlyCollection<DocumentSummary> documents,
         IReadOnlyCollection<NotebookFolderPreference> folders,
         IReadOnlyDictionary<string, string> documentFolders,
-        Guid? requestedFolderId,
-        int recentLimit = 6)
+        Guid? requestedFolderId)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(recentLimit);
         var folderIds = folders.Select(folder => folder.Id).ToHashSet();
         Guid? currentFolderId = requestedFolderId is { } folderId && folderIds.Contains(folderId)
             ? folderId
@@ -36,19 +33,12 @@ public static class HomeLibraryOrdering
             ? documents
             : documents.Where(document =>
                 AssignedFolderId(document.Id, documentFolders) == currentFolderId).ToArray();
-        var recent = scopedDocuments
-            .OrderByDescending(document => document.UpdatedAt)
-            .ThenBy(document => document.Title, NotebookTitleComparer.Instance)
-            .Take(recentLimit)
-            .ToArray();
-        var recentIds = recent.Select(document => document.Id).ToHashSet();
-        var remaining = scopedDocuments
-            .Where(document => !recentIds.Contains(document.Id))
+        var orderedDocuments = scopedDocuments
             .OrderBy(document => document.Title, NotebookTitleComparer.Instance)
             .ThenBy(document => document.Id)
             .ToArray();
 
-        return new HomeLibraryLayout(currentFolderId, childFolders, recent, remaining);
+        return new HomeLibraryLayout(currentFolderId, childFolders, orderedDocuments);
     }
 
     private static Guid? AssignedFolderId(

@@ -7,67 +7,149 @@ public static class ShapeRecognizer
 {
     public sealed record Recognition(ShapeKind Kind, PointD Start, PointD End);
 
-    public static ShapeKind? Recognize(IReadOnlyList<InkPoint> samples) => RecognizeDetailed(samples)?.Kind;
+    public static ShapeKind? Recognize(IReadOnlyList<InkPoint> samples) =>
+        RecognizeDetailed(samples)?.Kind;
 
     public static Recognition? RecognizeDetailed(
         IReadOnlyList<InkPoint> samples,
         bool deliberateGesture = true)
     {
         if (samples.Count < 2) return null;
-        var first = samples[0].Position;
-        var previous = first;
-        var minX = first.X;
-        var minY = first.Y;
-        var maxX = first.X;
-        var maxY = first.Y;
-        var pathLength = 0d;
-        for (var index = 1; index < samples.Count; index++)
-        {
-            var point = samples[index].Position;
-            minX = Math.Min(minX, point.X);
-            minY = Math.Min(minY, point.Y);
-            maxX = Math.Max(maxX, point.X);
-            maxY = Math.Max(maxY, point.Y);
-            pathLength += Vector2.Distance(previous.ToVector2(), point.ToVector2());
-            previous = point;
-        }
-        var bounds = new RectD(minX, minY, maxX - minX, maxY - minY);
-        if (Math.Max(bounds.Width, bounds.Height) < 18) return null;
-        if (pathLength < 18) return null;
-
-        var end = samples[^1].Position;
-        var endDistance = Vector2.Distance(first.ToVector2(), end.ToVector2());
+        var source = RemoveAdjacentDuplicates(samples.Select(sample => sample.Position));
+        if (source.Count < 4) return null;
+        var bounds = RectD.FromPoints(source);
+        var minimumDimension = Math.Min(bounds.Width, bounds.Height);
         var diagonal = Math.Sqrt(bounds.Width * bounds.Width + bounds.Height * bounds.Height);
-        var closed = endDistance <= Math.Max(18, diagonal * 0.24);
-        // Draw-to-shape deliberately recognizes only closed boxes and circles. Lines, arrows,
-        // and the other supported shapes remain available through the explicit shape tool so
-        // ordinary handwriting is never unexpectedly replaced.
-        if (!closed) return null;
-        // A terminal hold always signals intent. Without a hold, accept only a large closed
-        // gesture: this makes normal pen-drawn diagrams snap immediately while keeping
-        // handwriting-sized loops (especially "o") as ink.
-        if (!deliberateGesture && Math.Min(bounds.Width, bounds.Height) < 60) return null;
+        if (Math.Max(bounds.Width, bounds.Height) < 18 || minimumDimension < 14) return null;
 
-        if (bounds.Width < 14 || bounds.Height < 14) return null;
-        var rectangleError = 0d;
-        var ellipseError = 0d;
-        foreach (var sample in samples)
-        {
-            rectangleError += DistanceToRectangleEdge(sample.Position, bounds);
-            ellipseError += EllipseError(sample.Position, bounds);
-        }
-        rectangleError = rectangleError / samples.Count / Math.Max(1, Math.Min(bounds.Width, bounds.Height));
-        ellipseError /= samples.Count;
+        var pathLength = PathLength(source);
+        if (pathLength < 18) return null;
+        var first = source[0];
+        var end = source[^1];
+        var endDistance = Vector2.Distance(first.ToVector2(), end.ToVector2());
+        if (endDistance > Math.Max(18, diagonal * 0.24)) return null;
+        if (!deliberateGesture && minimumDimension < 60) return null;
 
-        if (ellipseError <= 0.12) return new Recognition(ShapeKind.Ellipse, first, end);
-        if (rectangleError <= 0.125) return new Recognition(ShapeKind.Rectangle, first, end);
-        if (ellipseError <= 0.23) return new Recognition(ShapeKind.Ellipse, first, end);
+        var points = ResampleClosed(source, 96);
+        var rectangleError = RectangleError(points, bounds) / minimumDimension;
+        var ellipseError = points.Average(point => EllipseError(point, bounds));
+        var starError = StarError(points, bounds) / minimumDimension;
+
+        // Stars must be materially more star-like than the smooth/box candidates. This stops
+        // arbitrary closed scribbles from falling through to the old broad oval fallback.
+        if (starError <= 0.105 && starError < rectangleError * 0.82 &&
+            starError < ellipseError * 0.82)
+            return new Recognition(ShapeKind.Star, first, end);
+
+        // Corners place rectangle samples directly on an edge, while ellipse samples stay
+        // radially consistent. Compare the fits before applying strict absolute thresholds.
+        if (rectangleError <= 0.095 && rectangleError < ellipseError * 0.92)
+            return new Recognition(ShapeKind.Rectangle, first, end);
+        if (ellipseError <= 0.135 && ellipseError < rectangleError * 1.15)
+            return new Recognition(ShapeKind.Ellipse, first, end);
         return null;
     }
 
-    private static double DistanceToRectangleEdge(PointD point, RectD bounds) => Math.Min(
-        Math.Min(Math.Abs(point.X - bounds.Left), Math.Abs(point.X - bounds.Right)),
-        Math.Min(Math.Abs(point.Y - bounds.Top), Math.Abs(point.Y - bounds.Bottom)));
+    private static List<PointD> RemoveAdjacentDuplicates(IEnumerable<PointD> points)
+    {
+        var result = new List<PointD>();
+        foreach (var point in points)
+        {
+            if (result.Count == 0 ||
+                Vector2.DistanceSquared(result[^1].ToVector2(), point.ToVector2()) > 0.01f)
+                result.Add(point);
+        }
+        return result;
+    }
+
+    private static double PathLength(IReadOnlyList<PointD> points)
+    {
+        var length = 0d;
+        for (var index = 1; index < points.Count; index++)
+            length += Vector2.Distance(points[index - 1].ToVector2(), points[index].ToVector2());
+        return length;
+    }
+
+    private static IReadOnlyList<PointD> ResampleClosed(IReadOnlyList<PointD> source, int count)
+    {
+        var closed = source.ToList();
+        if (Vector2.DistanceSquared(closed[0].ToVector2(), closed[^1].ToVector2()) > 0.01f)
+            closed.Add(closed[0]);
+        var cumulative = new double[closed.Count];
+        for (var index = 1; index < closed.Count; index++)
+            cumulative[index] = cumulative[index - 1] +
+                Vector2.Distance(closed[index - 1].ToVector2(), closed[index].ToVector2());
+        var total = cumulative[^1];
+        if (total <= 0.001) return closed;
+
+        var result = new PointD[count];
+        var segment = 1;
+        for (var sample = 0; sample < count; sample++)
+        {
+            var distance = total * sample / count;
+            while (segment + 1 < cumulative.Length && cumulative[segment] < distance) segment++;
+            var startDistance = cumulative[segment - 1];
+            var segmentLength = Math.Max(0.0001, cumulative[segment] - startDistance);
+            var amount = (distance - startDistance) / segmentLength;
+            var start = closed[segment - 1];
+            var end = closed[segment];
+            result[sample] = new PointD(
+                start.X + (end.X - start.X) * amount,
+                start.Y + (end.Y - start.Y) * amount);
+        }
+        return result;
+    }
+
+    private static double RectangleError(IReadOnlyList<PointD> points, RectD bounds)
+    {
+        var corners = new[]
+        {
+            new PointD(bounds.Left, bounds.Top),
+            new PointD(bounds.Right, bounds.Top),
+            new PointD(bounds.Right, bounds.Bottom),
+            new PointD(bounds.Left, bounds.Bottom)
+        };
+        return AverageDistanceToSegments(points, corners);
+    }
+
+    private static double StarError(IReadOnlyList<PointD> points, RectD bounds)
+    {
+        var best = double.PositiveInfinity;
+        foreach (var innerRatio in new[] { 0.35, 0.45, 0.55 })
+        for (var rotationStep = 0; rotationStep < 10; rotationStep++)
+        {
+            var rotation = -Math.PI / 2d + rotationStep * Math.PI / 25d;
+            var vertices = new PointD[10];
+            for (var index = 0; index < vertices.Length; index++)
+            {
+                var inner = index % 2 == 1;
+                var angle = rotation + index * Math.PI / 5d;
+                var radius = inner ? innerRatio : 1d;
+                vertices[index] = new PointD(
+                    bounds.Center.X + Math.Cos(angle) * bounds.Width / 2d * radius,
+                    bounds.Center.Y + Math.Sin(angle) * bounds.Height / 2d * radius);
+            }
+            best = Math.Min(best, AverageDistanceToSegments(points, vertices));
+        }
+        return best;
+    }
+
+    private static double AverageDistanceToSegments(
+        IReadOnlyList<PointD> points,
+        IReadOnlyList<PointD> vertices)
+    {
+        var total = 0d;
+        foreach (var point in points)
+        {
+            var distance = double.PositiveInfinity;
+            for (var index = 0; index < vertices.Count; index++)
+                distance = Math.Min(distance, StrokeGeometry.DistanceToSegment(
+                    point.ToVector2(), vertices[index].ToVector2(),
+                    vertices[(index + 1) % vertices.Count].ToVector2()));
+            total += distance;
+        }
+        return total / Math.Max(1, points.Count);
+    }
 
     private static double EllipseError(PointD point, RectD bounds)
     {

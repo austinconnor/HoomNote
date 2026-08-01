@@ -23,6 +23,10 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
 {
     private const int AssetLongEdge = 512;
     private readonly SemaphoreSlim _renderGate = new(1, 1);
+    private readonly struct CanvasBlendScope(CanvasDrawingSession session, CanvasBlend previous) : IDisposable
+    {
+        public void Dispose() => session.Blend = previous;
+    }
 
     public async Task<byte[]> RenderAsync(NotePage page, int pixelWidth, int pixelHeight,
         CancellationToken cancellationToken = default)
@@ -86,11 +90,12 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
                 // Page.Objects is maintained in authored Z-order. In particular, do not
                 // repartition translucent highlighter strokes beneath handwriting here:
                 // thumbnails must match the live canvas before and after a save/reopen.
+                var darkSurface = IsDarkColor(ParseColor(page.Template.PaperColor));
                 foreach (var canvasObject in
                          CanvasObjectRenderPolicy.VisibleInAuthoredOrder(page.Objects))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    DrawObject(session, canvasObject, imageBitmaps, roundStyle);
+                    DrawObject(session, canvasObject, imageBitmaps, roundStyle, darkSurface);
                 }
             }
 
@@ -158,14 +163,15 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         CanvasDrawingSession session,
         CanvasObject canvasObject,
         IReadOnlyDictionary<string, CanvasBitmap> images,
-        CanvasStrokeStyle roundStyle)
+        CanvasStrokeStyle roundStyle,
+        bool darkSurface)
     {
         var previous = session.Transform;
         session.Transform = canvasObject.Transform.ToMatrix() * previous;
         switch (canvasObject)
         {
             case InkStrokeObject ink:
-                DrawInk(session, ink, roundStyle);
+                DrawInk(session, ink, roundStyle, darkSurface);
                 break;
             case RichTextObject text:
                 DrawText(session, text);
@@ -184,12 +190,12 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
     private static void DrawInk(
         CanvasDrawingSession session,
         InkStrokeObject stroke,
-        CanvasStrokeStyle roundStyle)
+        CanvasStrokeStyle roundStyle,
+        bool darkSurface)
     {
         if (stroke.Points.Count == 0) return;
         var style = stroke.Style.Normalize();
-        var color = ParseColor(
-            style.Color, CanvasObjectRenderPolicy.SourceOverOpacity(style));
+        using var blend = ConfigureInkBlend(session, style, darkSurface, out var color);
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
             var points = StrokeOutlineBuilder.FitCenterline(stroke);
@@ -215,6 +221,38 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         }
         using var geometry = CreateWindingGeometry(session, outline.Contour);
         session.FillGeometry(geometry, color);
+    }
+
+    private static CanvasBlendScope ConfigureInkBlend(
+        CanvasDrawingSession session,
+        InkStyle style,
+        bool darkSurface,
+        out Color color)
+    {
+        var previous = session.Blend;
+        if (style.Tool != InkToolKind.Highlighter)
+        {
+            color = ParseColor(style.Color, CanvasObjectRenderPolicy.SourceOverOpacity(style));
+            return new CanvasBlendScope(session, previous);
+        }
+
+        var source = ParseColor(style.Color);
+        if (darkSurface)
+        {
+            session.Blend = CanvasBlend.Add;
+            color = Color.FromArgb(
+                (byte)Math.Round(CanvasObjectRenderPolicy.HighlighterBlendStrength(style) * 255),
+                source.R, source.G, source.B);
+        }
+        else
+        {
+            session.Blend = CanvasBlend.Min;
+            color = Color.FromArgb(255,
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.R, style),
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.G, style),
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.B, style));
+        }
+        return new CanvasBlendScope(session, previous);
     }
 
     private static CanvasGeometry CreateWindingGeometry(ICanvasResourceCreator creator, IReadOnlyList<PointD> points)
@@ -398,4 +436,7 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         return Color.FromArgb((byte)(255 * Math.Clamp(opacity, 0, 1)), Convert.ToByte(hex[..2], 16),
             Convert.ToByte(hex.Substring(2, 2), 16), Convert.ToByte(hex.Substring(4, 2), 16));
     }
+
+    private static bool IsDarkColor(Color color) =>
+        color.R * 0.2126 + color.G * 0.7152 + color.B * 0.0722 < 105;
 }

@@ -284,6 +284,14 @@
                                                    Minimum="0.1" Maximum="24" SmallChange="0.1" LargeChange="1"
                                                    Value="2.4" SpinButtonPlacementMode="Hidden" />
                                     </Grid>
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <Button Content="0.7" Tag="0.7" Click="OnInkSizePresetClick"
+                                                MinWidth="54" ToolTipService.ToolTip="Set pen size to 0.7" />
+                                        <Button Content="1.5" Tag="1.5" Click="OnInkSizePresetClick"
+                                                MinWidth="54" ToolTipService.ToolTip="Set pen size to 1.5" />
+                                        <Button Content="2" Tag="2" Click="OnInkSizePresetClick"
+                                                MinWidth="54" ToolTipService.ToolTip="Set pen size to 2" />
+                                    </StackPanel>
                                     <TextBlock x:Name="ActivePresetSaveText"
                                                Text="Size changes save automatically to the selected preset."
                                                Visibility="Collapsed" FontSize="10" TextWrapping="Wrap"
@@ -658,13 +666,24 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
-                    <StackPanel MaxWidth="1040" HorizontalAlignment="Stretch" Spacing="4">
-                        <TextBlock x:Name="HomeLibraryTitle" Text="Your library"
-                                   FontSize="26" FontWeight="SemiBold" />
-                        <TextBlock x:Name="HomeLibrarySubtitle"
-                                   Text="Browse folders first, then pick up a recently edited notebook."
-                                   Foreground="{StaticResource HoomNoteMutedTextBrush}" />
-                    </StackPanel>
+                    <Grid MaxWidth="1040" HorizontalAlignment="Stretch" ColumnSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="HomeLibraryBackButton" Width="36" Height="36" Padding="0"
+                                Visibility="Collapsed" Click="OnHomeLibraryBackClick"
+                                ToolTipService.ToolTip="Back to parent folder">
+                            <FontIcon Glyph="&#xE72B;" FontSize="15" />
+                        </Button>
+                        <StackPanel Grid.Column="1" Spacing="4">
+                            <TextBlock x:Name="HomeLibraryTitle" Text="Your library"
+                                       FontSize="26" FontWeight="SemiBold" />
+                            <TextBlock x:Name="HomeLibrarySubtitle"
+                                       Text="Browse folders or open any notebook."
+                                       Foreground="{StaticResource HoomNoteMutedTextBrush}" />
+                        </StackPanel>
+                    </Grid>
                     <GridView x:Name="HomeLibraryGrid" Grid.Row="1" Margin="0,18,0,0"
                               ItemsSource="{Binding Source={StaticResource HomeLibraryGroupsSource}}"
                               IsItemClickEnabled="True" ItemClick="OnHomeNotebookClick"

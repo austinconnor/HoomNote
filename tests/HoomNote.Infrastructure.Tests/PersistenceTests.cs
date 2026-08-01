@@ -89,6 +89,30 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_LoadFirstPageIncludesIncrementalInkForFreshCoverThumbnail()
+    {
+        await using var repository = new SqliteDocumentRepository(
+            Path.Combine(_root, "first-page-journal.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Changing cover");
+        var first = AddPage(document);
+        await repository.SaveAsync(document);
+        var newStroke = new InkStrokeObject
+        {
+            ZIndex = 4,
+            Points = [new InkPoint(20, 30), new InkPoint(120, 130)]
+        };
+        first.Objects.Add(newStroke);
+        first.UpdatedAt = DateTimeOffset.UtcNow.AddMilliseconds(10);
+        Assert.True(await repository.SaveInkAppendsAsync(document, [(first.Id, newStroke)]));
+
+        var loaded = await repository.LoadFirstPageAsync(document.Id);
+
+        Assert.NotNull(loaded);
+        Assert.Contains(loaded.Objects, item => item.Id == newStroke.Id);
+    }
+
+    [Fact]
     public async Task Repository_LoadFirstPageSkipsPreviewAboveSerializedSizeLimit()
     {
         await using var repository = new SqliteDocumentRepository(
@@ -484,6 +508,22 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SamsungNotesImport_UsesMediaBindIdInsteadOfPlacementOrder()
+    {
+        var source = Path.Combine(_root, "bound-images.sdocx");
+        WriteSamsungImageBindingFixture(source);
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets-bound-images"));
+        var importer = new DocumentImportService(store);
+
+        var result = await importer.ImportAsync(new ImportRequest(source));
+
+        var page = Assert.Single(result.Pages);
+        var image = Assert.IsType<ImageObject>(Assert.Single(page.Objects));
+        Assert.Equal("22@blue", image.AltText);
+        Assert.Equal(new RectD(100, 120, 300, 180), image.Bounds);
+    }
+
+    [Fact]
     public void SamsungNotesBulkDiscovery_FindsNotesRecursivelyAndPreservesFolders()
     {
         var root = Path.Combine(_root, "Samsung export");
@@ -796,6 +836,59 @@ public sealed class PersistenceTests : IAsyncLifetime
         var metadata = archive.CreateEntry("note.note");
         using var metadataStream = metadata.Open();
         metadataStream.Write([0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF5, 0xDD, 0xEE, 0xFF]);
+    }
+
+    private static void WriteSamsungImageBindingFixture(string path)
+    {
+        var imageObject = new byte[95];
+        WriteUInt32(imageObject, 0, 64);
+        WriteUInt16(imageObject, 4, 0);
+        imageObject[10] = 2;
+        WriteDouble(imageObject, 32, 100);
+        WriteDouble(imageObject, 40, 120);
+        WriteDouble(imageObject, 48, 400);
+        WriteDouble(imageObject, 56, 300);
+        WriteUInt32(imageObject, 64, 6);
+        WriteUInt16(imageObject, 68, 6);
+        WriteUInt32(imageObject, 70, 6);
+        WriteUInt16(imageObject, 74, 7);
+        WriteUInt32(imageObject, 76, 19);
+        WriteUInt16(imageObject, 80, 3);
+        WriteUInt32(imageObject, 82, 15);
+        imageObject[86] = 0;
+        imageObject[87] = 3;
+        imageObject[88] = 0;
+        imageObject[89] = 0;
+        imageObject[90] = 4;
+        WriteUInt32(imageObject, 91, 22);
+
+        var pageBytes = new byte[222];
+        WriteUInt32(pageBytes, 0, 64);
+        WriteUInt32(pageBytes, 0x16, 816);
+        WriteUInt32(pageBytes, 0x1A, 1056);
+        WriteUInt16(pageBytes, 64, 1);
+        WriteUInt32(pageBytes, 84, 1);
+        pageBytes[88] = 3;
+        WriteUInt32(pageBytes, 91, (uint)imageObject.Length);
+        imageObject.CopyTo(pageBytes, 95);
+
+        using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
+        using (var pageStream = archive.CreateEntry("fixture.page").Open())
+            pageStream.Write(pageBytes);
+        using (var red = archive.CreateEntry("media/11@red.png").Open())
+            red.Write([0x11]);
+        using (var blue = archive.CreateEntry("media/22@blue.png").Open())
+            blue.Write([0x22]);
+        using var metadata = archive.CreateEntry("media/mediaInfo.dat").Open();
+        foreach (var (bindId, fileName) in new[] { (11u, "11@red.png"), (22u, "22@blue.png") })
+        {
+            var nameBytes = System.Text.Encoding.Unicode.GetBytes(fileName);
+            var header = new byte[6];
+            WriteUInt32(header, 0, bindId);
+            WriteUInt16(header, 4, checked((ushort)fileName.Length));
+            metadata.Write(header);
+            metadata.Write(nameBytes);
+        }
     }
 
     private static void WriteUInt16(Span<byte> bytes, int offset, ushort value) =>

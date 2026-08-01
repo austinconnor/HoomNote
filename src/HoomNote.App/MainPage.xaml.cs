@@ -233,7 +233,9 @@ public sealed partial class MainPage : Page
     private const int PageThumbnailCacheLimit = 24;
     private const int PageThumbnailMaxWidth = 96;
     private const int PageThumbnailMaxHeight = 116;
-    private const int HomeThumbnailMaxSerializedCharacters = 1_000_000;
+    private const int HomeThumbnailMaxSerializedCharacters = 4_000_000;
+    private const int HomeThumbnailMaxWidth = 320;
+    private const int HomeThumbnailMaxHeight = 400;
     private const int PageThumbnailRefreshDelayMs = 400;
     private int _thumbnailPriorityGeneration;
     private readonly List<CanvasCachedGeometry> _liveInkGeometryChunks = [];
@@ -258,6 +260,11 @@ public sealed partial class MainPage : Page
         Guid PageId,
         SizeD PageSize,
         CanvasBitmap Bitmap);
+
+    private readonly struct CanvasBlendScope(CanvasDrawingSession session, CanvasBlend previous) : IDisposable
+    {
+        public void Dispose() => session.Blend = previous;
+    }
     private readonly Dictionary<Guid, StrokeGeometryCacheEntry> _strokeGeometryCache = [];
     private readonly LinkedList<Guid> _strokeGeometryLru = [];
     private readonly Dictionary<Guid, LinkedListNode<Guid>> _strokeGeometryLruNodes = [];
@@ -328,10 +335,11 @@ public sealed partial class MainPage : Page
     private CanvasCommandList? _pageRenderCache;
     private CanvasRenderTarget? _lowZoomPageRaster;
     private Guid? _lowZoomPageRasterPageId;
-    private AdjacentPagePreview? _previousPagePreview;
-    private AdjacentPagePreview? _nextPagePreview;
-    private CancellationTokenSource? _adjacentPagePreviewCancellation;
-    private int _adjacentPagePreviewGeneration;
+    private readonly Dictionary<Guid, AdjacentPagePreview> _notebookPagePreviews = [];
+    private readonly Dictionary<Guid, Task> _notebookPagePreviewLoads = [];
+    private CancellationTokenSource? _notebookPagePreviewCancellation;
+    private int _notebookPagePreviewGeneration;
+    private int _notebookPagePreviewLongEdge = 1536;
     private readonly Dictionary<(int X, int Y), CanvasRenderTarget> _navigationTiles = [];
     private readonly LinkedList<(int X, int Y)> _navigationTileLru = [];
     private readonly Dictionary<(int X, int Y), LinkedListNode<(int X, int Y)>> _navigationTileLruNodes = [];
@@ -353,8 +361,8 @@ public sealed partial class MainPage : Page
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
     private const int NavigationTileObjectThreshold = 256;
     private const float ContinuousPageGap = 28;
-    private const int AdjacentPagePreviewLongEdge = 512;
-    private const int AdjacentPagePreviewDelayMs = 180;
+    private const int AdjacentPagePreviewLongEdge = 1536;
+    private const long NotebookPagePreviewByteBudget = 256L * 1024 * 1024;
 
     private SqliteDocumentRepository? _repository;
     private MainWindow? _hostWindow;
@@ -422,12 +430,15 @@ public sealed partial class MainPage : Page
     private double _touchPageScrollAnchorY;
     private bool _zoomNavigationActive;
     private bool _wheelZoomAnimating;
+    private bool _wheelScrollAnimating;
     private bool _viewportFramePumpActive;
     private double _wheelZoomTarget = 1;
     private double _wheelZoomStart = 1;
     private Point _wheelZoomAnchorScreen;
     private PointD _wheelZoomAnchorPage;
     private long _wheelZoomAnimationStarted;
+    private float _wheelScrollVelocity;
+    private long _wheelScrollTimestamp;
     private long _lastPenInteractionTimestamp;
     private long _lastNativeTouchTimestamp;
     private int _pointerClassificationLogCount;
@@ -727,8 +738,8 @@ public sealed partial class MainPage : Page
         foreach (var cancellation in _homeThumbnailLoads.Values) cancellation.Cancel();
         _homeThumbnailLoads.Clear();
         _documentLoadCancellation?.Cancel();
-        _adjacentPagePreviewCancellation?.Cancel();
-        _adjacentPagePreviewCancellation = null;
+        _notebookPagePreviewCancellation?.Cancel();
+        _notebookPagePreviewCancellation = null;
         _pageThumbnailCache.Clear();
         _pageThumbnailLru.Clear();
         _settingsSaveDebounce?.Cancel();
@@ -746,7 +757,7 @@ public sealed partial class MainPage : Page
         DrawingSurface.RemoveFromVisualTree();
         lock (_pageRenderGate)
         {
-            DisposeAdjacentPagePreviewsCore();
+            DisposeNotebookPagePreviewsCore();
             InvalidatePageRenderCacheCore();
             ClearStrokeGeometryCacheCore();
             ClearImageBitmapCacheCore();
@@ -822,8 +833,11 @@ public sealed partial class MainPage : Page
             : null;
         HomeLibraryTitle.Text = currentFolder?.Name ?? "Your library";
         HomeLibrarySubtitle.Text = currentFolder is null
-            ? "Browse folders first, then pick up a recently edited notebook."
-            : "Open a subfolder or choose a notebook. Use Home to return to the main library.";
+            ? "Browse folders or open any notebook."
+            : "Open a subfolder or choose a notebook.";
+        HomeLibraryBackButton.Visibility = currentFolder is null
+            ? Visibility.Collapsed
+            : Visibility.Visible;
 
         var childFolders = layout.ChildFolders;
         if (childFolders.Count > 0)
@@ -840,24 +854,12 @@ public sealed partial class MainPage : Page
             _homeLibraryGroups.Add(group);
         }
 
-        var recent = layout.RecentDocuments;
-        if (recent.Count > 0)
-        {
-            var group = new HomeNotebookGroup("Recently edited");
-            foreach (var document in recent)
-                group.Add(new HomeNotebookCard(
-                    document with { Color = EffectiveDocumentColor(document.Id) }));
-            _homeLibraryGroups.Add(group);
-        }
-
-        var remaining = layout.RemainingDocuments;
-        if (remaining.Count > 0)
+        if (layout.Documents.Count > 0)
         {
             var group = new HomeNotebookGroup("All notebooks");
-            foreach (var document in remaining)
+            foreach (var document in layout.Documents)
                 group.Add(new HomeNotebookCard(
-                    document with { Color = EffectiveDocumentColor(document.Id) },
-                    shouldLoadThumbnail: false));
+                    document with { Color = EffectiveDocumentColor(document.Id) }));
             _homeLibraryGroups.Add(group);
         }
     }
@@ -892,14 +894,9 @@ public sealed partial class MainPage : Page
                     card.IsLoading = false;
                     return;
                 }
-                if (_pageThumbnailCache.TryGetValue(page.Id, out var cached))
-                {
-                    card.Thumbnail = cached;
-                    card.IsLoading = false;
-                    return;
-                }
-
-                var size = PageThumbnailSize(page);
+                // Home cards are much larger than the page rail. Reusing the rail's 96 px
+                // bitmap made notebook covers visibly soft and also kept stale first-page ink.
+                var size = ThumbnailSize(page, HomeThumbnailMaxWidth, HomeThumbnailMaxHeight);
                 var bytes = await _pageThumbnailRenderer.RenderAsync(
                     page, size.Width, size.Height, cancellation.Token);
                 cancellation.Token.ThrowIfCancellationRequested();
@@ -919,7 +916,6 @@ public sealed partial class MainPage : Page
                 };
                 await bitmap.SetSourceAsync(stream);
                 cancellation.Token.ThrowIfCancellationRequested();
-                CachePageThumbnail(page.Id, bitmap);
                 card.Thumbnail = bitmap;
                 card.IsLoading = false;
             }
@@ -958,6 +954,14 @@ public sealed partial class MainPage : Page
         if (card.DocumentId is not { } documentId) return;
         await LoadDocumentAsync(documentId);
         SelectLibraryDocument(documentId);
+    }
+
+    private void OnHomeLibraryBackClick(object sender, RoutedEventArgs e)
+    {
+        if (_homeFolderId is not { } folderId) return;
+        _homeFolderId = _userPreferences.NotebookFolders
+            .FirstOrDefault(folder => folder.Id == folderId)?.ParentId;
+        RebuildHomeLibrary();
     }
 
     private string EffectiveDocumentColor(Guid documentId)
@@ -1937,8 +1941,11 @@ public sealed partial class MainPage : Page
             foreach (var page in loaded.Pages) _pages.Add(page);
             _loading = false;
             var selectedIndex = pageId is null ? 0 : loaded.Pages.FindIndex(page => page.Id == pageId);
-            PageList.SelectedIndex = Math.Max(0, selectedIndex);
-            SelectPage(loaded.Pages.ElementAtOrDefault(Math.Max(0, selectedIndex)));
+            selectedIndex = Math.Max(0, selectedIndex);
+            var selectedPage = loaded.Pages.ElementAtOrDefault(selectedIndex);
+            StartNotebookPagePreviewPreload(loaded, selectedPage);
+            PageList.SelectedIndex = selectedIndex;
+            SelectPage(selectedPage);
             var elapsed = MillisecondsSince(started);
             DiagnosticsLog.Info("document.load_completed",
                 ("document_id", id),
@@ -2212,6 +2219,7 @@ public sealed partial class MainPage : Page
 
     private void ClearCurrentNotebook(Guid documentId)
     {
+        ResetNotebookPagePreviews();
         _document = null;
         _page = null;
         _pages.Clear();
@@ -2358,58 +2366,139 @@ public sealed partial class MainPage : Page
         BeginPdfPreviewLoad();
         // Preserve native PDF text selection/copy. This extracts embedded text and is not OCR.
         BeginSemanticTextLoad(page);
-        RequestAdjacentPagePreviews(page);
+        RequestVisiblePagePreviews(page);
+        if (page is not null)
+        {
+            lock (_pageRenderGate)
+                if (_notebookPagePreviews.ContainsKey(page.Id))
+                    BeginNavigationSettle();
+        }
         UpdateEmptyState();
         InvalidateCanvas();
     }
 
-    private void RequestAdjacentPagePreviews(NotePage? page)
+    private void ResetNotebookPagePreviews()
     {
-        _adjacentPagePreviewCancellation?.Cancel();
-        _adjacentPagePreviewCancellation?.Dispose();
-        _adjacentPagePreviewCancellation = null;
-        var generation = ++_adjacentPagePreviewGeneration;
-
-        if (_document is null || page is null || _document.Kind == DocumentKind.InfiniteCanvas ||
-            _pageThumbnailRenderer is null)
-        {
-            lock (_pageRenderGate) DisposeAdjacentPagePreviewsCore();
-            return;
-        }
-
-        var index = _document.Pages.FindIndex(item => item.Id == page.Id);
-        if (index < 0) return;
-        var previous = index > 0 ? _document.Pages[index - 1] : null;
-        var next = index + 1 < _document.Pages.Count ? _document.Pages[index + 1] : null;
-        var cancellation = _adjacentPagePreviewCancellation = new CancellationTokenSource();
-        _ = LoadAdjacentPagePreviewsAsync(previous, next, generation, cancellation);
+        var cancellation = _notebookPagePreviewCancellation;
+        _notebookPagePreviewCancellation = null;
+        cancellation?.Cancel();
+        cancellation?.Dispose();
+        _notebookPagePreviewGeneration++;
+        _notebookPagePreviewLoads.Clear();
+        lock (_pageRenderGate) DisposeNotebookPagePreviewsCore();
     }
 
-    private async Task LoadAdjacentPagePreviewsAsync(
-        NotePage? previous,
-        NotePage? next,
-        int generation,
-        CancellationTokenSource cancellation)
+    private void StartNotebookPagePreviewPreload(
+        HoomNoteDocument document,
+        NotePage? selectedPage)
     {
-        AdjacentPagePreview? previousPreview = null;
-        AdjacentPagePreview? nextPreview = null;
+        ResetNotebookPagePreviews();
+        if (document.Kind == DocumentKind.InfiniteCanvas || _pageThumbnailRenderer is null ||
+            document.Pages.Count == 0) return;
+
+        var generation = _notebookPagePreviewGeneration;
+        var cancellation = _notebookPagePreviewCancellation = new CancellationTokenSource();
+        _notebookPagePreviewLongEdge = Math.Clamp(
+            (int)Math.Floor(Math.Sqrt(
+                NotebookPagePreviewByteBudget / (4d * document.Pages.Count))),
+            512,
+            AdjacentPagePreviewLongEdge);
+        var selectedIndex = selectedPage is null
+            ? 0
+            : Math.Max(0, document.Pages.FindIndex(page => page.Id == selectedPage.Id));
+        var orderedPages = document.Pages
+            .Select((page, index) => (Page: page, Index: index))
+            .OrderBy(item => Math.Abs(item.Index - selectedIndex))
+            .ThenBy(item => item.Index)
+            .Select(item => item.Page)
+            .ToArray();
+        _ = PreloadNotebookPagePreviewsAsync(
+            document.Id, orderedPages, generation, cancellation.Token);
+    }
+
+    private async Task PreloadNotebookPagePreviewsAsync(
+        Guid documentId,
+        IReadOnlyList<NotePage> pages,
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        var loadedCount = 0;
         try
         {
-            await Task.Delay(AdjacentPagePreviewDelayMs, cancellation.Token);
-            previousPreview = await RenderAdjacentPagePreviewAsync(previous, cancellation.Token);
-            nextPreview = await RenderAdjacentPagePreviewAsync(next, cancellation.Token);
-            cancellation.Token.ThrowIfCancellationRequested();
-            if (generation != _adjacentPagePreviewGeneration) return;
+            foreach (var page in pages)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await EnsureNotebookPagePreviewAsync(page, generation, cancellationToken);
+                loadedCount++;
+            }
+            if (_document?.Id == documentId && generation == _notebookPagePreviewGeneration)
+            {
+                DiagnosticsLog.Info("page.previews_ready",
+                    ("document_id", documentId), ("pages", loadedCount));
+                StatusText.Text = "Ready • pages preloaded";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.Warning("page.preview_preload_failed",
+                ("document_id", documentId), ("error", exception.Message));
+        }
+    }
 
+    private void RequestVisiblePagePreviews(NotePage? page)
+    {
+        if (_document is null || page is null ||
+            _document.Kind == DocumentKind.InfiniteCanvas || _pageThumbnailRenderer is null)
+            return;
+        if (_notebookPagePreviewCancellation is null)
+            StartNotebookPagePreviewPreload(_document, page);
+
+        var generation = _notebookPagePreviewGeneration;
+        var token = _notebookPagePreviewCancellation?.Token ?? CancellationToken.None;
+        var index = _document.Pages.FindIndex(item => item.Id == page.Id);
+        if (index < 0) return;
+        for (var candidate = Math.Max(0, index - 1);
+             candidate <= Math.Min(_document.Pages.Count - 1, index + 1);
+             candidate++)
+            _ = EnsureNotebookPagePreviewAsync(_document.Pages[candidate], generation, token);
+    }
+
+    private Task EnsureNotebookPagePreviewAsync(
+        NotePage page,
+        int generation,
+        CancellationToken cancellationToken,
+        bool refresh = false)
+    {
+        lock (_pageRenderGate)
+            if (!refresh && _notebookPagePreviews.ContainsKey(page.Id))
+                return Task.CompletedTask;
+        if (_notebookPagePreviewLoads.TryGetValue(page.Id, out var existing)) return existing;
+        var task = LoadNotebookPagePreviewAsync(page, generation, cancellationToken);
+        _notebookPagePreviewLoads[page.Id] = task;
+        return task;
+    }
+
+    private async Task LoadNotebookPagePreviewAsync(
+        NotePage page,
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        AdjacentPagePreview? preview = null;
+        try
+        {
+            preview = await RenderNotebookPagePreviewAsync(page, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (preview is null || generation != _notebookPagePreviewGeneration) return;
             lock (_pageRenderGate)
             {
-                if (generation != _adjacentPagePreviewGeneration) return;
-                _previousPagePreview?.Bitmap.Dispose();
-                _nextPagePreview?.Bitmap.Dispose();
-                _previousPagePreview = previousPreview;
-                _nextPagePreview = nextPreview;
-                previousPreview = null;
-                nextPreview = null;
+                if (generation != _notebookPagePreviewGeneration) return;
+                if (_notebookPagePreviews.Remove(page.Id, out var previous))
+                    previous.Bitmap.Dispose();
+                _notebookPagePreviews[page.Id] = preview;
+                preview = null;
             }
             InvalidateCanvas();
         }
@@ -2418,24 +2507,22 @@ public sealed partial class MainPage : Page
         }
         catch (Exception exception)
         {
-            DiagnosticsLog.Warning("page.adjacent_preview_failed", ("error", exception.Message));
+            DiagnosticsLog.Warning("page.preview_failed",
+                ("page_id", page.Id), ("error", exception.Message));
         }
         finally
         {
-            previousPreview?.Bitmap.Dispose();
-            nextPreview?.Bitmap.Dispose();
-            if (ReferenceEquals(_adjacentPagePreviewCancellation, cancellation))
-                _adjacentPagePreviewCancellation = null;
-            cancellation.Dispose();
+            preview?.Bitmap.Dispose();
+            _notebookPagePreviewLoads.Remove(page.Id);
         }
     }
 
-    private async Task<AdjacentPagePreview?> RenderAdjacentPagePreviewAsync(
+    private async Task<AdjacentPagePreview?> RenderNotebookPagePreviewAsync(
         NotePage? page,
         CancellationToken cancellationToken)
     {
         if (page is null || _pageThumbnailRenderer is null) return null;
-        var scale = AdjacentPagePreviewLongEdge /
+        var scale = _notebookPagePreviewLongEdge /
                     Math.Max(1d, Math.Max(page.Size.Width, page.Size.Height));
         var pixelWidth = Math.Max(1, (int)Math.Round(page.Size.Width * scale));
         var pixelHeight = Math.Max(1, (int)Math.Round(page.Size.Height * scale));
@@ -2457,12 +2544,11 @@ public sealed partial class MainPage : Page
         return new AdjacentPagePreview(page.Id, page.Size, bitmap);
     }
 
-    private void DisposeAdjacentPagePreviewsCore()
+    private void DisposeNotebookPagePreviewsCore()
     {
-        _previousPagePreview?.Bitmap.Dispose();
-        _nextPagePreview?.Bitmap.Dispose();
-        _previousPagePreview = null;
-        _nextPagePreview = null;
+        foreach (var preview in _notebookPagePreviews.Values)
+            preview.Bitmap.Dispose();
+        _notebookPagePreviews.Clear();
     }
 
     private void BeginSemanticTextLoad(NotePage? page)
@@ -2615,9 +2701,9 @@ public sealed partial class MainPage : Page
         // Ink, eraser, selection, and style gestures render exclusively on the
         // interaction overlay. Only actual viewport navigation may select the
         // low-memory navigation snapshot for the committed page.
-        var interactionActive = (_isPointerDown && _gestureTool == EditorTool.Pan) ||
+        var interactionActive = _isPointerDown ||
                                 _touchPoints.Count > 0 ||
-                                _touchInertiaActive || _wheelZoomAnimating ||
+                                _touchInertiaActive || _wheelZoomAnimating || _wheelScrollAnimating ||
                                 _zoomNavigationActive;
         Volatile.Write(ref _publishedPageRenderState, new PageRenderState(
             _publishedPageSnapshot,
@@ -2693,29 +2779,39 @@ public sealed partial class MainPage : Page
         NotePage page,
         PageRenderState state)
     {
-        if (_document?.Kind == DocumentKind.InfiniteCanvas) return;
-        var currentTop = (state.Height - page.Size.Height * state.Zoom) / 2d + state.Pan.Y;
-        var currentBottom = currentTop + page.Size.Height * state.Zoom;
-        DrawAdjacentPagePreview(drawingSession, _previousPagePreview,
-            currentTop - ContinuousPageGap, aboveCurrentPage: true, state);
-        DrawAdjacentPagePreview(drawingSession, _nextPagePreview,
-            currentBottom + ContinuousPageGap, aboveCurrentPage: false, state);
+        if (_document is not { Kind: not DocumentKind.InfiniteCanvas } document) return;
+        var index = document.Pages.FindIndex(candidate => candidate.Id == page.Id);
+        if (index < 0) return;
+        var viewport = new SizeD(state.Width, state.Height);
+        var currentBounds = ContinuousPageLayout.CurrentBounds(
+            page.Size, state.Zoom, state.Pan.X, state.Pan.Y, viewport);
+        if (index > 0 &&
+            _notebookPagePreviews.TryGetValue(document.Pages[index - 1].Id, out var previous))
+        {
+            var bounds = ContinuousPageLayout.AdjacentBounds(
+                currentBounds, previous.PageSize, state.Zoom, state.Pan.X, viewport,
+                aboveCurrentPage: true, ContinuousPageGap);
+            DrawAdjacentPagePreview(drawingSession, previous, bounds, state);
+        }
+        if (index + 1 < document.Pages.Count &&
+            _notebookPagePreviews.TryGetValue(document.Pages[index + 1].Id, out var next))
+        {
+            var bounds = ContinuousPageLayout.AdjacentBounds(
+                currentBounds, next.PageSize, state.Zoom, state.Pan.X, viewport,
+                aboveCurrentPage: false, ContinuousPageGap);
+            DrawAdjacentPagePreview(drawingSession, next, bounds, state);
+        }
     }
 
     private static void DrawAdjacentPagePreview(
         CanvasDrawingSession drawingSession,
-        AdjacentPagePreview? preview,
-        double edge,
-        bool aboveCurrentPage,
+        AdjacentPagePreview preview,
+        RectD bounds,
         PageRenderState state)
     {
-        if (preview is null) return;
-        var width = preview.PageSize.Width * state.Zoom;
-        var height = preview.PageSize.Height * state.Zoom;
-        var left = (state.Width - width) / 2d + state.Pan.X;
-        var top = aboveCurrentPage ? edge - height : edge;
-        if (top >= state.Height || top + height <= 0) return;
-        drawingSession.DrawImage(preview.Bitmap, new Rect(left, top, width, height));
+        if (bounds.Y >= state.Height || bounds.Bottom <= 0) return;
+        drawingSession.DrawImage(preview.Bitmap,
+            new Rect(bounds.X, bounds.Y, bounds.Width, bounds.Height));
     }
 
     private void RequestErasePreviewRetire(int renderedEditVersion)
@@ -2909,8 +3005,8 @@ public sealed partial class MainPage : Page
             ? Color.FromArgb(170, 245, 247, 250)
             : Color.FromArgb(145, 31, 35, 42);
         drawingSession.DrawText(
-            (pageIndex + 1).ToString(),
-            new Rect(anchor.X - 30, anchor.Y - 21, 60, 16),
+            $"{pageIndex + 1} of {_pages.Count}",
+            new Rect(anchor.X - 55, anchor.Y - 21, 110, 16),
             color,
             _pageNumberTextFormat);
         drawingSession.Transform = previous;
@@ -3015,6 +3111,18 @@ public sealed partial class MainPage : Page
         // used again once the user zooms in far enough to benefit from their extra resolution.
         // Every scene revision first records a complete fallback. Tile refinement is never
         // presented against an empty surface or an obsolete pre-undo page.
+        var retainedPageReady =
+            (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) ||
+            (_pageRenderCache is not null && _pageRenderCachePageId == page.Id);
+        if (!retainedPageReady && state.InteractionActive &&
+            _notebookPagePreviews.TryGetValue(page.Id, out var preloadedPreview))
+        {
+            drawingSession.DrawImage(preloadedPreview.Bitmap,
+                new Rect(0, 0, page.Size.Width, page.Size.Height));
+            _frameRenderMode = "preloaded-page";
+            return;
+        }
+
         EnsureLowZoomPageRaster(device, page);
         var useLowZoomRaster = CanUseNavigationSnapshot(page, state);
         if (useLowZoomRaster)
@@ -3434,8 +3542,8 @@ public sealed partial class MainPage : Page
     private void DrawLiveInk(CanvasDrawingSession drawingSession)
     {
         var style = (_gestureInkStyle ?? CurrentInkStyle()).Normalize();
-        var color = ParseColor(
-            style.Color, CanvasObjectRenderPolicy.SourceOverOpacity(style));
+        using var blend = ConfigureInkBlend(
+            drawingSession, style, IsDarkColor(_page?.Template.PaperColor ?? "#FFFDF8"), out var color);
         var width = style.Width;
         if (style.Tool == InkToolKind.Highlighter && HighlighterStraightCheckBox.IsChecked == true && _activeInk.Count > 1)
         {
@@ -3778,9 +3886,9 @@ public sealed partial class MainPage : Page
     {
         if (stroke.Points.Count == 0) return;
         var normalizedStyle = stroke.Style.Normalize();
-        var color = ParseColor(
-            normalizedStyle.Color,
-            CanvasObjectRenderPolicy.SourceOverOpacity(normalizedStyle));
+        using var blend = ConfigureInkBlend(
+            drawingSession, normalizedStyle,
+            IsDarkColor(_page?.Template.PaperColor ?? "#FFFDF8"), out var color);
         if (cacheGeometry && TryDrawCachedInk(drawingSession, stroke, color)) return;
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
@@ -3799,6 +3907,38 @@ public sealed partial class MainPage : Page
 
         using var geometry = CreateWindingGeometry(drawingSession, outline.Contour);
         drawingSession.FillGeometry(geometry, color);
+    }
+
+    private static CanvasBlendScope ConfigureInkBlend(
+        CanvasDrawingSession drawingSession,
+        InkStyle style,
+        bool darkSurface,
+        out Color color)
+    {
+        var previous = drawingSession.Blend;
+        if (style.Tool != InkToolKind.Highlighter)
+        {
+            color = ParseColor(style.Color, CanvasObjectRenderPolicy.SourceOverOpacity(style));
+            return new CanvasBlendScope(drawingSession, previous);
+        }
+
+        var source = ParseColor(style.Color);
+        if (darkSurface)
+        {
+            drawingSession.Blend = CanvasBlend.Add;
+            color = Color.FromArgb(
+                (byte)Math.Round(CanvasObjectRenderPolicy.HighlighterBlendStrength(style) * 255),
+                source.R, source.G, source.B);
+        }
+        else
+        {
+            drawingSession.Blend = CanvasBlend.Min;
+            color = Color.FromArgb(255,
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.R, style),
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.G, style),
+                CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(source.B, style));
+        }
+        return new CanvasBlendScope(drawingSession, previous);
     }
 
     private bool TryDrawCachedInk(CanvasDrawingSession drawingSession, InkStrokeObject stroke, Color color)
@@ -4149,6 +4289,7 @@ public sealed partial class MainPage : Page
     {
         if (_page is null) return;
         StopWheelZoomAnimation(resumeBackgroundWork: false);
+        StopWheelScrollAnimation(resumeBackgroundWork: false);
         var point = e.GetCurrentPoint(DrawingSurface);
         if (point.PointerDeviceType == PointerDeviceType.Mouse &&
             MillisecondsSince(_lastNativeTouchTimestamp) < 500)
@@ -4197,6 +4338,15 @@ public sealed partial class MainPage : Page
         var middleMousePan = point.PointerDeviceType == PointerDeviceType.Mouse && point.Properties.IsMiddleButtonPressed;
         _gestureTool = _readMode || rightMousePan || middleMousePan ? EditorTool.Pan :
             point.Properties.IsEraser ? EditorTool.StrokeEraser : _activeTool;
+        if (_gestureTool != EditorTool.Pan && !TryActivateVisiblePageAt(point.Position))
+        {
+            _isPointerDown = false;
+            _penActive = false;
+            ResumeBackgroundRecognition();
+            ResumeThumbnailRefresh();
+            e.Handled = true;
+            return;
+        }
         _screenStart = point.Position;
         _panStart = _pan;
         _gestureScreenToPageValid = Matrix3x2.Invert(PageTransform(), out _gestureScreenToPage);
@@ -4565,6 +4715,7 @@ public sealed partial class MainPage : Page
         }
 
         StopTouchInertia(resumeBackgroundWork: true);
+        StopWheelScrollAnimation(resumeBackgroundWork: false);
 
         var firstTouch = _touchPoints.Count == 0;
         _touchPoints[point.PointerId] = point.Position;
@@ -4867,20 +5018,68 @@ public sealed partial class MainPage : Page
         var desiredTop = targetIndex > currentIndex
             ? oldBottom + pageGap
             : oldTop - pageGap - (float)(target.Size.Height * oldZoom);
-        var centeredTop = (float)((_canvasHeight - target.Size.Height * oldZoom) / 2d);
+        SwitchToVisiblePage(target, desiredTop, oldZoom, oldPan.X);
+        return true;
+    }
 
+    private bool TryActivateVisiblePageAt(Point screenPoint)
+    {
+        if (_document is null || _page is null ||
+            _document.Kind == DocumentKind.InfiniteCanvas) return true;
+        var currentIndex = _document.Pages.FindIndex(page => page.Id == _page.Id);
+        if (currentIndex < 0) return false;
+        var viewport = new SizeD(_canvasWidth, _canvasHeight);
+        var currentBounds = ContinuousPageLayout.CurrentBounds(
+            _page.Size, _zoom, _pan.X, _pan.Y, viewport);
+        RectD? previousBounds = null;
+        RectD? nextBounds = null;
+        if (currentIndex > 0)
+            previousBounds = ContinuousPageLayout.AdjacentBounds(
+                currentBounds, _document.Pages[currentIndex - 1].Size, _zoom, _pan.X,
+                viewport, aboveCurrentPage: true, ContinuousPageGap);
+        if (currentIndex + 1 < _document.Pages.Count)
+            nextBounds = ContinuousPageLayout.AdjacentBounds(
+                currentBounds, _document.Pages[currentIndex + 1].Size, _zoom, _pan.X,
+                viewport, aboveCurrentPage: false, ContinuousPageGap);
+
+        var slot = ContinuousPageLayout.HitTest(
+            new PointD(screenPoint.X, screenPoint.Y), currentBounds, previousBounds, nextBounds);
+        if (slot is null) return false;
+        if (slot == ContinuousPageSlot.Current) return true;
+        var targetIndex = currentIndex + (int)slot.Value;
+        var targetBounds = slot == ContinuousPageSlot.Previous ? previousBounds : nextBounds;
+        if (targetBounds is null || targetIndex < 0 || targetIndex >= _document.Pages.Count)
+            return false;
+        SwitchToVisiblePage(
+            _document.Pages[targetIndex], targetBounds.Value.Y, _zoom, _pan.X);
+        return true;
+    }
+
+    private void SwitchToVisiblePage(
+        NotePage target,
+        double targetTop,
+        double preservedZoom,
+        float preservedPanX)
+    {
+        if (_document is null || _page?.Id == target.Id) return;
+        var targetIndex = _document.Pages.FindIndex(page => page.Id == target.Id);
+        if (targetIndex < 0) return;
         _loading = true;
         PageList.SelectedItem = target;
         _loading = false;
         _tabPageSelections[_document.Id] = target.Id;
         SelectPage(target);
-        _zoom = oldZoom;
-        _pan = new Vector2(oldPan.X, desiredTop - centeredTop);
+        _zoom = preservedZoom;
+        _pan = new Vector2(
+            preservedPanX,
+            (float)ContinuousPageLayout.PanYForPageTop(
+                targetTop, target.Size, preservedZoom, _canvasHeight));
+        ClampHorizontalPan();
         _fitPending = false;
         PageList.ScrollIntoView(target);
         PointerStatus.Text = $"Page {targetIndex + 1} of {_pages.Count}";
+        BeginNavigationSettle();
         InvalidateCanvas();
-        return true;
     }
 
     private void ResetTouchPageScroll()
@@ -4966,7 +5165,7 @@ public sealed partial class MainPage : Page
     private void OnNavigationSettleTick(DispatcherQueueTimer sender, object args)
     {
         if (_isPointerDown || _cornerZoomDragging || _touchPoints.Count > 0 ||
-            _touchInertiaActive || _wheelZoomAnimating)
+            _touchInertiaActive || _wheelZoomAnimating || _wheelScrollAnimating)
         {
             sender.Start();
             return;
@@ -4999,6 +5198,27 @@ public sealed partial class MainPage : Page
         return true;
     }
 
+    private bool AdvanceWheelScroll()
+    {
+        if (!_wheelScrollAnimating || _page is null || _isPointerDown || _touchPoints.Count > 0)
+        {
+            StopWheelScrollAnimation(resumeBackgroundWork: true);
+            return false;
+        }
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var elapsedSeconds = Math.Clamp(
+            (now - _wheelScrollTimestamp) / (double)System.Diagnostics.Stopwatch.Frequency,
+            0.001,
+            0.05);
+        _wheelScrollTimestamp = now;
+        _pan.Y += _wheelScrollVelocity * (float)elapsedSeconds;
+        TryContinueToAdjacentPage();
+        _wheelScrollVelocity *= (float)Math.Exp(-11 * elapsedSeconds);
+        if (Math.Abs(_wheelScrollVelocity) < 18)
+            StopWheelScrollAnimation(resumeBackgroundWork: true);
+        return true;
+    }
+
     private void ApplyZoomAtAnchor(double zoom, PointD pageAnchor, Point screenAnchor)
     {
         _zoom = Math.Clamp(zoom, _minimumZoom, _maximumZoom);
@@ -5020,6 +5240,22 @@ public sealed partial class MainPage : Page
         _wheelZoomAnimating = false;
         _wheelZoomTarget = _zoom;
         _wheelZoomStart = _zoom;
+        StopViewportFramePumpIfIdle();
+        if (!resumeBackgroundWork) return;
+        ResumeBackgroundRecognition();
+        ResumeThumbnailRefresh();
+    }
+
+    private void StopWheelScrollAnimation(bool resumeBackgroundWork)
+    {
+        if (!_wheelScrollAnimating)
+        {
+            _wheelScrollVelocity = 0;
+            return;
+        }
+        _wheelScrollAnimating = false;
+        _wheelScrollVelocity = 0;
+        BeginNavigationSettle();
         StopViewportFramePumpIfIdle();
         if (!resumeBackgroundWork) return;
         ResumeBackgroundRecognition();
@@ -5061,16 +5297,26 @@ public sealed partial class MainPage : Page
         if (_readMode || !IsControlDown())
         {
             StopWheelZoomAnimation(resumeBackgroundWork: false);
-            _pan.Y += delta * 0.65f;
+            PauseBackgroundRecognition();
+            PauseThumbnailRefresh();
+            BeginNavigationSettle();
+            _pan.Y += delta * 0.13f;
+            if (!_wheelScrollAnimating)
+            {
+                _wheelScrollAnimating = true;
+                _wheelScrollTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                EnsureViewportFramePump();
+            }
+            _wheelScrollVelocity = Math.Clamp(
+                _wheelScrollVelocity + delta * 5.7f, -5_000, 5_000);
             _fitPending = false;
             TryContinueToAdjacentPage();
             e.Handled = true;
             InvalidateCanvas();
-            ResumeBackgroundRecognition();
-            ResumeThumbnailRefresh();
             return;
         }
 
+        StopWheelScrollAnimation(resumeBackgroundWork: false);
         BeginNavigationSettle();
         PauseBackgroundRecognition();
         PauseThumbnailRefresh();
@@ -5192,7 +5438,8 @@ public sealed partial class MainPage : Page
 
         var tolerance = 10 / _zoom;
         _selectedObject = _spatialIndex.Query(new RectD(point.X - tolerance, point.Y - tolerance, tolerance * 2, tolerance * 2))
-            .Where(item => (!item.IsLocked || item is ImageObject) && StrokeGeometry.HitTest(item, point, tolerance))
+            .Where(item => (!item.IsLocked || item is ImageObject or ShapeObject) &&
+                           StrokeGeometry.HitTest(item, point, tolerance))
             .OrderByDescending(item => item.ZIndex)
             .FirstOrDefault();
         _selectedObjects.Clear();
@@ -5592,29 +5839,13 @@ public sealed partial class MainPage : Page
                 var bounds = StrokeGeometry.GetWorldBounds(item);
                 if (!bounds.Intersects(area)) return false;
                 if (!lasso) return true;
-                return PointInPolygon(bounds.Center, points) ||
-                       PointInPolygon(new PointD(bounds.Left, bounds.Top), points) ||
-                       PointInPolygon(new PointD(bounds.Right, bounds.Bottom), points);
+                return LassoSelection.Intersects(item, points);
             }).ToArray();
         _selectedObjects.Clear();
         _selectedObjects.AddRange(selected);
         _selectedObject = selected.Length == 1 ? selected[0] : null;
         ClearTextSelection();
         UpdateSelectionUi();
-    }
-
-    private static bool PointInPolygon(PointD point, IReadOnlyList<PointD> polygon)
-    {
-        var inside = false;
-        for (int left = 0, right = polygon.Count - 1; left < polygon.Count; right = left++)
-        {
-            var a = polygon[left];
-            var b = polygon[right];
-            if ((a.Y > point.Y) == (b.Y > point.Y)) continue;
-            var crossing = (b.X - a.X) * (point.Y - a.Y) / (b.Y - a.Y) + a.X;
-            if (point.X < crossing) inside = !inside;
-        }
-        return inside;
     }
 
     private void CommitSegmentErase()
@@ -5849,6 +6080,12 @@ public sealed partial class MainPage : Page
         var page = pageId is null ? null : _document?.Pages.FirstOrDefault(item => item.Id == pageId);
         _pendingThumbnailRefreshPageId = null;
         if (page is null) return;
+        if (_notebookPagePreviewCancellation is { } previewCancellation)
+            _ = EnsureNotebookPagePreviewAsync(
+                page,
+                _notebookPagePreviewGeneration,
+                previewCancellation.Token,
+                refresh: true);
         if (PageSidebar.Visibility == Visibility.Visible && PageColumn.Width.Value > 0)
             RequestPageThumbnail(page, refresh: true, prioritize: true);
         else
@@ -6375,11 +6612,13 @@ public sealed partial class MainPage : Page
     }
 
     private static (int Width, int Height) PageThumbnailSize(NotePage page)
+        => ThumbnailSize(page, PageThumbnailMaxWidth, PageThumbnailMaxHeight);
+
+    private static (int Width, int Height) ThumbnailSize(NotePage page, int maxWidth, int maxHeight)
     {
         var pageWidth = Math.Max(1, page.Size.Width);
         var pageHeight = Math.Max(1, page.Size.Height);
-        var scale = Math.Min(PageThumbnailMaxWidth / pageWidth,
-            PageThumbnailMaxHeight / pageHeight);
+        var scale = Math.Min(maxWidth / pageWidth, maxHeight / pageHeight);
         return (
             Math.Max(1, (int)Math.Round(pageWidth * scale)),
             Math.Max(1, (int)Math.Round(pageHeight * scale)));
@@ -7089,6 +7328,14 @@ public sealed partial class MainPage : Page
     {
         if (_syncingInkWidth || StrokeWidthSlider is null) return;
         SetInkWidth(double.IsFinite(args.NewValue) ? args.NewValue : StrokeWidthSlider.Value);
+    }
+
+    private void OnInkSizePresetClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string rawSize } &&
+            double.TryParse(rawSize, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var size))
+            SetInkWidth(size);
     }
 
     private void SetInkWidth(double requestedWidth)
@@ -7997,10 +8244,12 @@ public sealed partial class MainPage : Page
 
     private void OnSelectionLockClick(object sender, RoutedEventArgs e)
     {
-        if (_document is null || _page is null || _selectedObject is not ImageObject image) return;
-        var updated = image with { IsLocked = !image.IsLocked };
-        _history.Execute(new ReplaceObjectsCommand(_page.Id, [image], [updated],
-            updated.IsLocked ? "Lock image" : "Unlock image"), _document);
+        if (_document is null || _page is null || _selectedObject is not { } selected ||
+            selected is not ImageObject and not ShapeObject) return;
+        var updated = selected with { IsLocked = !selected.IsLocked };
+        var objectName = selected is ShapeObject ? "shape" : "image";
+        _history.Execute(new ReplaceObjectsCommand(_page.Id, [selected], [updated],
+            updated.IsLocked ? $"Lock {objectName}" : $"Unlock {objectName}"), _document);
         _selectedObject = updated;
         _selectedObjects.Clear();
         _selectedObjects.Add(updated);
@@ -9190,7 +9439,7 @@ public sealed partial class MainPage : Page
 
     private void StopViewportFramePumpIfIdle()
     {
-        if (_touchInertiaActive || _wheelZoomAnimating ||
+        if (_touchInertiaActive || _wheelZoomAnimating || _wheelScrollAnimating ||
             (_searchFlashBounds.Count > 0 && _searchFlashStarted != 0))
         {
             return;
@@ -9205,6 +9454,7 @@ public sealed partial class MainPage : Page
         var redraw = false;
         if (_touchInertiaActive) redraw |= AdvanceTouchInertia();
         if (_wheelZoomAnimating) redraw |= AdvanceWheelZoom();
+        if (_wheelScrollAnimating) redraw |= AdvanceWheelScroll();
         if (_searchFlashBounds.Count > 0 && _searchFlashStarted != 0)
             redraw |= AdvanceSearchFlash();
         if (redraw) InvalidateCanvas();
@@ -9710,9 +9960,11 @@ public sealed partial class MainPage : Page
         var styleSource = _selectedObjects.FirstOrDefault(item => item is InkStrokeObject or ShapeObject)
                           ?? (_selectedObject is InkStrokeObject or ShapeObject ? _selectedObject : null);
         SelectionStylePanel.Visibility = styleSource is null ? Visibility.Collapsed : Visibility.Visible;
-        SelectionLockButton.Visibility = _selectedObject is ImageObject ? Visibility.Visible : Visibility.Collapsed;
-        if (_selectedObject is ImageObject selectedImage)
-            SelectionLockButton.Content = selectedImage.IsLocked ? "Unlock" : "Lock";
+        SelectionLockButton.Visibility = _selectedObject is ImageObject or ShapeObject
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        if (_selectedObject is ImageObject or ShapeObject)
+            SelectionLockButton.Content = _selectedObject.IsLocked ? "Unlock" : "Lock";
         UpdateImageLockOverlay();
         if (styleSource is not null)
         {
