@@ -192,7 +192,10 @@ public sealed partial class MainPage : Page
     private readonly LinkedList<Guid> _openDocumentLru = [];
     private readonly Dictionary<Guid, int> _openDocumentPointCounts = [];
     private const int OpenDocumentCacheLimit = 2;
-    private const int OpenDocumentCachePointBudget = 400_000;
+    // Keep the two notebooks a user is actively switching between even when both contain dense
+    // Samsung ink. The previous 400k ceiling evicted a 596k-point notebook immediately, forcing
+    // another full JSON parse on every return navigation.
+    private const int OpenDocumentCachePointBudget = 1_000_000;
     private const int ToolbarPresetLimit = 50;
     private readonly Dictionary<Guid, SpatialIndex> _pageSpatialIndexCache = [];
     private readonly LinkedList<Guid> _pageSpatialIndexLru = [];
@@ -337,6 +340,7 @@ public sealed partial class MainPage : Page
     private Guid? _lowZoomPageRasterPageId;
     private readonly Dictionary<Guid, AdjacentPagePreview> _notebookPagePreviews = [];
     private readonly Dictionary<Guid, Task> _notebookPagePreviewLoads = [];
+    private readonly HashSet<Guid> _notebookPagePreviewRefreshPending = [];
     private CancellationTokenSource? _notebookPagePreviewCancellation;
     private int _notebookPagePreviewGeneration;
     private int _notebookPagePreviewLongEdge = 1536;
@@ -356,13 +360,14 @@ public sealed partial class MainPage : Page
     // a command list created a visible hitch between letters; batching amortizes that work.
     private const int OverlayBatchSize = 8;
     private const int OverlayBatchCompactionThreshold = 8;
-    private const int NavigationTilePixels = 512;
+    private const int NavigationTilePixels = 320;
     private const int NavigationTileGutterPixels = 2;
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
     private const int NavigationTileObjectThreshold = 256;
     private const float ContinuousPageGap = 28;
     private const int AdjacentPagePreviewLongEdge = 1536;
     private const long NotebookPagePreviewByteBudget = 256L * 1024 * 1024;
+    private const int NotebookPagePreviewLookAhead = 5;
 
     private SqliteDocumentRepository? _repository;
     private MainWindow? _hostWindow;
@@ -402,7 +407,7 @@ public sealed partial class MainPage : Page
     private readonly DispatcherQueueTimer _navigationSettleTimer;
     private readonly DispatcherQueueTimer _zoomIndicatorTimer;
     private Storyboard? _zoomIndicatorFade;
-    private Guid? _pendingThumbnailRefreshPageId;
+    private readonly HashSet<Guid> _pendingThumbnailRefreshPageIds = [];
     private EditorTool _activeTool = EditorTool.Select;
     private ShapeKind _selectedShapeKind = ShapeKind.Square;
     private EditorTool _gestureTool = EditorTool.Select;
@@ -772,6 +777,7 @@ public sealed partial class MainPage : Page
     private async Task RefreshLibraryAsync(Guid? preferredDocumentId = null)
     {
         if (_repository is null) return;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var summaries = await _repository.ListAsync();
         _allDocuments.Clear();
         _allDocuments.AddRange(summaries);
@@ -795,6 +801,9 @@ public sealed partial class MainPage : Page
             if (preferred is not null) SelectLibraryDocument(preferred.Id);
         }
         UpdateEmptyState();
+        DiagnosticsLog.Info("library.refresh_completed",
+            ("documents", _allDocuments.Count),
+            ("elapsed_ms", MillisecondsSince(started)));
     }
 
     private void ApplyFolderFilter(Guid? preferredDocumentId = null)
@@ -1928,7 +1937,8 @@ public sealed partial class MainPage : Page
                 _documentHistories[id] = history = new CommandHistory();
             _history = history;
             _document = loaded;
-            CacheOpenDocument(loaded);
+            var inkPointCount = CountInkPoints(loaded);
+            CacheOpenDocument(loaded, inkPointCount);
             UpdateFolderActions();
             _pendingInkAppends.Clear();
             _requiresFullSave = false;
@@ -1951,7 +1961,7 @@ public sealed partial class MainPage : Page
                 ("document_id", id),
                 ("source", fromCache ? "cache" : "database"),
                 ("pages", loaded.Pages.Count),
-                ("ink_points", CountInkPoints(loaded)),
+                ("ink_points", inkPointCount),
                 ("elapsed_ms", elapsed));
         }
         catch (OperationCanceledException)
@@ -2348,7 +2358,9 @@ public sealed partial class MainPage : Page
         _pendingInkCommitPreviews.Clear();
         Volatile.Write(ref _inkPreviewCommitVersion, -1);
         _page = page;
-        ClearStrokeGeometryCache();
+        // Retain bounded stroke geometry across page switches. Object ids are document-unique,
+        // replacements self-invalidate by reference, and the LRU/point budgets prune old pages.
+        // Clearing here made every return to a dense page rebuild its vector geometry.
         _selectedObject = null;
         _selectedObjects.Clear();
         ClearTextSelection();
@@ -2385,6 +2397,7 @@ public sealed partial class MainPage : Page
         cancellation?.Dispose();
         _notebookPagePreviewGeneration++;
         _notebookPagePreviewLoads.Clear();
+        _notebookPagePreviewRefreshPending.Clear();
         lock (_pageRenderGate) DisposeNotebookPagePreviewsCore();
     }
 
@@ -2460,10 +2473,15 @@ public sealed partial class MainPage : Page
         var token = _notebookPagePreviewCancellation?.Token ?? CancellationToken.None;
         var index = _document.Pages.FindIndex(item => item.Id == page.Id);
         if (index < 0) return;
-        for (var candidate = Math.Max(0, index - 1);
-             candidate <= Math.Min(_document.Pages.Count - 1, index + 1);
-             candidate++)
-            _ = EnsureNotebookPagePreviewAsync(_document.Pages[candidate], generation, token);
+        for (var distance = 0; distance <= NotebookPagePreviewLookAhead; distance++)
+        {
+            var previous = index - distance;
+            var next = index + distance;
+            if (previous >= 0)
+                _ = EnsureNotebookPagePreviewAsync(_document.Pages[previous], generation, token);
+            if (distance > 0 && next < _document.Pages.Count)
+                _ = EnsureNotebookPagePreviewAsync(_document.Pages[next], generation, token);
+        }
     }
 
     private Task EnsureNotebookPagePreviewAsync(
@@ -2475,7 +2493,11 @@ public sealed partial class MainPage : Page
         lock (_pageRenderGate)
             if (!refresh && _notebookPagePreviews.ContainsKey(page.Id))
                 return Task.CompletedTask;
-        if (_notebookPagePreviewLoads.TryGetValue(page.Id, out var existing)) return existing;
+        if (_notebookPagePreviewLoads.TryGetValue(page.Id, out var existing))
+        {
+            if (refresh) _notebookPagePreviewRefreshPending.Add(page.Id);
+            return existing;
+        }
         var task = LoadNotebookPagePreviewAsync(page, generation, cancellationToken);
         _notebookPagePreviewLoads[page.Id] = task;
         return task;
@@ -2514,6 +2536,9 @@ public sealed partial class MainPage : Page
         {
             preview?.Bitmap.Dispose();
             _notebookPagePreviewLoads.Remove(page.Id);
+            if (_notebookPagePreviewRefreshPending.Remove(page.Id) &&
+                generation == _notebookPagePreviewGeneration && !cancellationToken.IsCancellationRequested)
+                _ = EnsureNotebookPagePreviewAsync(page, generation, cancellationToken, refresh: true);
         }
     }
 
@@ -2989,7 +3014,7 @@ public sealed partial class MainPage : Page
             DrawSelectionMarquee(drawingSession);
 
         DrawPageNumber(drawingSession);
-        UpdateImageLockOverlay();
+        UpdateSelectionLockOverlay();
     }
 
     private void DrawPageNumber(CanvasDrawingSession drawingSession)
@@ -5062,11 +5087,28 @@ public sealed partial class MainPage : Page
         float preservedPanX)
     {
         if (_document is null || _page?.Id == target.Id) return;
+        var previousPage = _page;
+        var previousSelection = PageList.SelectedItem as NotePage;
         var targetIndex = _document.Pages.FindIndex(page => page.Id == target.Id);
         if (targetIndex < 0) return;
+        // A just-edited page becomes a bitmap-backed neighbor after this switch. Start its
+        // refresh before changing focus so fast cross-page handwriting never gets stranded
+        // behind the normal thumbnail debounce.
+        if (previousPage is not null && _pendingThumbnailRefreshPageIds.Contains(previousPage.Id) &&
+            _notebookPagePreviewCancellation is { } previewCancellation)
+            _ = EnsureNotebookPagePreviewAsync(
+                previousPage,
+                _notebookPagePreviewGeneration,
+                previewCancellation.Token,
+                refresh: true);
         _loading = true;
         PageList.SelectedItem = target;
         _loading = false;
+        if (previousSelection is not null &&
+            PageList.ContainerFromItem(previousSelection) is ListViewItem previousContainer)
+            UpdatePageThumbnailContainer(previousSelection, previousContainer);
+        if (PageList.ContainerFromItem(target) is ListViewItem targetContainer)
+            UpdatePageThumbnailContainer(target, targetContainer);
         _tabPageSelections[_document.Id] = target.Id;
         SelectPage(target);
         _zoom = preservedZoom;
@@ -6022,7 +6064,10 @@ public sealed partial class MainPage : Page
         ? double.PositiveInfinity
         : (System.Diagnostics.Stopwatch.GetTimestamp() - timestamp) * 1000d / System.Diagnostics.Stopwatch.Frequency;
 
-    private void OnDocumentChanged(bool recognizeInk, CanvasObject? appendedObject = null)
+    private void OnDocumentChanged(
+        bool recognizeInk,
+        CanvasObject? appendedObject = null,
+        IEnumerable<Guid>? affectedPageIds = null)
     {
         _ = recognizeInk;
         if (_page is not null) _page.UpdatedAt = DateTimeOffset.UtcNow;
@@ -6057,14 +6102,21 @@ public sealed partial class MainPage : Page
         }
         if (!appendOnly) UpdateSelectionUi();
         InvalidateCanvas();
-        ScheduleSave();
+        ScheduleSave(affectedPageIds);
     }
 
-    private void ScheduleSave()
+    private void ScheduleSave(IEnumerable<Guid>? affectedPageIds = null)
     {
         _saveTimer.Stop();
         _saveTimer.Start();
-        _pendingThumbnailRefreshPageId = _page?.Id;
+        if (affectedPageIds is null)
+        {
+            if (_page is not null) _pendingThumbnailRefreshPageIds.Add(_page.Id);
+        }
+        else
+        {
+            foreach (var pageId in affectedPageIds) _pendingThumbnailRefreshPageIds.Add(pageId);
+        }
         _thumbnailRefreshTimer.Stop();
         _thumbnailRefreshTimer.Start();
     }
@@ -6076,35 +6128,38 @@ public sealed partial class MainPage : Page
             sender.Start();
             return;
         }
-        var pageId = _pendingThumbnailRefreshPageId;
-        var page = pageId is null ? null : _document?.Pages.FirstOrDefault(item => item.Id == pageId);
-        _pendingThumbnailRefreshPageId = null;
-        if (page is null) return;
-        if (_notebookPagePreviewCancellation is { } previewCancellation)
-            _ = EnsureNotebookPagePreviewAsync(
-                page,
-                _notebookPagePreviewGeneration,
-                previewCancellation.Token,
-                refresh: true);
-        if (PageSidebar.Visibility == Visibility.Visible && PageColumn.Width.Value > 0)
-            RequestPageThumbnail(page, refresh: true, prioritize: true);
-        else
-            // When the rail is collapsed, invalidate without paying the rendering cost.
-            // Container realization will request the preview when the user opens the rail.
-            InvalidatePageThumbnail(page.Id);
+        var pageIds = _pendingThumbnailRefreshPageIds.ToArray();
+        _pendingThumbnailRefreshPageIds.Clear();
+        foreach (var pageId in pageIds)
+        {
+            var page = _document?.Pages.FirstOrDefault(item => item.Id == pageId);
+            if (page is null) continue;
+            if (_notebookPagePreviewCancellation is { } previewCancellation)
+                _ = EnsureNotebookPagePreviewAsync(
+                    page,
+                    _notebookPagePreviewGeneration,
+                    previewCancellation.Token,
+                    refresh: true);
+            if (PageSidebar.Visibility == Visibility.Visible && PageColumn.Width.Value > 0)
+                RequestPageThumbnail(page, refresh: true, prioritize: true);
+            else
+                // When the rail is collapsed, invalidate without paying the rendering cost.
+                // Container realization will request the preview when the user opens the rail.
+                InvalidatePageThumbnail(page.Id);
+        }
     }
 
     private void PauseThumbnailRefresh()
     {
         _thumbnailRefreshTimer.Stop();
         if (_page is null || !_pageThumbnailLoads.TryGetValue(_page.Id, out var load)) return;
-        _pendingThumbnailRefreshPageId ??= _page.Id;
+        _pendingThumbnailRefreshPageIds.Add(_page.Id);
         load.Cancel();
     }
 
     private void ResumeThumbnailRefresh()
     {
-        if (_isPointerDown || _pendingThumbnailRefreshPageId is null) return;
+        if (_isPointerDown || _pendingThumbnailRefreshPageIds.Count == 0) return;
         _thumbnailRefreshTimer.Stop();
         _thumbnailRefreshTimer.Start();
     }
@@ -6570,10 +6625,10 @@ public sealed partial class MainPage : Page
         container.Background = new SolidColorBrush(isSelected
             ? Color.FromArgb(42, 56, 189, 248)
             : Color.FromArgb(0, 0, 0, 0));
-        container.BorderBrush = new SolidColorBrush(isSelected
-            ? Color.FromArgb(220, 56, 189, 248)
-            : Color.FromArgb(0, 0, 0, 0));
-        container.BorderThickness = new Thickness(isSelected ? 1.5 : 0);
+        // The thumbnail frame carries selection. Avoid a second full-row outline, which can
+        // linger on recycled containers and visually collide with the scrollbar.
+        container.BorderBrush = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0));
+        container.BorderThickness = new Thickness(0);
         if (container.ContentTemplateRoot is not FrameworkElement root) return;
         var frame = root.FindName("PageThumbnailFrame") as Border;
         var image = root.FindName("PageThumbnailImage") as Image;
@@ -6696,6 +6751,7 @@ public sealed partial class MainPage : Page
     private async Task CreateDocumentAsync(DocumentKind kind, string title)
     {
         if (_repository is null) return;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var destinationFolderId = _selectedFolderId;
         var document = HoomNoteDocument.Create(title, kind);
         var defaultKind = Enum.TryParse<PageTemplateKind>(_userPreferences.DefaultPageTemplate, out var parsedDefault)
@@ -6721,6 +6777,7 @@ public sealed partial class MainPage : Page
             document.Sections[0].PageIds.Add(canvas.Id);
         }
         await _repository.SaveAsync(document);
+        CacheOpenDocument(document, 0);
         if (destinationFolderId is { } folderId)
         {
             _userPreferences.DocumentFolders[document.Id.ToString("D")] = folderId.ToString("D");
@@ -6728,6 +6785,10 @@ public sealed partial class MainPage : Page
         }
         _selectedFolderId = destinationFolderId;
         await RefreshLibraryAsync(document.Id);
+        DiagnosticsLog.Info("document.create_completed",
+            ("document_id", document.Id),
+            ("kind", kind),
+            ("elapsed_ms", MillisecondsSince(started)));
     }
 
     private void OnAddPageClick(object sender, RoutedEventArgs e)
@@ -8128,26 +8189,45 @@ public sealed partial class MainPage : Page
     {
         if (_document is null) return;
         var pageIds = _document.Pages.Select(page => page.Id).ToArray();
-        _history.Undo(_document);
+        if (!_history.Undo(_document)) return;
         if (!pageIds.SequenceEqual(_document.Pages.Select(page => page.Id)))
         {
             RenumberAutomaticPages();
             SyncPageCollection(_page?.Id);
         }
-        OnDocumentChanged(recognizeInk: true);
+        RebindSelectionAfterHistoryChange();
+        OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
     }
 
     private void OnRedoClick(object sender, RoutedEventArgs e)
     {
         if (_document is null) return;
         var pageIds = _document.Pages.Select(page => page.Id).ToArray();
-        _history.Redo(_document);
+        if (!_history.Redo(_document)) return;
         if (!pageIds.SequenceEqual(_document.Pages.Select(page => page.Id)))
         {
             RenumberAutomaticPages();
             SyncPageCollection(_page?.Id);
         }
-        OnDocumentChanged(recognizeInk: true);
+        RebindSelectionAfterHistoryChange();
+        OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
+    }
+
+    private void RebindSelectionAfterHistoryChange()
+    {
+        var selectedIds = (_selectedObjects.Count > 0
+                ? _selectedObjects.Select(item => item.Id)
+                : _selectedObject is null ? [] : [_selectedObject.Id])
+            .ToArray();
+        ClearTransformPreviewState();
+        Volatile.Write(ref _transformPreviewCommitVersion, -1);
+        _transformOriginal = null;
+        _multiTransformOriginals = null;
+        _transformHandle = TransformHandle.None;
+        _selectedObjects.Clear();
+        if (_page is not null)
+            _selectedObjects.AddRange(SelectionRebinder.Rebind(selectedIds, _page.Objects));
+        _selectedObject = _selectedObjects.Count == 1 ? _selectedObjects[0] : null;
     }
 
     private void OnDuplicateClick(object sender, RoutedEventArgs e)
@@ -9743,10 +9823,10 @@ public sealed partial class MainPage : Page
         _imageBitmapLru.AddFirst(assetHash);
     }
 
-    private void CacheOpenDocument(HoomNoteDocument document)
+    private void CacheOpenDocument(HoomNoteDocument document, int? knownPointCount = null)
     {
         _openDocumentCache[document.Id] = document;
-        _openDocumentPointCounts[document.Id] = CountInkPoints(document);
+        _openDocumentPointCounts[document.Id] = knownPointCount ?? CountInkPoints(document);
         _openDocumentLru.Remove(document.Id);
         _openDocumentLru.AddFirst(document.Id);
         while (_openDocumentLru.Count > OpenDocumentCacheLimit ||
@@ -9965,7 +10045,7 @@ public sealed partial class MainPage : Page
             : Visibility.Collapsed;
         if (_selectedObject is ImageObject or ShapeObject)
             SelectionLockButton.Content = _selectedObject.IsLocked ? "Unlock" : "Lock";
-        UpdateImageLockOverlay();
+        UpdateSelectionLockOverlay();
         if (styleSource is not null)
         {
             _loading = true;
@@ -10147,30 +10227,38 @@ public sealed partial class MainPage : Page
         OnDocumentChanged(recognizeInk: false);
     }
 
-    private void UpdateImageLockOverlay()
+    private void UpdateSelectionLockOverlay()
     {
-        if (_readMode || _selectedObject is not ImageObject image || _page is null)
+        if (_readMode || _selectedObject is not { } selected ||
+            selected is not ImageObject and not ShapeObject || _page is null)
         {
-            if (ImageLockOverlayButton.Visibility != Visibility.Collapsed)
-                ImageLockOverlayButton.Visibility = Visibility.Collapsed;
+            if (SelectionLockOverlayButton.Visibility != Visibility.Collapsed)
+                SelectionLockOverlayButton.Visibility = Visibility.Collapsed;
             return;
         }
-        var bounds = StrokeGeometry.GetWorldBounds(image);
+        var bounds = StrokeGeometry.GetWorldBounds(selected);
         var anchor = PageToScreen(new PointD(bounds.Right, bounds.Top));
         var left = Math.Clamp(anchor.X + 8, 4, Math.Max(4, DrawingSurface.ActualWidth - 40));
         var top = Math.Clamp(anchor.Y - 18, 4, Math.Max(4, DrawingSurface.ActualHeight - 40));
-        if (double.IsNaN(Canvas.GetLeft(ImageLockOverlayButton)) ||
-            Math.Abs(Canvas.GetLeft(ImageLockOverlayButton) - left) > 0.25)
-            Canvas.SetLeft(ImageLockOverlayButton, left);
-        if (double.IsNaN(Canvas.GetTop(ImageLockOverlayButton)) ||
-            Math.Abs(Canvas.GetTop(ImageLockOverlayButton) - top) > 0.25)
-            Canvas.SetTop(ImageLockOverlayButton, top);
-        ImageLockedOverlayIcon.Visibility = image.IsLocked ? Visibility.Visible : Visibility.Collapsed;
-        ImageUnlockedOverlayIcon.Visibility = image.IsLocked ? Visibility.Collapsed : Visibility.Visible;
-        UpdateTransientToolTip(ImageLockOverlayButton,
-            image.IsLocked ? "Image is locked • click to unlock" : "Image is unlocked • click to lock");
-        if (ImageLockOverlayButton.Visibility != Visibility.Visible)
-            ImageLockOverlayButton.Visibility = Visibility.Visible;
+        if (double.IsNaN(Canvas.GetLeft(SelectionLockOverlayButton)) ||
+            Math.Abs(Canvas.GetLeft(SelectionLockOverlayButton) - left) > 0.25)
+            Canvas.SetLeft(SelectionLockOverlayButton, left);
+        if (double.IsNaN(Canvas.GetTop(SelectionLockOverlayButton)) ||
+            Math.Abs(Canvas.GetTop(SelectionLockOverlayButton) - top) > 0.25)
+            Canvas.SetTop(SelectionLockOverlayButton, top);
+        SelectionLockedOverlayIcon.Visibility = selected.IsLocked
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        SelectionUnlockedOverlayIcon.Visibility = selected.IsLocked
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        var objectName = selected is ShapeObject ? "Shape" : "Image";
+        UpdateTransientToolTip(SelectionLockOverlayButton,
+            selected.IsLocked
+                ? $"{objectName} is locked • click to unlock"
+                : $"{objectName} is unlocked • click to lock");
+        if (SelectionLockOverlayButton.Visibility != Visibility.Visible)
+            SelectionLockOverlayButton.Visibility = Visibility.Visible;
     }
 
     private void ConfigureTransientToolTips(DependencyObject root)

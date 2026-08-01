@@ -1,24 +1,24 @@
-# HoomNote 0.7.35
+# HoomNote 0.7.36
 
-- Page scrolling is now smooth and continuous across page boundaries. Either
-  visible page can be edited during a transition, wheel and touch scrolling use
-  inertia, and notebook pages are preloaded into a high-resolution preview cache
-  to prevent navigation buffering and blurry scrolling artifacts.
-- Shapes can now be locked and unlocked from the selection controls. Locked
-  shapes cannot be erased or transformed.
-- Lasso selection now selects an entire ink stroke when any portion of that
-  stroke crosses or falls inside the lasso.
-- The page indicator now includes the notebook total, such as `4 of 56`.
-- Notebook cover thumbnails are rendered at a sharper card resolution and now
-  include incremental first-page edits instead of remaining stale.
-- The home library now shows folders followed by one alphabetically ordered
-  `All notebooks` section. The recently edited section was removed, and a back
-  arrow provides navigation out of folders.
-- Samsung Notes imports now resolve every placed image through its stored media
-  bind ID, preventing image contents from being assigned to the wrong image box.
-- Pen-drawn shape recognition now uses stricter rectangle and ellipse fitting,
-  rejects irregular closed scribbles instead of forcing them into ovals, and
-  adds reliable five-point star snapping.
-- Highlighters now use page-aware marker blending on both light and dark paper,
-  preserving underlying page content and avoiding cumulative alpha coverage.
-- Added one-tap pen size presets for `0.7`, `1.5`, and `2` below the size slider.
+- Shapes now show the same floating lock control as images, making the lock
+  state visible and directly accessible on the canvas.
+- Undo and redo now rebind transformed selections to the restored document
+  objects, preventing stale selection state from leaving strokes extremely
+  thick or text incorrectly scaled.
+- Handwriting committed on one visible page no longer disappears when focus
+  immediately moves across the page break. Delayed previews are tracked per
+  page, and undo or redo refreshes every page affected by the command.
+- Continuous scrolling now requests high-resolution previews up to five pages
+  in both directions so upcoming pages are ready before they enter the viewport.
+- Page navigation retains bounded vector geometry and a larger two-notebook hot
+  cache, reducing repeated rendering and deserialization in dense notebooks.
+- Navigation refinement uses smaller work units to reduce long frames, newly
+  created notes open from memory instead of being reloaded from the database,
+  and redundant ink-point scans were removed from document loading.
+- Added timing diagnostics for library refreshes and note creation to make
+  remaining slow interaction paths directly measurable in the app log.
+- The page sidebar now maintains exactly one visual selection and keeps its
+  selection styling clear of the scrollbar.
+- Samsung Notes image fallback matching now uses each media file's stable
+  numeric index instead of arbitrary ZIP entry order, preventing image content
+  from being placed into the wrong correctly sized box in image-heavy notes.

@@ -5,6 +5,7 @@ namespace HoomNote.Core.Editing;
 public interface IDocumentCommand
 {
     string Description { get; }
+    IReadOnlyCollection<Guid> AffectedPageIds { get; }
     void Execute(HoomNoteDocument document);
     void Undo(HoomNoteDocument document);
 }
@@ -12,6 +13,7 @@ public interface IDocumentCommand
 public sealed class AddObjectCommand(Guid pageId, CanvasObject canvasObject) : IDocumentCommand
 {
     public string Description => $"Add {canvasObject.GetType().Name}";
+    public IReadOnlyCollection<Guid> AffectedPageIds => [pageId];
 
     public void Execute(HoomNoteDocument document)
     {
@@ -42,6 +44,7 @@ public sealed class ReplaceObjectsCommand(
     string description) : IDocumentCommand
 {
     public string Description => description;
+    public IReadOnlyCollection<Guid> AffectedPageIds => [pageId];
 
     public void Execute(HoomNoteDocument document) => Replace(document, before, after);
     public void Undo(HoomNoteDocument document) => Replace(document, after, before);
@@ -69,6 +72,7 @@ public sealed class DeletePageCommand(Guid pageId) : IDocumentCommand
     private readonly List<(Guid SectionId, int Index)> _sectionLocations = [];
 
     public string Description => "Delete page";
+    public IReadOnlyCollection<Guid> AffectedPageIds => [pageId];
 
     public void Execute(HoomNoteDocument document)
     {
@@ -106,6 +110,7 @@ public sealed class DeletePageCommand(Guid pageId) : IDocumentCommand
 public sealed class AddPageCommand(NotePage page, int index, Guid? sectionId = null) : IDocumentCommand
 {
     public string Description => "Add page";
+    public IReadOnlyCollection<Guid> AffectedPageIds => [page.Id];
 
     public void Execute(HoomNoteDocument document)
     {
@@ -131,6 +136,7 @@ public sealed class ReorderPagesCommand(
     IReadOnlyList<Guid> after) : IDocumentCommand
 {
     public string Description => "Reorder pages";
+    public IReadOnlyCollection<Guid> AffectedPageIds { get; } = before.Concat(after).Distinct().ToArray();
 
     public void Execute(HoomNoteDocument document) => Apply(document, after);
     public void Undo(HoomNoteDocument document) => Apply(document, before);
@@ -160,11 +166,13 @@ public sealed class CommandHistory(int capacity = 120)
 
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
+    public IReadOnlyCollection<Guid> LastAffectedPageIds { get; private set; } = [];
     public event EventHandler? Changed;
 
     public void Execute(IDocumentCommand command, HoomNoteDocument document)
     {
         command.Execute(document);
+        LastAffectedPageIds = command.AffectedPageIds;
         _undo.Push(command);
         _redo.Clear();
         TrimToCapacity();
@@ -172,22 +180,26 @@ public sealed class CommandHistory(int capacity = 120)
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    public void Undo(HoomNoteDocument document)
+    public bool Undo(HoomNoteDocument document)
     {
-        if (!_undo.TryPop(out var command)) return;
+        if (!_undo.TryPop(out var command)) return false;
         command.Undo(document);
+        LastAffectedPageIds = command.AffectedPageIds;
         _redo.Push(command);
         document.UpdatedAt = DateTimeOffset.UtcNow;
         Changed?.Invoke(this, EventArgs.Empty);
+        return true;
     }
 
-    public void Redo(HoomNoteDocument document)
+    public bool Redo(HoomNoteDocument document)
     {
-        if (!_redo.TryPop(out var command)) return;
+        if (!_redo.TryPop(out var command)) return false;
         command.Execute(document);
+        LastAffectedPageIds = command.AffectedPageIds;
         _undo.Push(command);
         document.UpdatedAt = DateTimeOffset.UtcNow;
         Changed?.Invoke(this, EventArgs.Empty);
+        return true;
     }
 
     private void TrimToCapacity()

@@ -566,7 +566,7 @@
                         <ListView.ItemContainerStyle>
                             <Style TargetType="ListViewItem">
                                 <Setter Property="Padding" Value="4" />
-                                <Setter Property="Margin" Value="0,0,0,8" />
+                                <Setter Property="Margin" Value="0,0,12,8" />
                                 <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                                 <Setter Property="CornerRadius" Value="8" />
                             </Style>
@@ -620,14 +620,14 @@
                     <TextBox x:Name="TextEditorOverlay" Visibility="Collapsed" AcceptsReturn="True" TextWrapping="Wrap"
                         Background="#EE1D1D1D" BorderBrush="{StaticResource HoomNoteAccentBrush}" BorderThickness="1"
                         Padding="8" TextChanged="OnTextEditorChanged" LostFocus="OnTextEditorLostFocus" />
-                    <Button x:Name="ImageLockOverlayButton" Width="36" Height="36" Padding="0"
+                    <Button x:Name="SelectionLockOverlayButton" Width="36" Height="36" Padding="0"
                             Visibility="Collapsed" Click="OnSelectionLockClick"
-                            ToolTipService.ToolTip="Image is unlocked • click to lock">
+                            ToolTipService.ToolTip="Selected object is unlocked • click to lock">
                         <Grid>
-                            <PathIcon x:Name="ImageLockedOverlayIcon"
+                            <PathIcon x:Name="SelectionLockedOverlayIcon"
                                       Data="{StaticResource IconLock}"
                                       Visibility="Collapsed" />
-                            <PathIcon x:Name="ImageUnlockedOverlayIcon"
+                            <PathIcon x:Name="SelectionUnlockedOverlayIcon"
                                       Data="{StaticResource IconUnlock}" />
                         </Grid>
                     </Button>

@@ -589,32 +589,26 @@ internal static class SamsungNotesImportParser
         var archiveImages = archive.Entries
             .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
                             IsSupportedImageExtension(Path.GetExtension(entry.FullName)))
+            // Samsung's numeric filename prefix is the stable media index. ZIP directory order
+            // is arbitrary (real exports commonly contain 3, 4, 14, 1, ...), which put the
+            // correct image dimensions around the wrong image content when bind IDs were absent.
+            .OrderBy(entry => ReadMediaIndex(entry.FullName))
+            .ThenBy(entry => entry.FullName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var byName = archiveImages.ToDictionary(
-            entry => Path.GetFileName(entry.FullName),
-            StringComparer.OrdinalIgnoreCase);
-        var ordered = new List<ZipArchiveEntry>(archiveImages.Length);
-        var included = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return archiveImages;
+    }
 
-        var metadata = archive.GetEntry("media/mediaInfo.dat");
-        if (metadata is { Length: > 0 and <= MaximumEntryBytes })
-        {
-            using var input = metadata.Open();
-            using var memory = new MemoryStream((int)Math.Min(metadata.Length, int.MaxValue));
-            input.CopyTo(memory);
-            foreach (var fileName in ReadMediaFileNames(memory.ToArray()))
-            {
-                if (!byName.TryGetValue(fileName, out var entry) || !included.Add(fileName)) continue;
-                ordered.Add(entry);
-            }
-        }
-
-        foreach (var entry in archiveImages)
-        {
-            var fileName = Path.GetFileName(entry.FullName);
-            if (included.Add(fileName)) ordered.Add(entry);
-        }
-        return [.. ordered];
+    private static int ReadMediaIndex(string fullName)
+    {
+        var fileName = Path.GetFileName(fullName);
+        var separator = fileName.IndexOf('@');
+        return separator > 0 && int.TryParse(
+            fileName.AsSpan(0, separator),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var index)
+            ? index
+            : int.MaxValue;
     }
 
     private static IReadOnlyDictionary<uint, ZipArchiveEntry> ReadMediaEntriesByBindId(
@@ -640,9 +634,6 @@ internal static class SamsungNotesImportParser
                 result.TryAdd(bindId, entry);
         return result;
     }
-
-    private static IReadOnlyList<string> ReadMediaFileNames(ReadOnlySpan<byte> data)
-        => ReadMediaBindings(data).Select(binding => binding.FileName).ToArray();
 
     private static IReadOnlyList<(uint BindId, string FileName)> ReadMediaBindings(ReadOnlySpan<byte> data)
     {

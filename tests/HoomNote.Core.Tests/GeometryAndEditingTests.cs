@@ -300,9 +300,51 @@ public sealed class GeometryAndEditingTests
         history.Undo(document);
         Assert.Empty(page.Objects);
         Assert.True(history.CanRedo);
+        Assert.Equal([page.Id], history.LastAffectedPageIds);
 
         history.Redo(document);
         Assert.Single(page.Objects);
+        Assert.Equal([page.Id], history.LastAffectedPageIds);
+    }
+
+    [Fact]
+    public void SelectionRebinder_UsesRestoredObjectsAfterTransformUndo()
+    {
+        var document = HoomNoteDocument.Create("Undo selection scale");
+        var page = new NotePage();
+        document.Pages.Add(page);
+        document.Sections[0].PageIds.Add(page.Id);
+        var stroke = new InkStrokeObject
+        {
+            Style = new InkStyle { Width = 2 },
+            Points = [new InkPoint(0, 0), new InkPoint(20, 20)]
+        };
+        var text = new RichTextObject
+        {
+            Content = RichTextDocument.FromPlainText("Readable text"),
+            Bounds = new RectD(30, 10, 120, 40)
+        };
+        page.Objects.AddRange([stroke, text]);
+        var scale = Transform2D.Scale(8, 0.25, new PointD(0, 0));
+        CanvasObject[] transformed =
+        [
+            stroke with { Transform = scale },
+            text with { Transform = scale }
+        ];
+        var history = new CommandHistory();
+        history.Execute(new ReplaceObjectsCommand(
+            page.Id, [stroke, text], transformed, "Transform selection"), document);
+
+        Assert.True(history.Undo(document));
+        var rebound = SelectionRebinder.Rebind(
+            transformed.Select(item => item.Id), page.Objects);
+
+        Assert.Same(stroke, rebound[0]);
+        Assert.Same(text, rebound[1]);
+        Assert.Equal(2, StrokeGeometry.EffectiveWorldWidth(
+            Assert.IsType<InkStrokeObject>(rebound[0])), 4);
+        Assert.Equal(Transform2D.Identity, rebound[1].Transform);
+        Assert.False(history.Undo(document));
     }
 
     [Fact]

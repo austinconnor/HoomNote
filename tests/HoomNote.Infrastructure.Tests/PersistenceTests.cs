@@ -591,6 +591,9 @@ public sealed class PersistenceTests : IAsyncLifetime
                 var expectedImageNames = archive.Entries
                     .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
                                     Path.GetExtension(entry.FullName).Equals(".png", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(entry => int.Parse(
+                        Path.GetFileName(entry.FullName).Split('@')[0],
+                        System.Globalization.CultureInfo.InvariantCulture))
                     .Select(entry => Path.GetFileNameWithoutExtension(entry.FullName))
                     .ToArray();
                 Assert.Equal(expectedImageNames, images.Select(image => image.AltText));
