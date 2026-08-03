@@ -119,6 +119,25 @@ public sealed class GeometryAndEditingTests
         Assert.Equal(next.Y, transitioned.Y, 5);
     }
 
+    [Theory]
+    [InlineData(800, 1, 1200, 500, 0)]
+    [InlineData(1600, 1, 1200, 500, 200)]
+    [InlineData(1600, 1, 1200, -500, -200)]
+    [InlineData(1600, 1, 1200, 75, 75)]
+    [InlineData(1600, 1, 1200, double.NaN, 0)]
+    public void ViewportPanBounds_KeepsPageWithinHorizontalViewport(
+        double pageWidth,
+        double zoom,
+        double viewportWidth,
+        double requestedPan,
+        double expectedPan)
+    {
+        var result = ViewportPanBounds.ClampHorizontal(
+            pageWidth, zoom, viewportWidth, (float)requestedPan);
+
+        Assert.Equal(expectedPan, result, 4);
+    }
+
     [Fact]
     public void TwoFingerPinch_IgnoresCentroidTranslationWhenSpreadIsUnchanged()
     {

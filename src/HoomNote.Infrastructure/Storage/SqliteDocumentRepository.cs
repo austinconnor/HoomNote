@@ -68,6 +68,12 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 PRIMARY KEY(page_id, object_id)
             );
             CREATE INDEX IF NOT EXISTS ix_ink_append_page ON ink_append_journal(page_id);
+            CREATE TABLE IF NOT EXISTS home_thumbnails (
+                document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+                page_id TEXT NOT NULL,
+                page_updated_utc TEXT NOT NULL,
+                png BLOB NOT NULL
+            );
             """, cancellationToken);
 
         await EnsureRecognizedRegionsColumnAsync(cancellationToken);
@@ -293,6 +299,46 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         }
         page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
         return page;
+    }
+
+    public async Task<byte[]?> LoadCachedHomeThumbnailAsync(
+        Guid documentId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            SELECT h.png
+            FROM home_thumbnails h
+            INNER JOIN pages p ON p.id = h.page_id AND p.document_id = h.document_id
+            WHERE h.document_id = $document AND p.ordinal = 0
+              AND h.page_updated_utc = p.updated_utc;
+            """;
+        command.Parameters.AddWithValue("$document", documentId.ToString("D"));
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return result is byte[] png && png.Length > 0 ? png : null;
+    }
+
+    public async Task SaveCachedHomeThumbnailAsync(
+        Guid documentId,
+        NotePage page,
+        byte[] png,
+        CancellationToken cancellationToken = default)
+    {
+        if (png.Length == 0) return;
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO home_thumbnails(document_id,page_id,page_updated_utc,png)
+            VALUES($document,$page,$updated,$png)
+            ON CONFLICT(document_id) DO UPDATE SET
+                page_id=excluded.page_id,
+                page_updated_utc=excluded.page_updated_utc,
+                png=excluded.png;
+            """;
+        command.Parameters.AddWithValue("$document", documentId.ToString("D"));
+        command.Parameters.AddWithValue("$page", page.Id.ToString("D"));
+        command.Parameters.AddWithValue("$updated", page.UpdatedAt.ToString("O"));
+        command.Parameters.Add("$png", SqliteType.Blob).Value = png;
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task SaveAsync(HoomNoteDocument document, CancellationToken cancellationToken = default)

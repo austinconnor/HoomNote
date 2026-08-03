@@ -106,19 +106,27 @@ public sealed partial class MainPage : Page
         public HomeNotebookCard(
             NotebookFolderPreference folder,
             int childFolderCount,
-            int notebookCount)
+            int notebookCount,
+            string? thumbnailAssetHash)
         {
             FolderId = folder.Id;
+            FolderThumbnailAssetHash = thumbnailAssetHash;
             Title = folder.Name;
             Metadata = $"{childFolderCount} {(childFolderCount == 1 ? "folder" : "folders")} • " +
                        $"{notebookCount} {(notebookCount == 1 ? "notebook" : "notebooks")}";
             AccentBrush = new SolidColorBrush(ParseColor(folder.Color));
+            ShouldLoadThumbnail = !string.IsNullOrWhiteSpace(thumbnailAssetHash);
+            _isLoading = ShouldLoadThumbnail;
         }
 
         public Guid? DocumentId { get; }
         public Guid? FolderId { get; }
-        public Guid Id => DocumentId ?? Guid.Empty;
+        public Guid Id => DocumentId ?? FolderId ?? Guid.Empty;
         public bool IsFolder => FolderId is not null;
+        public Visibility FolderMenuVisibility => IsFolder ? Visibility.Visible : Visibility.Collapsed;
+        public string? FolderThumbnailAssetHash { get; }
+        public bool HasCustomThumbnail => !string.IsNullOrWhiteSpace(FolderThumbnailAssetHash);
+        public Stretch ThumbnailStretch => IsFolder ? Stretch.UniformToFill : Stretch.Uniform;
         public bool ShouldLoadThumbnail { get; }
         public string Glyph => IsFolder ? "\uE8B7" : "\uE8A5";
         public string Title { get; }
@@ -232,11 +240,13 @@ public sealed partial class MainPage : Page
     private readonly LinkedList<Guid> _pageThumbnailLru = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _pageThumbnailLoads = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _homeThumbnailLoads = [];
+    private readonly HashSet<Guid> _dirtyHomeThumbnailDocumentIds = [];
     private readonly SemaphoreSlim _homeThumbnailLoadGate = new(1, 1);
+    private readonly Dictionary<Guid, CancellationTokenSource> _homeThumbnailRefreshCancellations = [];
+    private readonly Dictionary<Guid, Task> _homeThumbnailRefreshTasks = [];
     private const int PageThumbnailCacheLimit = 24;
     private const int PageThumbnailMaxWidth = 96;
     private const int PageThumbnailMaxHeight = 116;
-    private const int HomeThumbnailMaxSerializedCharacters = 4_000_000;
     private const int HomeThumbnailMaxWidth = 320;
     private const int HomeThumbnailMaxHeight = 400;
     private const int PageThumbnailRefreshDelayMs = 400;
@@ -341,6 +351,7 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, AdjacentPagePreview> _notebookPagePreviews = [];
     private readonly Dictionary<Guid, Task> _notebookPagePreviewLoads = [];
     private readonly HashSet<Guid> _notebookPagePreviewRefreshPending = [];
+    private Guid? _preloadedFallbackPageId;
     private CancellationTokenSource? _notebookPagePreviewCancellation;
     private int _notebookPagePreviewGeneration;
     private int _notebookPagePreviewLongEdge = 1536;
@@ -463,6 +474,7 @@ public sealed partial class MainPage : Page
     private bool _penActive;
     private bool _gestureAllowsTextSelection;
     private bool _loading;
+    private bool _isUnloading;
     private bool _updatingTabs;
     private bool _syncingInkColor;
     private bool _syncingInkWidth;
@@ -718,6 +730,7 @@ public sealed partial class MainPage : Page
 
     private async void OnUnloaded(object sender, RoutedEventArgs e)
     {
+        _isUnloading = true;
         DiagnosticsLog.Info("main.unloading", ("unsaved", _hasUnsavedChanges),
             ("document_open", _document is not null));
         _saveTimer.Stop();
@@ -742,6 +755,8 @@ public sealed partial class MainPage : Page
         _pageThumbnailLoads.Clear();
         foreach (var cancellation in _homeThumbnailLoads.Values) cancellation.Cancel();
         _homeThumbnailLoads.Clear();
+        foreach (var cancellation in _homeThumbnailRefreshCancellations.Values)
+            cancellation.Cancel();
         _documentLoadCancellation?.Cancel();
         _notebookPagePreviewCancellation?.Cancel();
         _notebookPagePreviewCancellation = null;
@@ -756,6 +771,7 @@ public sealed partial class MainPage : Page
         await _documentLoadGate.WaitAsync();
         _documentLoadGate.Release();
         if (_document is not null) await SaveNowAsync();
+        await Task.WhenAll(_homeThumbnailRefreshTasks.Values.Distinct());
         if (_userSettingsStore is not null) await SaveUserPreferencesAsync();
         if (_repository is not null) await _repository.DisposeAsync();
         PageSurface.RemoveFromVisualTree();
@@ -858,7 +874,10 @@ public sealed partial class MainPage : Page
                     item.ParentId == folder.Id);
                 var notebookCount = _allDocuments.Count(document =>
                     DocumentFolderId(document.Id) == folder.Id);
-                group.Add(new HomeNotebookCard(folder, childFolderCount, notebookCount));
+                _userPreferences.FolderThumbnails.TryGetValue(
+                    folder.Id.ToString("D"), out var thumbnailAssetHash);
+                group.Add(new HomeNotebookCard(
+                    folder, childFolderCount, notebookCount, thumbnailAssetHash));
             }
             _homeLibraryGroups.Add(group);
         }
@@ -878,7 +897,7 @@ public sealed partial class MainPage : Page
         ContainerContentChangingEventArgs args)
     {
         if (args.InRecycleQueue || args.Item is not HomeNotebookCard card ||
-            !card.ShouldLoadThumbnail || card.DocumentId is null || card.Thumbnail is not null ||
+            !card.ShouldLoadThumbnail || card.Thumbnail is not null ||
             _homeThumbnailLoads.ContainsKey(card.Id)) return;
         var cancellation = new CancellationTokenSource();
         _homeThumbnailLoads[card.Id] = cancellation;
@@ -889,25 +908,80 @@ public sealed partial class MainPage : Page
         HomeNotebookCard card,
         CancellationTokenSource cancellation)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
+            if (card.FolderId is { } folderId &&
+                card.FolderThumbnailAssetHash is { Length: > 0 } folderAssetHash)
+            {
+                if (_assetStore is null) return;
+                await _homeThumbnailLoadGate.WaitAsync(cancellation.Token);
+                try
+                {
+                    var file = await StorageFile.GetFileFromPathAsync(
+                        _assetStore.GetPath(folderAssetHash));
+                    using var stream = await file.OpenReadAsync();
+                    var bitmap = new BitmapImage
+                    {
+                        DecodePixelWidth = HomeThumbnailMaxWidth
+                    };
+                    await bitmap.SetSourceAsync(stream);
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    card.Thumbnail = bitmap;
+                    card.IsLoading = false;
+                    DiagnosticsLog.Info("folder.thumbnail_ready",
+                        ("folder_id", folderId),
+                        ("elapsed_ms", MillisecondsSince(started)));
+                }
+                finally
+                {
+                    _homeThumbnailLoadGate.Release();
+                }
+                return;
+            }
             if (_repository is null || _pageThumbnailRenderer is null ||
                 card.DocumentId is not { } documentId) return;
             await _homeThumbnailLoadGate.WaitAsync(cancellation.Token);
             try
             {
-                var page = await _repository.LoadFirstPageAsync(
-                    documentId, cancellation.Token, HomeThumbnailMaxSerializedCharacters);
-                if (page is null)
+                var bytes = await _repository.LoadCachedHomeThumbnailAsync(
+                    documentId, cancellation.Token);
+                var source = "persisted";
+                if (bytes is null)
                 {
-                    card.IsLoading = false;
-                    return;
+                    var fromMemory = _openDocumentCache.TryGetValue(documentId, out var openDocument);
+                    var page = fromMemory
+                        ? openDocument!.Pages.FirstOrDefault()
+                        : await _repository.LoadFirstPageAsync(documentId, cancellation.Token);
+                    if (page is null)
+                    {
+                        card.IsLoading = false;
+                        DiagnosticsLog.Info("home.thumbnail_unavailable",
+                            ("document_id", documentId),
+                            ("reason", "no_pages"));
+                        return;
+                    }
+                    source = fromMemory ? "memory" : "database";
+                    // Dense native notebooks can have first-page JSON records tens of MB in
+                    // size. Render them once in the background, then persist the small PNG so
+                    // later library visits never repeat deserialization or vector rendering.
+                    var size = ThumbnailSize(page, HomeThumbnailMaxWidth, HomeThumbnailMaxHeight);
+                    bytes = await _pageThumbnailRenderer.RenderAsync(
+                        page, size.Width, size.Height, cancellation.Token);
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    try
+                    {
+                        await _repository.SaveCachedHomeThumbnailAsync(
+                            documentId, page, bytes, cancellation.Token);
+                    }
+                    catch (Exception exception) when (!cancellation.IsCancellationRequested)
+                    {
+                        // A transient cache-write failure must not hide a thumbnail that was
+                        // already rendered successfully for this library visit.
+                        DiagnosticsLog.Warning("home.thumbnail_cache_save_failed",
+                            ("document_id", documentId), ("error", exception.Message));
+                    }
                 }
-                // Home cards are much larger than the page rail. Reusing the rail's 96 px
-                // bitmap made notebook covers visibly soft and also kept stale first-page ink.
-                var size = ThumbnailSize(page, HomeThumbnailMaxWidth, HomeThumbnailMaxHeight);
-                var bytes = await _pageThumbnailRenderer.RenderAsync(
-                    page, size.Width, size.Height, cancellation.Token);
                 cancellation.Token.ThrowIfCancellationRequested();
                 using var stream = new InMemoryRandomAccessStream();
                 using (var writer = new DataWriter(stream))
@@ -918,15 +992,15 @@ public sealed partial class MainPage : Page
                     writer.DetachStream();
                 }
                 stream.Seek(0);
-                var bitmap = new BitmapImage
-                {
-                    DecodePixelWidth = size.Width,
-                    DecodePixelHeight = size.Height
-                };
+                var bitmap = new BitmapImage();
                 await bitmap.SetSourceAsync(stream);
                 cancellation.Token.ThrowIfCancellationRequested();
                 card.Thumbnail = bitmap;
                 card.IsLoading = false;
+                DiagnosticsLog.Info("home.thumbnail_ready",
+                    ("document_id", documentId),
+                    ("source", source),
+                    ("elapsed_ms", MillisecondsSince(started)));
             }
             finally
             {
@@ -951,6 +1025,76 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void ScheduleHomeThumbnailCacheRefresh(HoomNoteDocument document)
+    {
+        if (_isUnloading || _repository is null || _pageThumbnailRenderer is null ||
+            document.Pages.FirstOrDefault() is not { } firstPage)
+            return;
+
+        if (_homeThumbnailRefreshCancellations.Remove(document.Id, out var previousCancellation))
+            previousCancellation.Cancel();
+        var cancellation = new CancellationTokenSource();
+        _homeThumbnailRefreshCancellations[document.Id] = cancellation;
+        var pageSnapshot = firstPage with { Objects = firstPage.Objects.ToList() };
+        var previousRefresh = _homeThumbnailRefreshTasks.GetValueOrDefault(
+            document.Id, Task.CompletedTask);
+        _homeThumbnailRefreshTasks[document.Id] = RefreshHomeThumbnailCacheAfterAsync(
+            previousRefresh, document.Id, pageSnapshot, cancellation);
+    }
+
+    private async Task RefreshHomeThumbnailCacheAfterAsync(
+        Task previousRefresh,
+        Guid documentId,
+        NotePage page,
+        CancellationTokenSource cancellation)
+    {
+        await previousRefresh;
+        await RefreshHomeThumbnailCacheAsync(documentId, page, cancellation);
+    }
+
+    private async Task RefreshHomeThumbnailCacheAsync(
+        Guid documentId,
+        NotePage page,
+        CancellationTokenSource cancellation)
+    {
+        var lockTaken = false;
+        try
+        {
+            // Keep cover generation entirely outside active writing and the autosave window.
+            // Returning to the library later can then decode a tiny persisted PNG immediately.
+            await Task.Delay(1_200, cancellation.Token);
+            if (_repository is null || _pageThumbnailRenderer is null) return;
+            await _homeThumbnailLoadGate.WaitAsync(cancellation.Token);
+            lockTaken = true;
+            if (await _repository.LoadCachedHomeThumbnailAsync(documentId, cancellation.Token) is not null)
+                return;
+            var size = ThumbnailSize(page, HomeThumbnailMaxWidth, HomeThumbnailMaxHeight);
+            var bytes = await _pageThumbnailRenderer.RenderAsync(
+                page, size.Width, size.Height, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            await _repository.SaveCachedHomeThumbnailAsync(
+                documentId, page, bytes, cancellation.Token);
+            DiagnosticsLog.Info("home.thumbnail_cache_refreshed",
+                ("document_id", documentId), ("bytes", bytes.Length));
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.Warning("home.thumbnail_cache_refresh_failed",
+                ("document_id", documentId), ("error", exception.Message));
+        }
+        finally
+        {
+            if (lockTaken) _homeThumbnailLoadGate.Release();
+            if (_homeThumbnailRefreshCancellations.TryGetValue(documentId, out var active) &&
+                ReferenceEquals(active, cancellation))
+                _homeThumbnailRefreshCancellations.Remove(documentId);
+            cancellation.Dispose();
+        }
+    }
+
     private async void OnHomeNotebookClick(object sender, ItemClickEventArgs e)
     {
         if (e.ClickedItem is not HomeNotebookCard card) return;
@@ -963,6 +1107,73 @@ public sealed partial class MainPage : Page
         if (card.DocumentId is not { } documentId) return;
         await LoadDocumentAsync(documentId);
         SelectLibraryDocument(documentId);
+    }
+
+    private void OnFolderThumbnailMenuClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: HomeNotebookCard { FolderId: not null } card } button)
+            return;
+        var flyout = new MenuFlyout();
+        var upload = new MenuFlyoutItem
+        {
+            Text = card.HasCustomThumbnail ? "Replace thumbnail…" : "Upload thumbnail…",
+            Icon = new FontIcon { Glyph = "\uE91B" },
+            Tag = card
+        };
+        upload.Click += OnUploadFolderThumbnailClick;
+        flyout.Items.Add(upload);
+        if (card.HasCustomThumbnail)
+        {
+            var remove = new MenuFlyoutItem
+            {
+                Text = "Remove thumbnail",
+                Icon = new FontIcon { Glyph = "\uE74D" },
+                Tag = card
+            };
+            remove.Click += OnRemoveFolderThumbnailClick;
+            flyout.Items.Add(remove);
+        }
+        flyout.ShowAt(button);
+    }
+
+    private async void OnUploadFolderThumbnailClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem
+            {
+                Tag: HomeNotebookCard { FolderId: { } folderId }
+            } || _assetStore is null || HostWindow is not { } hostWindow)
+            return;
+        try
+        {
+            var picker = new FileOpenPicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(
+                picker, WinRT.Interop.WindowNative.GetWindowHandle(hostWindow));
+            foreach (var extension in new[] { ".png", ".jpg", ".jpeg", ".webp", ".bmp" })
+                picker.FileTypeFilter.Add(extension);
+            var file = await picker.PickSingleFileAsync();
+            if (file is null) return;
+            await using var input = File.OpenRead(file.Path);
+            var assetHash = await _assetStore.AddAsync(input, Path.GetExtension(file.Path));
+            _userPreferences.FolderThumbnails[folderId.ToString("D")] = assetHash;
+            await PersistUserPreferencesAsync("Updated folder thumbnail");
+            RebuildHomeLibrary();
+        }
+        catch (Exception exception)
+        {
+            ShowError("The folder thumbnail could not be updated.", exception);
+        }
+    }
+
+    private async void OnRemoveFolderThumbnailClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem
+            {
+                Tag: HomeNotebookCard { FolderId: { } folderId }
+            })
+            return;
+        _userPreferences.FolderThumbnails.Remove(folderId.ToString("D"));
+        await PersistUserPreferencesAsync("Removed folder thumbnail");
+        RebuildHomeLibrary();
     }
 
     private void OnHomeLibraryBackClick(object sender, RoutedEventArgs e)
@@ -1870,6 +2081,7 @@ public sealed partial class MainPage : Page
                 _userPreferences.NotebookFolders[index] = child with { ParentId = source.ParentId };
         }
         _userPreferences.NotebookFolders.RemoveAll(item => item.Id == folderId);
+        _userPreferences.FolderThumbnails.Remove(folderId.ToString("D"));
         if (_selectedFolderId == folderId) _selectedFolderId = source.ParentId;
         RebuildFolderTree(_selectedFolderId);
         ApplyFolderFilter();
@@ -1956,6 +2168,7 @@ public sealed partial class MainPage : Page
             StartNotebookPagePreviewPreload(loaded, selectedPage);
             PageList.SelectedIndex = selectedIndex;
             SelectPage(selectedPage);
+            ScheduleHomeThumbnailCacheRefresh(loaded);
             var elapsed = MillisecondsSince(started);
             DiagnosticsLog.Info("document.load_completed",
                 ("document_id", id),
@@ -2816,7 +3029,8 @@ public sealed partial class MainPage : Page
             var bounds = ContinuousPageLayout.AdjacentBounds(
                 currentBounds, previous.PageSize, state.Zoom, state.Pan.X, viewport,
                 aboveCurrentPage: true, ContinuousPageGap);
-            DrawAdjacentPagePreview(drawingSession, previous, bounds, state);
+            DrawAdjacentPagePreview(
+                drawingSession, document.Pages[index - 1], previous, bounds, state);
         }
         if (index + 1 < document.Pages.Count &&
             _notebookPagePreviews.TryGetValue(document.Pages[index + 1].Id, out var next))
@@ -2824,12 +3038,14 @@ public sealed partial class MainPage : Page
             var bounds = ContinuousPageLayout.AdjacentBounds(
                 currentBounds, next.PageSize, state.Zoom, state.Pan.X, viewport,
                 aboveCurrentPage: false, ContinuousPageGap);
-            DrawAdjacentPagePreview(drawingSession, next, bounds, state);
+            DrawAdjacentPagePreview(
+                drawingSession, document.Pages[index + 1], next, bounds, state);
         }
     }
 
-    private static void DrawAdjacentPagePreview(
+    private void DrawAdjacentPagePreview(
         CanvasDrawingSession drawingSession,
+        NotePage page,
         AdjacentPagePreview preview,
         RectD bounds,
         PageRenderState state)
@@ -2837,6 +3053,12 @@ public sealed partial class MainPage : Page
         if (bounds.Y >= state.Height || bounds.Bottom <= 0) return;
         drawingSession.DrawImage(preview.Bitmap,
             new Rect(bounds.X, bounds.Y, bounds.Width, bounds.Height));
+        if (!_temporaryGridVisible) return;
+        var previousTransform = drawingSession.Transform;
+        drawingSession.Transform = Matrix3x2.CreateScale((float)state.Zoom) *
+                                   Matrix3x2.CreateTranslation((float)bounds.X, (float)bounds.Y);
+        DrawTemporaryGrid(drawingSession, page);
+        drawingSession.Transform = previousTransform;
     }
 
     private void RequestErasePreviewRetire(int renderedEditVersion)
@@ -3139,12 +3361,15 @@ public sealed partial class MainPage : Page
         var retainedPageReady =
             (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) ||
             (_pageRenderCache is not null && _pageRenderCachePageId == page.Id);
-        if (!retainedPageReady && state.InteractionActive &&
+        if (!retainedPageReady && _preloadedFallbackPageId != page.Id &&
             _notebookPagePreviews.TryGetValue(page.Id, out var preloadedPreview))
         {
             drawingSession.DrawImage(preloadedPreview.Bitmap,
                 new Rect(0, 0, page.Size.Width, page.Size.Height));
+            if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page);
             _frameRenderMode = "preloaded-page";
+            _preloadedFallbackPageId = page.Id;
+            DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
             return;
         }
 
@@ -6071,6 +6296,13 @@ public sealed partial class MainPage : Page
     {
         _ = recognizeInk;
         if (_page is not null) _page.UpdatedAt = DateTimeOffset.UtcNow;
+        if (_document is not null && _page?.Id == _document.Pages.FirstOrDefault()?.Id)
+        {
+            _dirtyHomeThumbnailDocumentIds.Add(_document.Id);
+            if (_homeThumbnailRefreshCancellations.TryGetValue(
+                    _document.Id, out var thumbnailRefresh))
+                thumbnailRefresh.Cancel();
+        }
         _hasUnsavedChanges = true;
         _editVersion++;
         if (appendedObject is InkStrokeObject appendedInk && _page is not null)
@@ -6202,7 +6434,12 @@ public sealed partial class MainPage : Page
 
             _pendingInkAppends.RemoveAll(item => appendIds.Contains(item.Stroke.Id));
             if (performedFullSave && fullSaveVersion == _fullSaveVersion) _requiresFullSave = false;
-            if (editVersion == _editVersion) _hasUnsavedChanges = false;
+            if (editVersion == _editVersion)
+            {
+                _hasUnsavedChanges = false;
+                if (_dirtyHomeThumbnailDocumentIds.Remove(document.Id))
+                    ScheduleHomeThumbnailCacheRefresh(document);
+            }
             StatusText.Text = $"Saved {DateTime.Now:t}";
         }
         finally { _saveGate.Release(); }
@@ -6776,8 +7013,19 @@ public sealed partial class MainPage : Page
             document.Pages.Add(canvas);
             document.Sections[0].PageIds.Add(canvas.Id);
         }
+        else
+        {
+            var page = new NotePage
+            {
+                Title = "Page 1",
+                Template = CreatePageTemplate(defaultKind, _userPreferences.DefaultPageColor)
+            };
+            document.Pages.Add(page);
+            document.Sections[0].PageIds.Add(page.Id);
+        }
         await _repository.SaveAsync(document);
         CacheOpenDocument(document, 0);
+        ScheduleHomeThumbnailCacheRefresh(document);
         if (destinationFolderId is { } folderId)
         {
             _userPreferences.DocumentFolders[document.Id.ToString("D")] = folderId.ToString("D");
@@ -9935,6 +10183,7 @@ public sealed partial class MainPage : Page
 
     private void InvalidatePageRenderCacheCore()
     {
+        _preloadedFallbackPageId = null;
         ClearNavigationTileCacheCore();
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = null;
@@ -9991,14 +10240,14 @@ public sealed partial class MainPage : Page
     private void ClampHorizontalPan()
     {
         if (_page is null || _canvasWidth <= 0) return;
-        var overflow = Math.Max(0, _page.Size.Width * _zoom - _canvasWidth);
-        if (overflow <= 0)
-        {
-            _pan.X = 0;
-            return;
-        }
-        var maximumPan = (float)(overflow / 2d);
-        _pan.X = Math.Clamp(_pan.X, -maximumPan, maximumPan);
+        var requested = _pan.X;
+        var clamped = ViewportPanBounds.ClampHorizontal(
+            _page.Size.Width, _zoom, _canvasWidth, requested);
+        _pan.X = clamped;
+        if (Math.Abs(requested - clamped) <= 0.01f) return;
+        if ((requested > clamped && _touchVelocity.X > 0) ||
+            (requested < clamped && _touchVelocity.X < 0))
+            _touchVelocity.X = 0;
     }
 
     private PointD ScreenToPage(Point screen)

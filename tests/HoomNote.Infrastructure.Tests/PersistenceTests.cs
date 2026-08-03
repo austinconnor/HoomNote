@@ -136,6 +136,32 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_HomeThumbnailCacheInvalidatesWhenFirstPageChanges()
+    {
+        await using var repository = new SqliteDocumentRepository(
+            Path.Combine(_root, "home-thumbnail-cache.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Cached cover");
+        var first = AddPage(document);
+        await repository.SaveAsync(document);
+        byte[] thumbnail = [1, 2, 3, 4, 5];
+
+        await repository.SaveCachedHomeThumbnailAsync(document.Id, first, thumbnail);
+
+        Assert.Equal(thumbnail, await repository.LoadCachedHomeThumbnailAsync(document.Id));
+
+        var stroke = new InkStrokeObject
+        {
+            Points = [new InkPoint(10, 10), new InkPoint(20, 20)]
+        };
+        first.Objects.Add(stroke);
+        first.UpdatedAt = first.UpdatedAt.AddSeconds(1);
+        Assert.True(await repository.SaveInkAppendsAsync(document, [(first.Id, stroke)]));
+
+        Assert.Null(await repository.LoadCachedHomeThumbnailAsync(document.Id));
+    }
+
+    [Fact]
     public async Task Repository_DeleteRemovesNotebookAndSearchRows()
     {
         await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "delete-library.db"));
@@ -651,6 +677,10 @@ public sealed class PersistenceTests : IAsyncLifetime
             {
                 [documentId.ToString("D")] = "#4BAEFF"
             },
+            FolderThumbnails = new Dictionary<string, string>
+            {
+                [folder.Id.ToString("D")] = "abc123.png"
+            },
             NotebookOrder = [documentId.ToString("D")],
             DefaultPageTemplate = "Graph",
             DefaultPageColor = "#202124",
@@ -690,6 +720,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#38B26C", loadedChild.Color);
         Assert.Equal(folder.Id.ToString("D"), loaded.DocumentFolders[documentId.ToString("D")]);
         Assert.Equal("#4BAEFF", loaded.DocumentColors[documentId.ToString("D")]);
+        Assert.Equal("abc123.png", loaded.FolderThumbnails[folder.Id.ToString("D")]);
         Assert.Equal(documentId.ToString("D"), Assert.Single(loaded.NotebookOrder));
         Assert.Equal("Graph", loaded.DefaultPageTemplate);
         Assert.Equal("#202124", loaded.DefaultPageColor);

@@ -6,7 +6,7 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 11;
+    public const int CurrentVersion = 12;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
@@ -25,6 +25,7 @@ public sealed record UserPreferences
     public List<string> ExpandedFolderIds { get; init; } = [];
     public Dictionary<string, string> DocumentFolders { get; init; } = [];
     public Dictionary<string, string> DocumentColors { get; init; } = [];
+    public Dictionary<string, string> FolderThumbnails { get; init; } = [];
     public List<string> NotebookOrder { get; init; } = [];
     public string DefaultPageTemplate { get; init; } = "Lined";
     public string DefaultPageColor { get; init; } = "#FFFDF8";
@@ -113,6 +114,8 @@ public sealed class LocalUserSettingsStore(string settingsPath)
             preferences.DocumentFolders, StringComparer.OrdinalIgnoreCase),
         DocumentColors = new Dictionary<string, string>(
             preferences.DocumentColors, StringComparer.OrdinalIgnoreCase),
+        FolderThumbnails = new Dictionary<string, string>(
+            preferences.FolderThumbnails, StringComparer.OrdinalIgnoreCase),
         NotebookOrder = [.. preferences.NotebookOrder]
     };
 }

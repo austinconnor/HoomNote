@@ -729,8 +729,16 @@
                                             <Grid>
                                                 <FontIcon Glyph="{Binding Glyph}" FontSize="30" Opacity="0.22"
                                                           Foreground="{Binding AccentBrush}" />
-                                                <Image Source="{Binding Thumbnail}" Stretch="Uniform" />
+                                                <Image Source="{Binding Thumbnail}" Stretch="{Binding ThumbnailStretch}" />
                                                 <ProgressRing Width="20" Height="20" IsActive="{Binding IsLoading}" />
+                                                <Button HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                        Width="28" Height="28" Margin="4" Padding="0"
+                                                        Visibility="{Binding FolderMenuVisibility}"
+                                                        Tag="{Binding}" Click="OnFolderThumbnailMenuClick"
+                                                        Background="#B0101113"
+                                                        ToolTipService.ToolTip="Folder thumbnail options">
+                                                    <FontIcon Glyph="&#xE712;" FontSize="13" />
+                                                </Button>
                                             </Grid>
                                         </Border>
                                         <TextBlock Grid.Row="1" Text="{Binding Title}" FontSize="13"
