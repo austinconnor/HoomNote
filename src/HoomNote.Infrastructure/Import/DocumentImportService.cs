@@ -63,12 +63,33 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
             await using var samsungStream = File.OpenRead(sourcePath);
             var samsungAssetHash = await assetStore.AddAsync(samsungStream, extension, cancellationToken);
             var samsung = await SamsungNotesImportParser.ParseAsync(sourcePath, cancellationToken);
+            var samsungPages = samsung.Pages.ToArray();
+            var warnings = samsung.Warnings.ToList();
+            if (samsung.Pdf is { } embeddedPdf)
+            {
+                await using var pdfStream = new MemoryStream(embeddedPdf.Data, writable: false);
+                var pdfAssetHash = await assetStore.AddAsync(pdfStream, ".pdf", cancellationToken);
+                var pdfPageCount = await ReadEmbeddedPdfPageCountAsync(
+                    embeddedPdf.Data, cancellationToken);
+                var attachedPageCount = Math.Min(pdfPageCount, samsungPages.Length);
+                for (var pageIndex = 0; pageIndex < attachedPageCount; pageIndex++)
+                {
+                    samsungPages[pageIndex].ImportedLayer = new ImportedDocumentLayer
+                    {
+                        AssetHash = pdfAssetHash,
+                        SourceName = embeddedPdf.FileName,
+                        SourcePageIndex = pageIndex,
+                        Transform = Transform2D.Identity
+                    };
+                }
+                warnings.Add($"The embedded PDF background was restored on {attachedPageCount} page(s).");
+            }
             foreach (var image in samsung.Images)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 await using var imageStream = new MemoryStream(image.Data, writable: false);
                 var imageHash = await assetStore.AddAsync(imageStream, Path.GetExtension(image.FileName), cancellationToken);
-                samsung.Pages[image.PageIndex].Objects.Add(new ImageObject
+                samsungPages[image.PageIndex].Objects.Add(new ImageObject
                 {
                     AssetHash = imageHash,
                     Bounds = image.Bounds,
@@ -78,14 +99,18 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
                     PreserveAspectRatio = true
                 });
             }
-            foreach (var page in samsung.Pages)
+            foreach (var page in samsungPages)
                 page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
             var selectedSamsungPages = request.PageIndexes?
-                .Where(index => index >= 0 && index < samsung.Pages.Count)
+                .Where(index => index >= 0 && index < samsungPages.Length)
                 .Distinct()
-                .Select((index, ordinal) => samsung.Pages[index] with { Title = $"Page {ordinal + 1}" })
-                .ToArray() ?? samsung.Pages;
-            return new ImportResult(samsungAssetHash, Path.GetFileName(request.SourcePath), selectedSamsungPages, samsung.Warnings);
+                .Select((index, ordinal) => samsungPages[index] with { Title = $"Page {ordinal + 1}" })
+                .ToArray() ?? samsungPages;
+            return new ImportResult(
+                samsungAssetHash,
+                Path.GetFileName(request.SourcePath),
+                selectedSamsungPages,
+                warnings);
         }
 
         if (extension != ".pdf") throw new NotSupportedException("HoomNote currently imports PDF, PPT, PPTX, and Samsung Notes SDOCX documents.");
@@ -197,6 +222,28 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
             {
                 throw new InvalidDataException(
                     "HoomNote could not read the PDF page tree. The file may be encrypted, damaged, or unsupported.",
+                    exception);
+            }
+        }, cancellationToken);
+    }
+
+    private static Task<int> ReadEmbeddedPdfPageCountAsync(
+        byte[] data,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var stream = new MemoryStream(data, writable: false);
+                using var document = PdfReader.Open(stream, PdfDocumentOpenMode.Import);
+                return document.PageCount;
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidDataException(
+                    "HoomNote could not read the PDF embedded in this Samsung Notes file.",
                     exception);
             }
         }, cancellationToken);

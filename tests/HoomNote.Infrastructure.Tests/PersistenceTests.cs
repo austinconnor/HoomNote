@@ -534,6 +534,42 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SamsungNotesImport_RestoresEmbeddedPdfAndModernHighlighterStyle()
+    {
+        var source = Path.Combine(_root, "annotated-pdf.sdocx");
+        WriteSamsungPdfAnnotationFixture(source);
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets-annotated-pdf"));
+        var importer = new DocumentImportService(store);
+
+        var result = await importer.ImportAsync(new ImportRequest(source));
+
+        var page = Assert.Single(result.Pages);
+        var imported = Assert.IsType<ImportedDocumentLayer>(page.ImportedLayer);
+        Assert.Equal(0, imported.SourcePageIndex);
+        Assert.Equal("0@source.pdf", imported.SourceName);
+        Assert.True(File.Exists(store.GetPath(imported.AssetHash)));
+        var highlighters = page.Objects.OfType<InkStrokeObject>().ToArray();
+        Assert.Equal(2, highlighters.Length);
+        Assert.All(highlighters, highlighter =>
+        {
+            Assert.Equal(InkToolKind.Highlighter, highlighter.Style.Tool);
+            Assert.Equal("#FFCB30", highlighter.Style.Color);
+            Assert.Equal(19.375f, highlighter.Style.Width, 3);
+            Assert.Equal(1f, highlighter.Style.Opacity);
+            Assert.False(highlighter.Style.PressureEnabled);
+        });
+        Assert.Contains(result.Warnings, warning =>
+            warning.Contains("embedded PDF background was restored", StringComparison.Ordinal));
+
+        var document = HoomNoteDocument.Create("Imported Samsung PDF");
+        document.Pages.Add(page);
+        document.Sections[0].PageIds.Add(page.Id);
+        var svgPath = Path.Combine(_root, "annotated-pdf.svg");
+        await new VectorExportService(store).ExportAsync(document, svgPath, VectorExportFormat.Svg);
+        Assert.Contains("opacity=\"0.42\"", await File.ReadAllTextAsync(svgPath));
+    }
+
+    [Fact]
     public async Task SamsungNotesImport_UsesMediaBindIdInsteadOfPlacementOrder()
     {
         var source = Path.Combine(_root, "bound-images.sdocx");
@@ -870,6 +906,93 @@ public sealed class PersistenceTests : IAsyncLifetime
         var metadata = archive.CreateEntry("note.note");
         using var metadataStream = metadata.Open();
         metadataStream.Write([0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF5, 0xDD, 0xEE, 0xFF]);
+    }
+
+    private static void WriteSamsungPdfAnnotationFixture(string path)
+    {
+        var objectBytes = new byte[240];
+        WriteUInt32(objectBytes, 0, (uint)objectBytes.Length);
+        WriteUInt32(objectBytes, 6, 80);
+        objectBytes[10] = 2;
+        WriteDouble(objectBytes, 32, 100);
+        WriteDouble(objectBytes, 40, 80);
+        WriteDouble(objectBytes, 48, 120);
+        WriteDouble(objectBytes, 56, 82);
+        WriteUInt32(objectBytes, 130, 5);
+        objectBytes[156] = 64;
+        objectBytes[157] = 0x01;
+        objectBytes[160] = 64;
+        objectBytes[161] = 0x01;
+        for (var offset = 176; offset < 184; offset += 2) objectBytes[offset] = 100;
+
+        // Modern Samsung style record: flags, BGRA (including source alpha), width,
+        // then the explicit tool id (2 = highlighter).
+        objectBytes[212] = 0x03;
+        objectBytes[213] = 0x00;
+        WriteUInt32(objectBytes, 214, 0x03);
+        objectBytes[218] = 0x30;
+        objectBytes[219] = 0xCB;
+        objectBytes[220] = 0xFF;
+        objectBytes[221] = 0x72;
+        BinaryPrimitives.WriteSingleLittleEndian(objectBytes.AsSpan(222), 19.375f);
+        WriteUInt32(objectBytes, 226, 2);
+
+        var extraShapeBytes = new byte[250];
+        objectBytes.AsSpan(0, 80).CopyTo(extraShapeBytes);
+        WriteUInt32(extraShapeBytes, 0, (uint)extraShapeBytes.Length);
+        var extraPayload = extraShapeBytes.AsSpan(80);
+        extraPayload[0] = 0x02;
+        extraPayload[1] = 0x01;
+        extraPayload[2] = 0x00;
+        extraPayload[3] = 0x17;
+        extraPayload[4] = 0x00;
+        "extra_key_stroke_shape"u8.CopyTo(extraPayload[5..]);
+        WriteUInt32(extraPayload, 66, 5);
+        extraPayload[84] = 64;
+        extraPayload[85] = 0x01;
+        extraPayload[88] = 64;
+        extraPayload[89] = 0x01;
+        for (var offset = 104; offset < 112; offset += 2) extraPayload[offset] = 100;
+        extraPayload[144] = 0x03;
+        extraPayload[145] = 0x00;
+        WriteUInt32(extraPayload, 146, 0x03);
+        extraPayload[150] = 0x30;
+        extraPayload[151] = 0xCB;
+        extraPayload[152] = 0xFF;
+        extraPayload[153] = 0x72;
+        BinaryPrimitives.WriteSingleLittleEndian(extraPayload[154..], 19.375f);
+        WriteUInt32(extraPayload, 158, 2);
+
+        var secondObjectOffset = 95 + objectBytes.Length;
+        var pageBytes = new byte[secondObjectOffset + 7 + extraShapeBytes.Length + 32];
+        WriteUInt32(pageBytes, 0, 64);
+        WriteUInt32(pageBytes, 0x16, 816);
+        WriteUInt32(pageBytes, 0x1A, 1056);
+        WriteUInt16(pageBytes, 64, 1);
+        WriteUInt32(pageBytes, 84, 2);
+        pageBytes[88] = 1;
+        WriteUInt32(pageBytes, 91, (uint)objectBytes.Length);
+        objectBytes.CopyTo(pageBytes, 95);
+        pageBytes[secondObjectOffset] = 1;
+        WriteUInt32(pageBytes, secondObjectOffset + 3, (uint)extraShapeBytes.Length);
+        extraShapeBytes.CopyTo(pageBytes, secondObjectOffset + 7);
+
+        using var pdfStream = new MemoryStream();
+        using (var pdf = new PdfDocument())
+        {
+            var pdfPage = pdf.AddPage();
+            pdfPage.Width = XUnit.FromPoint(612);
+            pdfPage.Height = XUnit.FromPoint(792);
+            pdf.Save(pdfStream, closeStream: false);
+        }
+
+        using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
+        using (var pageStream = archive.CreateEntry("annotated.page").Open())
+            pageStream.Write(pageBytes);
+        using (var embeddedPdf = archive.CreateEntry("media/0@source.pdf").Open())
+            embeddedPdf.Write(pdfStream.ToArray());
+        using var metadata = archive.CreateEntry("note.note").Open();
+        metadata.Write([0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     private static void WriteSamsungImageBindingFixture(string path)

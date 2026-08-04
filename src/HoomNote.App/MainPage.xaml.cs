@@ -582,6 +582,8 @@ public sealed partial class MainPage : Page
         VersionText.Text = DisplayVersion();
         PresetScrollViewer.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnPresetScrollWheelChanged), handledEventsToo: true);
+        AddHandler(UIElement.PointerPressedEvent,
+            new PointerEventHandler(OnLightDismissInspectorPointerPressed), handledEventsToo: true);
         _saveTimer = DispatcherQueue.CreateTimer();
         _saveTimer.Interval = TimeSpan.FromMilliseconds(1_500);
         _saveTimer.IsRepeating = false;
@@ -3361,6 +3363,21 @@ public sealed partial class MainPage : Page
         var retainedPageReady =
             (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) ||
             (_pageRenderCache is not null && _pageRenderCachePageId == page.Id);
+        var importedPdfPending = IsImportedPdfPreviewPending(page);
+        if (importedPdfPending &&
+            _notebookPagePreviews.TryGetValue(page.Id, out var stablePreview))
+        {
+            // A neighboring page already has a complete composed preview, including its PDF
+            // background. Keep presenting it while the focused-page PDF raster loads instead
+            // of briefly rebuilding a paper-only page between the two rendering paths.
+            drawingSession.DrawImage(stablePreview.Bitmap,
+                new Rect(0, 0, page.Size.Width, page.Size.Height));
+            if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page);
+            _frameRenderMode = "preloaded-pdf-pending";
+            _preloadedFallbackPageId = page.Id;
+            RequestPdfPreviewLoad(page);
+            return;
+        }
         if (!retainedPageReady && _preloadedFallbackPageId != page.Id &&
             _notebookPagePreviews.TryGetValue(page.Id, out var preloadedPreview))
         {
@@ -3417,6 +3434,14 @@ public sealed partial class MainPage : Page
             if (appended.IsHidden) continue;
             DrawObject(drawingSession, appended, cacheInkGeometry: true);
         }
+    }
+
+    private bool IsImportedPdfPreviewPending(NotePage page)
+    {
+        var layer = page.ImportedLayer;
+        if (layer is null || !layer.IsVisible || _assetStore is null) return false;
+        var path = _assetStore.GetPath(layer.AssetHash);
+        return _pdfPreview.TryGet(path, layer.SourcePageIndex) is null;
     }
 
     private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
@@ -6925,6 +6950,14 @@ public sealed partial class MainPage : Page
         {
             var oldest = _pageThumbnailLru.First!.Value;
             _pageThumbnailLru.RemoveFirst();
+            if (_page?.Id == oldest && _pageThumbnailLru.Count > 0)
+            {
+                // The selected page is commonly the first thumbnail rendered. In notebooks
+                // just over the cache limit it was therefore evicted first, leaving its visible
+                // card on a spinner while every neighboring thumbnail remained available.
+                _pageThumbnailLru.AddLast(oldest);
+                continue;
+            }
             _pageThumbnailCache.Remove(oldest);
         }
     }
@@ -7722,6 +7755,28 @@ public sealed partial class MainPage : Page
                     InspectorSidebar.Visibility != Visibility.Visible || InspectorColumn.Width.Value <= 0);
                 break;
         }
+    }
+
+    private async void OnLightDismissInspectorPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_readMode || InspectorSidebar.Visibility != Visibility.Visible ||
+            InspectorColumn.Width.Value <= 0 ||
+            e.OriginalSource is not DependencyObject source ||
+            IsDescendantOf(source, InspectorSidebar) ||
+            HasStringTag(source, "Inspector"))
+            return;
+
+        await AnimateSidebarAsync(
+            InspectorColumn, InspectorSidebar, InspectorWidth, opening: false);
+    }
+
+    private static bool HasStringTag(DependencyObject? element, string tag)
+    {
+        for (var current = element; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (current is FrameworkElement { Tag: string candidate } &&
+                string.Equals(candidate, tag, StringComparison.Ordinal))
+                return true;
+        return false;
     }
 
     private async Task AnimateSidebarAsync(ColumnDefinition column, FrameworkElement sidebar,

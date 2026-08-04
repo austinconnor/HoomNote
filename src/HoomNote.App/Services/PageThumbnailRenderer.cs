@@ -21,7 +21,7 @@ namespace HoomNote_App.Services;
 /// </summary>
 public sealed class PageThumbnailRenderer(IAssetStore assetStore)
 {
-    private const int AssetLongEdge = 512;
+    private const int ImageAssetLongEdge = 512;
     private readonly SemaphoreSlim _renderGate = new(1, 1);
     private readonly struct CanvasBlendScope(CanvasDrawingSession session, CanvasBlend previous) : IDisposable
     {
@@ -55,7 +55,7 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         {
             if (page.ImportedLayer is { IsVisible: true } imported && !string.IsNullOrWhiteSpace(imported.AssetHash))
                 importedPage = await TryLoadPdfPageAsync(device, assetStore.GetPath(imported.AssetHash),
-                    imported.SourcePageIndex, cancellationToken);
+                    imported.SourcePageIndex, pixelWidth, pixelHeight, cancellationToken);
 
             foreach (var assetHash in page.Objects.OfType<ImageObject>()
                          .Where(image => !image.IsHidden && !string.IsNullOrWhiteSpace(image.AssetHash))
@@ -368,7 +368,12 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         }
     }
 
-    private static async Task<CanvasBitmap?> TryLoadPdfPageAsync(CanvasDevice device, string path, int pageIndex,
+    private static async Task<CanvasBitmap?> TryLoadPdfPageAsync(
+        CanvasDevice device,
+        string path,
+        int pageIndex,
+        int targetPixelWidth,
+        int targetPixelHeight,
         CancellationToken cancellationToken)
     {
         try
@@ -379,7 +384,12 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
             if (pageIndex < 0 || (uint)pageIndex >= document.PageCount) return null;
             using var page = document.GetPage((uint)pageIndex);
             using var stream = new InMemoryRandomAccessStream();
-            var scale = Math.Min(1d, AssetLongEdge / Math.Max(page.Size.Width, page.Size.Height));
+            // Adjacent notebook pages can occupy nearly the entire viewport. Rendering their
+            // PDF background at the old thumbnail-only 512 px cap made the page visibly blurry
+            // until it became the focused page and switched to PdfPreviewCache. Match the PDF
+            // source raster to the bounded output preview instead, so it is sharp immediately.
+            var requestedLongEdge = Math.Max(1, Math.Max(targetPixelWidth, targetPixelHeight));
+            var scale = requestedLongEdge / Math.Max(1d, Math.Max(page.Size.Width, page.Size.Height));
             await page.RenderToStreamAsync(stream, new PdfPageRenderOptions
             {
                 DestinationWidth = (uint)Math.Max(1, page.Size.Width * scale),
@@ -404,7 +414,8 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
             var file = await StorageFile.GetFileFromPathAsync(path);
             using var stream = await file.OpenAsync(FileAccessMode.Read);
             var decoder = await BitmapDecoder.CreateAsync(stream);
-            var scale = Math.Min(1d, AssetLongEdge / (double)Math.Max(decoder.PixelWidth, decoder.PixelHeight));
+            var scale = Math.Min(1d,
+                ImageAssetLongEdge / (double)Math.Max(decoder.PixelWidth, decoder.PixelHeight));
             var transform = new BitmapTransform
             {
                 ScaledWidth = (uint)Math.Max(1, decoder.PixelWidth * scale),

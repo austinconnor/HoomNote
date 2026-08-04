@@ -21,12 +21,19 @@ internal static class SamsungNotesImportParser
 
     internal sealed record SamsungEmbeddedImage(
         int PageIndex, RectD Bounds, int ZIndex, string FileName, byte[] Data);
+    internal sealed record SamsungEmbeddedPdf(string FileName, byte[] Data);
     internal sealed record ParsedSamsungNote(
         IReadOnlyList<NotePage> Pages,
         IReadOnlyList<SamsungEmbeddedImage> Images,
+        SamsungEmbeddedPdf? Pdf,
         IReadOnlyList<string> Warnings);
     private sealed record DecodedStroke(List<PointD> Points, int PointCount, int DeltaOffset);
-    private sealed record StrokeMetadata(string Color, float Width, int MarkerOffset);
+    private sealed record StrokeMetadata(
+        string Color,
+        float Width,
+        InkToolKind Tool,
+        float Opacity,
+        int MarkerOffset);
     private sealed record ShapeStyle(
         string Color,
         float Width,
@@ -53,6 +60,7 @@ internal static class SamsungNotesImportParser
             throw new InvalidDataException("This Samsung Notes file does not contain any readable .page records.");
 
         var documentPaperColor = ReadDocumentPaperColor(archive);
+        var embeddedPdf = ReadEmbeddedPdf(archive);
         // Image placements carry a media bind id. Resolve that id through mediaInfo.dat;
         // placement order is only a fallback for older files that omit the binding field.
         var mediaEntries = OrderedImageEntries(archive);
@@ -101,7 +109,7 @@ internal static class SamsungNotesImportParser
 
         var warnings = new List<string>
         {
-            "Samsung handwriting was imported as editable vector ink with its original colors, widths, pressure, and page color."
+            "Samsung handwriting was imported as editable vector ink with its original tool, colors, widths, opacity, pressure, and page color."
         };
         if (images.Count > 0)
             warnings.Add($"{images.Count} placed Samsung image(s) were imported at their original page positions.");
@@ -110,7 +118,7 @@ internal static class SamsungNotesImportParser
             warnings.Add($"{shapeCount} Samsung shape(s) and line(s) were imported as editable vectors.");
         if (skippedObjects > 0)
             warnings.Add($"{skippedObjects} unsupported Samsung object(s), such as placed media or typed content, were skipped safely.");
-        return new ParsedSamsungNote(pages, images, warnings);
+        return new ParsedSamsungNote(pages, images, embeddedPdf, warnings);
     }
 
     private static NotePage ParsePage(byte[] data, int pageIndex, string? documentPaperColor,
@@ -584,6 +592,23 @@ internal static class SamsungNotesImportParser
     private static bool IsSupportedImageExtension(string extension) => extension.ToLowerInvariant() is
         ".png" or ".jpg" or ".jpeg" or ".webp" or ".bmp";
 
+    private static SamsungEmbeddedPdf? ReadEmbeddedPdf(ZipArchive archive)
+    {
+        var entry = archive.Entries
+            .Where(candidate => candidate.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
+                                Path.GetExtension(candidate.FullName)
+                                    .Equals(".pdf", StringComparison.OrdinalIgnoreCase) &&
+                                candidate.Length is > 0 and <= MaximumEntryBytes)
+            .OrderBy(candidate => ReadMediaIndex(candidate.FullName))
+            .ThenBy(candidate => candidate.FullName, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (entry is null) return null;
+        using var input = entry.Open();
+        using var memory = new MemoryStream((int)Math.Min(entry.Length, int.MaxValue));
+        input.CopyTo(memory);
+        return new SamsungEmbeddedPdf(Path.GetFileName(entry.FullName), memory.ToArray());
+    }
+
     private static ZipArchiveEntry[] OrderedImageEntries(ZipArchive archive)
     {
         var archiveImages = archive.Entries
@@ -696,16 +721,16 @@ internal static class SamsungNotesImportParser
                 TimestampMicroseconds: index * 1_000L)).ToList();
             var pressureEnabled = pressures.Count > 0 && pressures.Max() - pressures.Min() > 0.01f;
             var width = Math.Clamp(metadata.Width * (float)scale, 0.25f, 96f);
-            var highlighter = width >= 8f;
+            var highlighter = metadata.Tool == InkToolKind.Highlighter;
             return new InkStrokeObject
             {
                 Points = imported,
                 Style = new InkStyle
                 {
-                    Tool = highlighter ? InkToolKind.Highlighter : InkToolKind.Pen,
+                    Tool = metadata.Tool,
                     Color = metadata.Color,
                     Width = width,
-                    Opacity = highlighter ? 0.35f : 1f,
+                    Opacity = metadata.Opacity,
                     PressureEnabled = pressureEnabled && !highlighter,
                     PressureSensitivity = pressureEnabled ? 0.9f : 0f,
                     // Samsung has already fitted these high-density samples. Preserve its
@@ -725,23 +750,53 @@ internal static class SamsungNotesImportParser
     {
         if (payload.Length < 64) return null;
         var padded = payload.Length >= 32 && payload[16..32].IndexOfAnyExcept((byte)0) < 0;
-        var countOffset = padded ? 50 : 34;
-        var deltaOffset = padded ? 76 : 60;
-        if (payload.Length < deltaOffset + 4) return null;
-        var count = checked((int)ReadUInt32(payload, countOffset));
-        if (count is < 1 or > 200_000) return null;
-        var deltaCount = Math.Min(Math.Max(0, count - 1), (payload.Length - deltaOffset) / 4);
+        var layouts = new List<(int CountOffset, int DeltaOffset)>(3);
+        var extraShapeOffset = payload.IndexOf("extra_key_stroke_shape"u8);
+        if (extraShapeOffset >= 0)
+            layouts.Add((extraShapeOffset + 61, extraShapeOffset + 79));
+        if (padded)
+        {
+            layouts.Add((50, 76));
+            layouts.Add((34, 60));
+        }
+        else
+        {
+            layouts.Add((34, 60));
+            layouts.Add((50, 76));
+        }
+        var candidates = new List<DecodedStroke>(2);
+        foreach (var layout in layouts)
+        {
+            if (payload.Length < layout.CountOffset + 4 || payload.Length < layout.DeltaOffset + 4)
+                continue;
+            var rawCount = ReadUInt32(payload, layout.CountOffset);
+            if (rawCount is < 1 or > 200_000) continue;
+            var count = (int)rawCount;
+            var deltaCount = Math.Min(Math.Max(0, count - 1),
+                (payload.Length - layout.DeltaOffset) / 4);
 
-        // Samsung stores each coordinate delta as one complete little-endian 16-bit
-        // signed-magnitude fixed-point word (15 magnitude bits, 5 fractional bits).
-        // Treating the high byte as a standalone sign/metadata flag truncates movement
-        // above 7.96875 px and collapses ordinary handwriting into dots around its anchor.
-        // The stored bounds are useful for positioning and validation, but must not be
-        // used to choose a different decoder independently for every stroke.
-        var points = DecodeCoordinates(payload, deltaOffset, deltaCount);
-        RemoveTerminator(points);
-        if (points.Count == 0 || !BoundsArePlausible(points, storedWidth, storedHeight)) return null;
-        return new DecodedStroke(points, count, deltaOffset);
+            // Some unpadded records happen to contain sixteen zero bytes at the padded marker.
+            // Decode both known layouts and let the stored object bounds choose the valid one.
+            var points = DecodeCoordinates(payload, layout.DeltaOffset, deltaCount);
+            RemoveTerminator(points);
+            if (points.Count > 0 && BoundsArePlausible(points, storedWidth, storedHeight))
+                candidates.Add(new DecodedStroke(points, count, layout.DeltaOffset));
+        }
+        return candidates.MinBy(candidate => BoundsDifferenceScore(
+            candidate.Points, storedWidth, storedHeight));
+    }
+
+    private static double BoundsDifferenceScore(
+        IReadOnlyList<PointD> points,
+        double storedWidth,
+        double storedHeight)
+    {
+        var width = points.Max(point => point.X) - points.Min(point => point.X);
+        var height = points.Max(point => point.Y) - points.Min(point => point.Y);
+        static double Difference(double decoded, double stored) => Math.Abs(stored) >= 0.5
+            ? Math.Abs(decoded - Math.Abs(stored)) / Math.Abs(stored)
+            : decoded / 32d;
+        return Difference(width, storedWidth) + Difference(height, storedHeight);
     }
 
     private static List<PointD> DecodeCoordinates(ReadOnlySpan<byte> payload, int offset, int count)
@@ -786,19 +841,39 @@ internal static class SamsungNotesImportParser
     {
         for (var offset = payload.Length - 14; offset >= 0; offset--)
         {
-            ReadOnlySpan<byte> markerTail = [0x00, 0x01, 0x00, 0x00, 0x00];
-            if (payload[offset] is not (0x02 or 0x03) ||
-                !payload.Slice(offset + 1, 5).SequenceEqual(markerTail)) continue;
+            if (payload[offset] is not (0x02 or 0x03) || payload[offset + 1] != 0) continue;
+            var fieldFlags = ReadUInt32(payload, offset + 2);
+            if ((fieldFlags & 1) == 0 || fieldFlags > 0xFF) continue;
             var after = offset + 6;
             if (after + 4 > payload.Length) break;
-            if (payload[after + 3] == 0xFF && after + 8 <= payload.Length)
+            if (payload[after + 3] > 0 && after + 8 <= payload.Length)
             {
                 var color = $"#{payload[after + 2]:X2}{payload[after + 1]:X2}{payload[after]:X2}";
-                return new StrokeMetadata(color, ReadValidWidth(payload, after + 4), offset);
+                var width = ReadValidWidth(payload, after + 4);
+                var samsungTool = (fieldFlags & 0x06) != 0 && after + 12 <= payload.Length
+                    ? ReadUInt32(payload, after + 8)
+                    : 0;
+                var tool = samsungTool == 2 || samsungTool == 0 && width >= 8f
+                    ? InkToolKind.Highlighter
+                    : InkToolKind.Pen;
+                var sourceOpacity = payload[after + 3] / 255f;
+                // Samsung stores final marker alpha. HoomNote's stable highlighter blend caps
+                // authored opacity at 42%, so normalize source alpha into that authored range.
+                var opacity = tool == InkToolKind.Highlighter
+                    ? Math.Clamp(sourceOpacity / 0.42f, 0.02f, 1f)
+                    : 1f;
+                return new StrokeMetadata(color, width, tool, opacity, offset);
             }
-            return new StrokeMetadata(defaultInkColor, ReadValidWidth(payload, after), offset);
+            var fallbackWidth = ReadValidWidth(payload, after);
+            var fallbackTool = fallbackWidth >= 8f ? InkToolKind.Highlighter : InkToolKind.Pen;
+            return new StrokeMetadata(
+                defaultInkColor,
+                fallbackWidth,
+                fallbackTool,
+                fallbackTool == InkToolKind.Highlighter ? InkStyle.DefaultHighlighterOpacity : 1f,
+                offset);
         }
-        return new StrokeMetadata(defaultInkColor, 0.8f, payload.Length);
+        return new StrokeMetadata(defaultInkColor, 0.8f, InkToolKind.Pen, 1f, payload.Length);
     }
 
     private static float ReadValidWidth(ReadOnlySpan<byte> data, int offset)

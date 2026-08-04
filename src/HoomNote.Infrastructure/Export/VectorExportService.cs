@@ -3,6 +3,7 @@ using System.Text;
 using HoomNote.Core.Documents;
 using HoomNote.Core.Services;
 using HoomNote.Canvas.Geometry;
+using HoomNote.Canvas.Rendering;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
 
@@ -112,7 +113,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
         switch (canvasObject)
         {
             case InkStrokeObject stroke:
-                var color = ParseXColor(stroke.Style.Color, stroke.Style.Normalize().Opacity);
+                var color = ParseXColor(stroke.Style.Color, InkOpacity(stroke.Style));
                 if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
                 {
                     var centerline = StrokeOutlineBuilder.FitCenterline(stroke);
@@ -246,7 +247,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
             switch (canvasObject)
             {
                 case InkStrokeObject stroke:
-                    var inkOpacity = stroke.Style.Normalize().Opacity;
+                    var inkOpacity = InkOpacity(stroke.Style);
                     if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
                     {
                         var centerline = StrokeOutlineBuilder.FitCenterline(stroke);
@@ -371,6 +372,10 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
     private static RectD Normalize(PointD left, PointD right) => new(
         Math.Min(left.X, right.X), Math.Min(left.Y, right.Y), Math.Abs(right.X - left.X), Math.Abs(right.Y - left.Y));
     private static double Dip(double value) => value * PointsPerDip;
+
+    private static float InkOpacity(InkStyle style) => style.Tool == InkToolKind.Highlighter
+        ? CanvasObjectRenderPolicy.HighlighterBlendStrength(style)
+        : CanvasObjectRenderPolicy.SourceOverOpacity(style);
 
     private static XColor ParseXColor(string value, float opacity = 1)
     {
