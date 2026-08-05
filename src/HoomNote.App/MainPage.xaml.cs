@@ -17,6 +17,7 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Navigation;
+using HoomNote.Core.Collections;
 using HoomNote.Canvas.Geometry;
 using HoomNote.Canvas.Interaction;
 using HoomNote.Canvas.Rendering;
@@ -189,7 +190,7 @@ public sealed partial class MainPage : Page
 
     private readonly ObservableCollection<DocumentSummary> _documents = [];
     private readonly List<DocumentSummary> _allDocuments = [];
-    private readonly ObservableCollection<NotePage> _pages = [];
+    private readonly RangeObservableCollection<NotePage> _pages = [];
     private readonly ObservableCollection<SearchResult> _searchResults = [];
     private readonly ObservableCollection<HomeNotebookGroup> _homeLibraryGroups = [];
     private Guid? _homeFolderId;
@@ -199,7 +200,8 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, HoomNoteDocument> _openDocumentCache = [];
     private readonly LinkedList<Guid> _openDocumentLru = [];
     private readonly Dictionary<Guid, int> _openDocumentPointCounts = [];
-    private const int OpenDocumentCacheLimit = 2;
+    private const int OpenDocumentCacheLimit = 4;
+    private const int OpenDocumentProtectedHotSetSize = 2;
     // Keep the two notebooks a user is actively switching between even when both contain dense
     // Samsung ink. The previous 400k ceiling evicted a 596k-point notebook immediately, forcing
     // another full JSON parse on every return navigation.
@@ -2148,17 +2150,32 @@ public sealed partial class MainPage : Page
         _documentLoadCancellation = cancellation;
         var lockTaken = false;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var saveElapsed = 0d;
+        var fetchElapsed = 0d;
+        var bindElapsed = 0d;
         foreach (var homeCancellation in _homeThumbnailLoads.Values) homeCancellation.Cancel();
         _homeThumbnailLoads.Clear();
         try
         {
             await _documentLoadGate.WaitAsync(cancellation.Token);
             lockTaken = true;
+            var stageStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             await SaveNowAsync();
+            saveElapsed = MillisecondsSince(stageStarted);
             cancellation.Token.ThrowIfCancellationRequested();
-            if (_document is not null) CacheOpenDocument(_document);
             var fromCache = _openDocumentCache.TryGetValue(id, out var cached);
+            if (fromCache) TouchOpenDocument(id);
+            if (_document is not null)
+            {
+                var knownPointCount = _openDocumentPointCounts.TryGetValue(
+                    _document.Id, out var currentPointCount)
+                    ? currentPointCount
+                    : (int?)null;
+                CacheOpenDocument(_document, knownPointCount);
+            }
+            stageStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             var loaded = cached ?? await _repository.LoadAsync(id, cancellation.Token);
+            fetchElapsed = MillisecondsSince(stageStarted);
             cancellation.Token.ThrowIfCancellationRequested();
             if (loaded is null) return;
             if (!_documentHistories.TryGetValue(id, out var history))
@@ -2166,8 +2183,11 @@ public sealed partial class MainPage : Page
             _history = history;
             _document = loaded;
             RestoreTemporaryGridVisibility(loaded.Id);
-            var inkPointCount = CountInkPoints(loaded);
+            var inkPointCount = fromCache && _openDocumentPointCounts.TryGetValue(id, out var cachedPointCount)
+                ? cachedPointCount
+                : CountInkPoints(loaded);
             CacheOpenDocument(loaded, inkPointCount);
+            stageStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateFolderActions();
             _pendingInkAppends.Clear();
             _requiresFullSave = false;
@@ -2176,8 +2196,7 @@ public sealed partial class MainPage : Page
             _hostWindow?.UpdateNotebookTitle(loaded.Title);
             EnsureNotebookTab(loaded.Id, loaded.Title);
             _loading = true;
-            _pages.Clear();
-            foreach (var page in loaded.Pages) _pages.Add(page);
+            _pages.ReplaceAll(loaded.Pages);
             _loading = false;
             var selectedIndex = pageId is null ? 0 : loaded.Pages.FindIndex(page => page.Id == pageId);
             selectedIndex = Math.Max(0, selectedIndex);
@@ -2185,6 +2204,7 @@ public sealed partial class MainPage : Page
             StartNotebookPagePreviewPreload(loaded, selectedPage);
             PageList.SelectedIndex = selectedIndex;
             SelectPage(selectedPage);
+            bindElapsed = MillisecondsSince(stageStarted);
             ScheduleHomeThumbnailCacheRefresh(loaded);
             var elapsed = MillisecondsSince(started);
             DiagnosticsLog.Info("document.load_completed",
@@ -2192,6 +2212,9 @@ public sealed partial class MainPage : Page
                 ("source", fromCache ? "cache" : "database"),
                 ("pages", loaded.Pages.Count),
                 ("ink_points", inkPointCount),
+                ("save_ms", saveElapsed),
+                ("fetch_ms", fetchElapsed),
+                ("bind_ms", bindElapsed),
                 ("elapsed_ms", elapsed));
         }
         catch (OperationCanceledException)
@@ -2670,6 +2693,9 @@ public sealed partial class MainPage : Page
         var loadedCount = 0;
         try
         {
+            // Let the selected page paint before background preview rendering starts competing
+            // for CPU/GPU time. Visible neighbors are still requested immediately by SelectPage.
+            await Task.Delay(400, cancellationToken);
             foreach (var page in pages)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -6458,7 +6484,14 @@ public sealed partial class MainPage : Page
         _hasUnsavedChanges = true;
         _editVersion++;
         if (appendedObject is InkStrokeObject appendedInk && _page is not null)
+        {
             _pendingInkAppends.Add((_page.Id, appendedInk));
+            if (_document is not null &&
+                _openDocumentPointCounts.TryGetValue(_document.Id, out var cachedPointCount))
+                _openDocumentPointCounts[_document.Id] = cachedPointCount > int.MaxValue - appendedInk.Points.Count
+                    ? int.MaxValue
+                    : cachedPointCount + appendedInk.Points.Count;
+        }
         else
         {
             _requiresFullSave = true;
@@ -10284,14 +10317,16 @@ public sealed partial class MainPage : Page
     private void CacheOpenDocument(HoomNoteDocument document, int? knownPointCount = null)
     {
         _openDocumentCache[document.Id] = document;
-        _openDocumentPointCounts[document.Id] = knownPointCount ?? CountInkPoints(document);
-        _openDocumentLru.Remove(document.Id);
-        _openDocumentLru.AddFirst(document.Id);
+        _openDocumentPointCounts[document.Id] = knownPointCount ??
+            (_openDocumentPointCounts.TryGetValue(document.Id, out var cachedPointCount)
+                ? cachedPointCount
+                : CountInkPoints(document));
+        TouchOpenDocument(document.Id);
         while (_openDocumentLru.Count > OpenDocumentCacheLimit ||
-               _openDocumentPointCounts.Values.Sum() > OpenDocumentCachePointBudget)
+               _openDocumentPointCounts.Values.Sum(value => (long)value) > OpenDocumentCachePointBudget)
         {
             var node = _openDocumentLru.Last;
-            while (node is not null && _document?.Id == node.Value) node = node.Previous;
+            while (node is not null && IsProtectedOpenDocument(node)) node = node.Previous;
             if (node is null) break;
             var candidate = node.Value;
             _openDocumentLru.Remove(node);
@@ -10302,6 +10337,24 @@ public sealed partial class MainPage : Page
             // leave with it rather than pinning dense notebooks indefinitely.
             _documentHistories.Remove(candidate);
         }
+    }
+
+    private void TouchOpenDocument(Guid documentId)
+    {
+        _openDocumentLru.Remove(documentId);
+        _openDocumentLru.AddFirst(documentId);
+    }
+
+    private bool IsProtectedOpenDocument(LinkedListNode<Guid> node)
+    {
+        if (_document?.Id == node.Value) return true;
+        var hotNode = _openDocumentLru.First;
+        for (var index = 0; index < OpenDocumentProtectedHotSetSize && hotNode is not null; index++)
+        {
+            if (hotNode == node) return true;
+            hotNode = hotNode.Next;
+        }
+        return false;
     }
 
     private static int CountInkPoints(HoomNoteDocument document)
