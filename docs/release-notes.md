@@ -1,16 +1,17 @@
-# HoomNote 0.7.38
+# HoomNote 0.7.39
 
-- Samsung Notes imports made from annotated PDFs now restore the embedded PDF
-  pages instead of showing blank white backgrounds.
-- Imported Samsung pen and highlighter strokes now preserve their original
-  tool, color, width, opacity, pressure behavior, and page placement.
-- Samsung highlighters now retain translucent blending in both the live canvas
-  and exported PDF/SVG documents.
-- Additional Samsung stroke-record layouts are now decoded so annotations are
-  not silently omitted from imported notebooks.
-- Imported PDF backgrounds now render sharply on adjacent pages as soon as they
-  enter the viewport, and remain stable while focus moves between pages instead
-  of flashing during the renderer handoff.
-- The right-side Settings panel now closes when clicking anywhere outside it.
-- The selected page thumbnail remains pinned in the page-rail cache instead of
-  falling back to a permanent loading spinner in longer notebooks.
+- Smart Shapes now recognize smaller and rougher rectangles, ovals, and stars,
+  then show the closest snapped shape while the pen is still held in place.
+- Highlighters are stronger and more marker-like on both light and dark pages,
+  while repeated passes on dark pages stay readable instead of quickly
+  saturating into an opaque block.
+- Dragged strokes, shapes, text, and images can now cross page boundaries while
+  preserving their visible position, selection, save state, and undo history.
+- Copy and cut operations now paste at the cursor or pen's last canvas position
+  on the destination page instead of reusing the source page coordinates.
+- Temporary-grid visibility is now remembered independently for every open
+  notebook tab, so toggling the grid does not change the other tabs.
+- The active page thumbnail now repairs and restarts a missed render after
+  navigation instead of remaining on a distracting loading spinner.
+- Image and shape lock controls now stay visible on white backgrounds and move
+  continuously with the selected object while it is being dragged.

@@ -117,6 +117,17 @@ public sealed class GeometryAndEditingTests
         var transitioned = ContinuousPageLayout.CurrentBounds(
             pageSize, zoom: 0.8, panX: 0, panY: transitionedPan, viewport);
         Assert.Equal(next.Y, transitioned.Y, 5);
+
+        var translation = ContinuousPageLayout.PageTranslationForSameViewportPosition(
+            current, next, zoom: 0.8);
+        var sourcePoint = new PointD(300, 1_030);
+        var destinationPoint = new PointD(
+            sourcePoint.X + translation.X,
+            sourcePoint.Y + translation.Y);
+        Assert.Equal(current.X + sourcePoint.X * 0.8,
+            next.X + destinationPoint.X * 0.8, 5);
+        Assert.Equal(current.Y + sourcePoint.Y * 0.8,
+            next.Y + destinationPoint.Y * 0.8, 5);
     }
 
     [Theory]
@@ -327,6 +338,43 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void MoveObjectsBetweenPagesCommand_RoundTripsOwnershipTransformAndUndo()
+    {
+        var document = HoomNoteDocument.Create("Move between pages");
+        var sourcePage = new NotePage { Title = "Source" };
+        var destinationPage = new NotePage { Title = "Destination" };
+        document.Pages.AddRange([sourcePage, destinationPage]);
+        document.Sections[0].PageIds.AddRange([sourcePage.Id, destinationPage.Id]);
+        var original = new InkStrokeObject
+        {
+            Points = [new InkPoint(10, 20), new InkPoint(40, 50)],
+            ZIndex = 3
+        };
+        var moved = original with
+        {
+            Transform = Transform2D.Translation(25, 35),
+            ZIndex = 8
+        };
+        sourcePage.Objects.Add(original);
+        var history = new CommandHistory();
+
+        history.Execute(new MoveObjectsBetweenPagesCommand(
+            sourcePage.Id, destinationPage.Id, [original], [moved]), document);
+
+        Assert.Empty(sourcePage.Objects);
+        Assert.Same(moved, Assert.Single(destinationPage.Objects));
+        Assert.Equal([sourcePage.Id, destinationPage.Id], history.LastAffectedPageIds);
+
+        Assert.True(history.Undo(document));
+        Assert.Same(original, Assert.Single(sourcePage.Objects));
+        Assert.Empty(destinationPage.Objects);
+
+        Assert.True(history.Redo(document));
+        Assert.Empty(sourcePage.Objects);
+        Assert.Same(moved, Assert.Single(destinationPage.Objects));
+    }
+
+    [Fact]
     public void SelectionRebinder_UsesRestoredObjectsAfterTransformUndo()
     {
         var document = HoomNoteDocument.Create("Undo selection scale");
@@ -523,12 +571,14 @@ public sealed class GeometryAndEditingTests
             Opacity = InkStyle.DefaultHighlighterOpacity
         };
 
-        Assert.Equal(0.252f, CanvasObjectRenderPolicy.HighlighterBlendStrength(style), 3);
+        Assert.Equal(0.456f, CanvasObjectRenderPolicy.HighlighterBlendStrength(style), 3);
         Assert.Equal(255, CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(255, style));
         var blueChannel = CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(0, style);
-        Assert.Equal(191, blueChannel);
+        Assert.Equal(139, blueChannel);
         Assert.Equal(blueChannel,
             CanvasObjectRenderPolicy.LightSurfaceHighlighterChannel(0, style));
+        Assert.Equal(0.24f,
+            CanvasObjectRenderPolicy.DarkSurfaceHighlighterBlendStrength(style), 3);
     }
 
     [Fact]
@@ -855,6 +905,20 @@ public sealed class GeometryAndEditingTests
         Assert.Null(ShapeRecognizer.RecognizeDetailed(handwrittenO, deliberateGesture: false));
         Assert.Equal(ShapeKind.Ellipse,
             ShapeRecognizer.RecognizeDetailed(handwrittenO, deliberateGesture: true)?.Kind);
+    }
+
+    [Fact]
+    public void ShapeRecognizer_HeldSmallGestureSnapsToClosestShape()
+    {
+        var points = new List<InkPoint>();
+        for (var x = 10; x <= 26; x += 2) points.Add(new InkPoint(x, 10));
+        for (var y = 12; y <= 22; y += 2) points.Add(new InkPoint(26, y));
+        for (var x = 24; x >= 10; x -= 2) points.Add(new InkPoint(x, 22));
+        for (var y = 20; y >= 10; y -= 2) points.Add(new InkPoint(10, y));
+
+        Assert.Equal(ShapeKind.Rectangle,
+            ShapeRecognizer.RecognizeDetailed(
+                points, deliberateGesture: true, snapToClosest: true)?.Kind);
     }
 
     [Fact]

@@ -241,7 +241,7 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         {
             session.Blend = CanvasBlend.Add;
             color = Color.FromArgb(
-                (byte)Math.Round(CanvasObjectRenderPolicy.HighlighterBlendStrength(style) * 255),
+                (byte)Math.Round(CanvasObjectRenderPolicy.DarkSurfaceHighlighterBlendStrength(style) * 255),
                 source.R, source.G, source.B);
         }
         else

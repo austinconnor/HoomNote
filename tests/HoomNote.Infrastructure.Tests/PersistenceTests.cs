@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
 using Microsoft.Data.Sqlite;
+using HoomNote.Canvas.Rendering;
 using HoomNote.Core.Documents;
 using HoomNote.Core.Services;
 using HoomNote.Infrastructure.Export;
@@ -555,7 +556,8 @@ public sealed class PersistenceTests : IAsyncLifetime
             Assert.Equal(InkToolKind.Highlighter, highlighter.Style.Tool);
             Assert.Equal("#FFCB30", highlighter.Style.Color);
             Assert.Equal(19.375f, highlighter.Style.Width, 3);
-            Assert.Equal(1f, highlighter.Style.Opacity);
+            Assert.Equal(0x72 / 255f / CanvasObjectRenderPolicy.HighlighterStrengthScale,
+                highlighter.Style.Opacity, 3);
             Assert.False(highlighter.Style.PressureEnabled);
         });
         Assert.Contains(result.Warnings, warning =>
@@ -566,7 +568,9 @@ public sealed class PersistenceTests : IAsyncLifetime
         document.Sections[0].PageIds.Add(page.Id);
         var svgPath = Path.Combine(_root, "annotated-pdf.svg");
         await new VectorExportService(store).ExportAsync(document, svgPath, VectorExportFormat.Svg);
-        Assert.Contains("opacity=\"0.42\"", await File.ReadAllTextAsync(svgPath));
+        Assert.Contains(
+            FormattableString.Invariant($"opacity=\"{0x72 / 255f}\""),
+            await File.ReadAllTextAsync(svgPath));
     }
 
     [Fact]

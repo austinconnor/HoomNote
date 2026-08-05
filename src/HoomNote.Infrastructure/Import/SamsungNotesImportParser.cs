@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
+using HoomNote.Canvas.Rendering;
 using HoomNote.Core.Documents;
 
 namespace HoomNote.Infrastructure.Import;
@@ -857,10 +858,13 @@ internal static class SamsungNotesImportParser
                     ? InkToolKind.Highlighter
                     : InkToolKind.Pen;
                 var sourceOpacity = payload[after + 3] / 255f;
-                // Samsung stores final marker alpha. HoomNote's stable highlighter blend caps
-                // authored opacity at 42%, so normalize source alpha into that authored range.
+                // Samsung stores final marker alpha. Convert it back to HoomNote's authored
+                // opacity so the stable highlighter compositor reproduces that source strength.
                 var opacity = tool == InkToolKind.Highlighter
-                    ? Math.Clamp(sourceOpacity / 0.42f, 0.02f, 1f)
+                    ? Math.Clamp(
+                        sourceOpacity / CanvasObjectRenderPolicy.HighlighterStrengthScale,
+                        0.02f,
+                        1f)
                     : 1f;
                 return new StrokeMetadata(color, width, tool, opacity, offset);
             }

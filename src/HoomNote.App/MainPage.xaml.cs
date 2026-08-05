@@ -307,6 +307,7 @@ public sealed partial class MainPage : Page
         VerticalAlignment = CanvasVerticalAlignment.Center
     };
     private readonly Dictionary<Guid, Guid> _tabPageSelections = [];
+    private readonly Dictionary<Guid, bool> _temporaryGridVisibilityByDocument = [];
     private IReadOnlyList<Guid>? _pageDragOrder;
     private readonly List<CanvasObject> _selectedObjects = [];
     private readonly List<RecognizedTextRegion> _selectedTextRegions = [];
@@ -345,6 +346,7 @@ public sealed partial class MainPage : Page
     private MenuFlyoutItem _canvasCopyMenuItem = null!;
     private MenuFlyoutItem _canvasPasteMenuItem = null!;
     private PointD? _canvasContextPastePoint;
+    private Point? _lastCanvasPointerPosition;
     private CanvasCommandList? _pageRenderCache;
     private CanvasRenderTarget? _lowZoomPageRaster;
     private Guid? _lowZoomPageRasterPageId;
@@ -416,6 +418,7 @@ public sealed partial class MainPage : Page
     private CancellationTokenSource? _incrementalRecognitionCancellation;
     private readonly DispatcherQueueTimer _thumbnailRefreshTimer;
     private readonly DispatcherQueueTimer _navigationSettleTimer;
+    private readonly DispatcherQueueTimer _shapeSnapTimer;
     private readonly DispatcherQueueTimer _zoomIndicatorTimer;
     private Storyboard? _zoomIndicatorFade;
     private readonly HashSet<Guid> _pendingThumbnailRefreshPageIds = [];
@@ -459,6 +462,7 @@ public sealed partial class MainPage : Page
     private long _lastNativeTouchTimestamp;
     private int _pointerClassificationLogCount;
     private long _lastInkMovementTimestamp;
+    private ShapeRecognizer.Recognition? _heldShapeRecognition;
     private double _zoom = 1;
     private double _minimumZoom = 0.08;
     private double _maximumZoom = 8;
@@ -602,6 +606,10 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.Interval = TimeSpan.FromMilliseconds(180);
         _navigationSettleTimer.IsRepeating = false;
         _navigationSettleTimer.Tick += OnNavigationSettleTick;
+        _shapeSnapTimer = DispatcherQueue.CreateTimer();
+        _shapeSnapTimer.Interval = TimeSpan.FromMilliseconds(ShapeSnapTerminalHoldMs);
+        _shapeSnapTimer.IsRepeating = false;
+        _shapeSnapTimer.Tick += OnShapeSnapTimerTick;
         _zoomIndicatorTimer = DispatcherQueue.CreateTimer();
         _zoomIndicatorTimer.Interval = TimeSpan.FromMilliseconds(850);
         _zoomIndicatorTimer.IsRepeating = false;
@@ -743,6 +751,7 @@ public sealed partial class MainPage : Page
         _recognitionTimer.Stop();
         _thumbnailRefreshTimer.Stop();
         _navigationSettleTimer.Stop();
+        _shapeSnapTimer.Stop();
         _zoomIndicatorTimer.Stop();
         _zoomIndicatorFade?.Stop();
         _wheelZoomAnimating = false;
@@ -752,6 +761,7 @@ public sealed partial class MainPage : Page
         ResetTouchPageScroll();
         _isPointerDown = false;
         _penActive = false;
+        _heldShapeRecognition = null;
         DrawingSurface.ReleasePointerCaptures();
         foreach (var cancellation in _pageThumbnailLoads.Values) cancellation.Cancel();
         _pageThumbnailLoads.Clear();
@@ -1852,6 +1862,10 @@ public sealed partial class MainPage : Page
     {
         if (_readMode || _page is null) return;
         var screenPoint = e.GetPosition(DrawingSurface);
+        if (TryResolveVisiblePageAt(screenPoint, out var targetPage, out var targetBounds) &&
+            targetPage.Id != _page.Id)
+            SwitchToVisiblePage(targetPage, targetBounds.Y, _zoom, _pan.X);
+        _lastCanvasPointerPosition = screenPoint;
         var pagePoint = ClampPointToPage(ScreenToPage(screenPoint));
         _canvasContextPastePoint = pagePoint;
 
@@ -2151,6 +2165,7 @@ public sealed partial class MainPage : Page
                 _documentHistories[id] = history = new CommandHistory();
             _history = history;
             _document = loaded;
+            RestoreTemporaryGridVisibility(loaded.Id);
             var inkPointCount = CountInkPoints(loaded);
             CacheOpenDocument(loaded, inkPointCount);
             UpdateFolderActions();
@@ -2513,6 +2528,7 @@ public sealed partial class MainPage : Page
         {
             sender.TabItems.Remove(tab);
             _tabPageSelections.Remove(closingId);
+            _temporaryGridVisibilityByDocument.Remove(closingId);
             RemoveCachedDocument(closingId);
             return;
         }
@@ -2525,6 +2541,7 @@ public sealed partial class MainPage : Page
         if (nextTab is not null) sender.SelectedItem = nextTab;
         _updatingTabs = false;
         _tabPageSelections.Remove(closingId);
+        _temporaryGridVisibilityByDocument.Remove(closingId);
         StatusText.Text = "Closing notebook…";
         await Task.Yield();
         try
@@ -3206,8 +3223,13 @@ public sealed partial class MainPage : Page
 
         if (_activeInk.Count > 0 && _gestureTool is EditorTool.Pen or EditorTool.Highlighter)
         {
-            DrawLiveInk(drawingSession);
-            DrawLiveInkPrediction(drawingSession);
+            if (_gestureTool == EditorTool.Pen && _heldShapeRecognition is { } heldShape)
+                DrawObject(drawingSession, CreateRecognizedShape(heldShape, 0));
+            else
+            {
+                DrawLiveInk(drawingSession);
+                DrawLiveInkPrediction(drawingSession);
+            }
         }
 
         if (_isPointerDown && _gestureTool == EditorTool.Shape && _activeInk.Count > 0)
@@ -4202,7 +4224,7 @@ public sealed partial class MainPage : Page
         {
             drawingSession.Blend = CanvasBlend.Add;
             color = Color.FromArgb(
-                (byte)Math.Round(CanvasObjectRenderPolicy.HighlighterBlendStrength(style) * 255),
+                (byte)Math.Round(CanvasObjectRenderPolicy.DarkSurfaceHighlighterBlendStrength(style) * 255),
                 source.R, source.G, source.B);
         }
         else
@@ -4605,6 +4627,7 @@ public sealed partial class MainPage : Page
         // CanvasControl can leave keyboard focus in search or a native text editor. Explicitly
         // reclaiming it makes routed Ctrl+Z/Ctrl+Y reliable after any canvas interaction.
         DrawingSurface.Focus(FocusState.Pointer);
+        _lastCanvasPointerPosition = point.Position;
         PauseBackgroundRecognition();
         PauseThumbnailRefresh();
         _isPointerDown = true;
@@ -4645,6 +4668,8 @@ public sealed partial class MainPage : Page
         if (_gestureTool is EditorTool.Lasso or EditorTool.BoxSelect && SelectionContainsInteraction(_gestureStart))
             _gestureTool = EditorTool.Select;
         _activeInk.Clear();
+        _heldShapeRecognition = null;
+        _shapeSnapTimer.Stop();
         _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         ClearLiveInkGeometryCache();
         _eraserPath.Clear();
@@ -4741,6 +4766,7 @@ public sealed partial class MainPage : Page
     private void OnCanvasPointerMoved(object sender, PointerRoutedEventArgs e)
     {
         var current = e.GetCurrentPoint(DrawingSurface);
+        _lastCanvasPointerPosition = current.Position;
         if (IsTouchNavigationPointer(e, current))
         {
             OnTouchPointerMoved(e, current);
@@ -4889,6 +4915,10 @@ public sealed partial class MainPage : Page
                 break;
             case EditorTool.Select when _multiTransformOriginals is { Count: > 1 } && _multiTransformPreviews.Count > 0:
                 var after = _multiTransformOriginals.Select(item => _multiTransformPreviews[item.Id]).ToArray();
+                if (TryMoveSelectionToVisiblePage(
+                        current.Position, _multiTransformOriginals, after,
+                        after.Any(item => item is InkStrokeObject)))
+                    break;
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, _multiTransformOriginals, after,
                     "Transform selection"), _document);
                 _selectedObjects.Clear();
@@ -4897,6 +4927,10 @@ public sealed partial class MainPage : Page
                 Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
                 break;
             case EditorTool.Select when _transformOriginal is not null && _transformPreview is not null:
+                if (TryMoveSelectionToVisiblePage(
+                        current.Position, [_transformOriginal], [_transformPreview],
+                        _transformPreview is InkStrokeObject))
+                    break;
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, [_transformOriginal], [_transformPreview], "Transform object"), _document);
                 _selectedObject = _transformPreview;
                 _selectedObjects.Clear();
@@ -4948,6 +4982,8 @@ public sealed partial class MainPage : Page
                                      Volatile.Read(ref _transformPreviewCommitVersion) >= 0;
         _isPointerDown = false;
         _penActive = false;
+        _shapeSnapTimer.Stop();
+        _heldShapeRecognition = null;
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         _activeInk.Clear();
         ClearLiveInkGeometryCache();
@@ -5299,13 +5335,32 @@ public sealed partial class MainPage : Page
 
     private bool TryActivateVisiblePageAt(Point screenPoint)
     {
-        if (_document is null || _page is null ||
-            _document.Kind == DocumentKind.InfiniteCanvas) return true;
-        var currentIndex = _document.Pages.FindIndex(page => page.Id == _page.Id);
-        if (currentIndex < 0) return false;
+        if (!TryResolveVisiblePageAt(screenPoint, out var target, out var targetBounds)) return false;
+        if (_page?.Id == target.Id) return true;
+        SwitchToVisiblePage(target, targetBounds.Y, _zoom, _pan.X);
+        return true;
+    }
+
+    private bool TryResolveVisiblePageAt(
+        Point screenPoint,
+        out NotePage target,
+        out RectD targetBounds)
+    {
+        target = null!;
+        targetBounds = default;
+        if (_document is null || _page is null) return false;
         var viewport = new SizeD(_canvasWidth, _canvasHeight);
         var currentBounds = ContinuousPageLayout.CurrentBounds(
             _page.Size, _zoom, _pan.X, _pan.Y, viewport);
+        if (_document.Kind == DocumentKind.InfiniteCanvas)
+        {
+            target = _page;
+            targetBounds = currentBounds;
+            return true;
+        }
+
+        var currentIndex = _document.Pages.FindIndex(page => page.Id == _page.Id);
+        if (currentIndex < 0) return false;
         RectD? previousBounds = null;
         RectD? nextBounds = null;
         if (currentIndex > 0)
@@ -5320,13 +5375,56 @@ public sealed partial class MainPage : Page
         var slot = ContinuousPageLayout.HitTest(
             new PointD(screenPoint.X, screenPoint.Y), currentBounds, previousBounds, nextBounds);
         if (slot is null) return false;
-        if (slot == ContinuousPageSlot.Current) return true;
         var targetIndex = currentIndex + (int)slot.Value;
-        var targetBounds = slot == ContinuousPageSlot.Previous ? previousBounds : nextBounds;
-        if (targetBounds is null || targetIndex < 0 || targetIndex >= _document.Pages.Count)
+        var resolvedBounds = slot switch
+        {
+            ContinuousPageSlot.Previous => previousBounds,
+            ContinuousPageSlot.Next => nextBounds,
+            _ => currentBounds
+        };
+        if (resolvedBounds is null || targetIndex < 0 || targetIndex >= _document.Pages.Count)
             return false;
-        SwitchToVisiblePage(
-            _document.Pages[targetIndex], targetBounds.Value.Y, _zoom, _pan.X);
+        target = _document.Pages[targetIndex];
+        targetBounds = resolvedBounds.Value;
+        return true;
+    }
+
+    private bool TryMoveSelectionToVisiblePage(
+        Point releasePoint,
+        IReadOnlyList<CanvasObject> originals,
+        IReadOnlyList<CanvasObject> previews,
+        bool recognizeInk)
+    {
+        if (_transformHandle != TransformHandle.Move || _document is null || _page is not { } source ||
+            !TryResolveVisiblePageAt(releasePoint, out var destination, out var destinationBounds) ||
+            destination.Id == source.Id)
+            return false;
+
+        var viewport = new SizeD(_canvasWidth, _canvasHeight);
+        var sourceBounds = ContinuousPageLayout.CurrentBounds(
+            source.Size, _zoom, _pan.X, _pan.Y, viewport);
+        var translation = ContinuousPageLayout.PageTranslationForSameViewportPosition(
+            sourceBounds, destinationBounds, _zoom);
+        var nextZIndex = destination.Objects.Count == 0
+            ? 0
+            : destination.Objects.Max(item => item.ZIndex) + 1;
+        var moved = previews.Select((item, index) => item with
+        {
+            Transform = item.Transform.Then(
+                Transform2D.Translation(translation.X, translation.Y)),
+            ZIndex = nextZIndex + index
+        }).ToArray();
+
+        _history.Execute(new MoveObjectsBetweenPagesCommand(
+            source.Id, destination.Id, originals, moved), _document);
+        SwitchToVisiblePage(destination, destinationBounds.Y, _zoom, _pan.X);
+        _selectedObjects.Clear();
+        _selectedObjects.AddRange(moved);
+        _selectedObject = moved.Length == 1 ? moved[0] : null;
+        OnDocumentChanged(
+            recognizeInk,
+            affectedPageIds: _history.LastAffectedPageIds);
+        StatusText.Text = $"Moved {moved.Length} object(s) to {destination.Title}";
         return true;
     }
 
@@ -5464,6 +5562,7 @@ public sealed partial class MainPage : Page
         }
         if (!_zoomNavigationActive) return;
         _zoomNavigationActive = false;
+        EnsureSelectedPageThumbnail();
         InvalidateCanvas();
     }
 
@@ -5934,26 +6033,39 @@ public sealed partial class MainPage : Page
                            (_gestureTool == EditorTool.Highlighter && HighlighterStraightCheckBox.IsChecked == true);
         if (endpointOnly && _activeInk.Count > 1) _activeInk[^1] = sample;
         else _activeInk.Add(sample);
-        if (!force) _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (!force)
+        {
+            _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_gestureTool == EditorTool.Pen)
+            {
+                _heldShapeRecognition = null;
+                _shapeSnapTimer.Stop();
+                if (SmartShapesToggle.IsOn) _shapeSnapTimer.Start();
+            }
+        }
         return true;
+    }
+
+    private void OnShapeSnapTimerTick(DispatcherQueueTimer sender, object args)
+    {
+        if (!_isPointerDown || _gestureTool != EditorTool.Pen || !SmartShapesToggle.IsOn ||
+            _activeInk.Count < 4)
+            return;
+        _heldShapeRecognition = ShapeRecognizer.RecognizeDetailed(
+            _activeInk, deliberateGesture: true, snapToClosest: true);
+        if (_heldShapeRecognition is null) return;
+        PointerStatus.Text = $"Snapped to {_heldShapeRecognition.Kind.ToString().ToLowerInvariant()}";
+        InvalidateInteractionOverlay();
     }
 
     private void CommitInk(bool deliberateShapeGesture)
     {
         if (_document is null || _page is null || _activeInk.Count == 0) return;
         if (_gestureTool == EditorTool.Pen && SmartShapesToggle.IsOn &&
-            ShapeRecognizer.RecognizeDetailed(_activeInk, deliberateShapeGesture) is { } recognition)
+            (_heldShapeRecognition ?? ShapeRecognizer.RecognizeDetailed(
+                _activeInk, deliberateShapeGesture, snapToClosest: deliberateShapeGesture)) is { } recognition)
         {
-            var shape = new ShapeObject
-            {
-                Shape = recognition.Kind,
-                Bounds = NormalizeRect(
-                    new PointD(_activeInk.Min(point => point.X), _activeInk.Min(point => point.Y)),
-                    new PointD(_activeInk.Max(point => point.X), _activeInk.Max(point => point.Y))),
-                StrokeColor = _inkColor,
-                StrokeWidth = (float)StrokeWidthSlider.Value,
-                ZIndex = NextZIndex()
-            };
+            var shape = CreateRecognizedShape(recognition, NextZIndex());
             _history.Execute(new AddObjectCommand(_page.Id, shape), _document);
             RetainInkCommitPreview(shape, _editVersion + 1);
             OnDocumentChanged(recognizeInk: false, appendedObject: shape);
@@ -5972,6 +6084,21 @@ public sealed partial class MainPage : Page
         _history.Execute(new AddObjectCommand(_page.Id, stroke), _document);
         RetainInkCommitPreview(stroke, _editVersion + 1);
         OnDocumentChanged(recognizeInk: true, appendedObject: stroke);
+    }
+
+    private ShapeObject CreateRecognizedShape(ShapeRecognizer.Recognition recognition, int zIndex)
+    {
+        var style = _gestureInkStyle ?? CurrentInkStyle();
+        return new ShapeObject
+        {
+            Shape = recognition.Kind,
+            Bounds = NormalizeRect(
+                new PointD(_activeInk.Min(point => point.X), _activeInk.Min(point => point.Y)),
+                new PointD(_activeInk.Max(point => point.X), _activeInk.Max(point => point.Y))),
+            StrokeColor = style.Color,
+            StrokeWidth = style.Width,
+            ZIndex = zIndex
+        };
     }
 
     private void RetainInkCommitPreview(CanvasObject canvasObject, int commitVersion)
@@ -6416,9 +6543,21 @@ public sealed partial class MainPage : Page
 
     private void ResumeThumbnailRefresh()
     {
-        if (_isPointerDown || _pendingThumbnailRefreshPageIds.Count == 0) return;
+        if (_isPointerDown) return;
+        EnsureSelectedPageThumbnail();
+        if (_pendingThumbnailRefreshPageIds.Count == 0) return;
         _thumbnailRefreshTimer.Stop();
         _thumbnailRefreshTimer.Start();
+    }
+
+    private void EnsureSelectedPageThumbnail()
+    {
+        if (_page is not { } page || PageSidebar.Visibility != Visibility.Visible ||
+            PageColumn.Width.Value <= 0 || PageList.ContainerFromItem(page) is not ListViewItem container)
+            return;
+        UpdatePageThumbnailContainer(page, container);
+        if (!_pageThumbnailCache.ContainsKey(page.Id) && !_pageThumbnailLoads.ContainsKey(page.Id))
+            RequestPageThumbnail(page, prioritize: true);
     }
 
     private async void OnSaveTimerTick(DispatcherQueueTimer sender, object args)
@@ -7580,10 +7719,19 @@ public sealed partial class MainPage : Page
     private void SetTemporaryGridVisible(bool visible)
     {
         _temporaryGridVisible = visible;
+        if (_document is { } document)
+            _temporaryGridVisibilityByDocument[document.Id] = visible;
         if (TemporaryGridToolbarButton.IsChecked != visible)
             TemporaryGridToolbarButton.IsChecked = visible;
         InvalidatePageRenderCache();
         InvalidateCanvas();
+    }
+
+    private void RestoreTemporaryGridVisibility(Guid documentId)
+    {
+        _temporaryGridVisible = _temporaryGridVisibilityByDocument.GetValueOrDefault(documentId);
+        if (TemporaryGridToolbarButton.IsChecked != _temporaryGridVisible)
+            TemporaryGridToolbarButton.IsChecked = _temporaryGridVisible;
     }
 
     private void OnTemporaryGridSizeChanged(object sender, RangeBaseValueChangedEventArgs e)
@@ -8737,17 +8885,18 @@ public sealed partial class MainPage : Page
     private async Task PasteSelectionCoreAsync(PointD? targetPoint)
     {
         if (_document is null || _page is null || _assetStore is null) return;
+        var pasteTarget = ResolvePasteTarget(targetPoint);
         string? json = null;
         try
         {
             var view = Clipboard.GetContent();
             if (view.Contains(CanvasClipboardFormat) && await view.GetDataAsync(CanvasClipboardFormat) is string clipboardJson)
                 json = clipboardJson;
-            else if (await TryPasteImageAsync(view, targetPoint)) return;
+            else if (await TryPasteImageAsync(view, pasteTarget)) return;
             else if (view.Contains(StandardDataFormats.Text))
             {
                 var text = await view.GetTextAsync();
-                if (!string.IsNullOrWhiteSpace(text)) PasteTextAt(text, targetPoint);
+                if (!string.IsNullOrWhiteSpace(text)) PasteTextAt(text, pasteTarget);
                 return;
             }
         }
@@ -8770,15 +8919,11 @@ public sealed partial class MainPage : Page
 
         var idMap = source.ToDictionary(item => item.Id, _ => Guid.NewGuid());
         var zIndex = NextZIndex();
-        var translation = new PointD(24, 24);
-        if (targetPoint is { } requestedTarget)
-        {
-            var sourceBounds = CombinedBounds(source);
-            var target = ClampPointToPage(requestedTarget);
-            translation = new PointD(
-                target.X - sourceBounds.Center.X,
-                target.Y - sourceBounds.Center.Y);
-        }
+        var sourceBounds = CombinedBounds(source);
+        var target = ClampPointToPage(pasteTarget);
+        var translation = new PointD(
+            target.X - sourceBounds.Center.X,
+            target.Y - sourceBounds.Center.Y);
         var pasted = source.Select((item, index) =>
         {
             CanvasObject clone = item with
@@ -8798,6 +8943,16 @@ public sealed partial class MainPage : Page
         _selectedObject = pasted.Length == 1 ? pasted[0] : null;
         OnDocumentChanged(recognizeInk: pasted.Any(item => item is InkStrokeObject));
         StatusText.Text = $"Pasted {pasted.Length} object(s)";
+    }
+
+    private PointD ResolvePasteTarget(PointD? explicitTarget)
+    {
+        if (explicitTarget is { } target) return ClampPointToPage(target);
+        if (_lastCanvasPointerPosition is { } pointer)
+            return ClampPointToPage(ScreenToPage(pointer));
+        return _page is null
+            ? default
+            : new PointD(_page.Size.Width / 2d, _page.Size.Height / 2d);
     }
 
     private void PasteTextAt(string text, PointD? targetPoint)
@@ -10540,7 +10695,10 @@ public sealed partial class MainPage : Page
                 SelectionLockOverlayButton.Visibility = Visibility.Collapsed;
             return;
         }
-        var bounds = StrokeGeometry.GetWorldBounds(selected);
+        var positionedSelection = _transformPreview is ImageObject or ShapeObject
+            ? _transformPreview
+            : selected;
+        var bounds = StrokeGeometry.GetWorldBounds(positionedSelection);
         var anchor = PageToScreen(new PointD(bounds.Right, bounds.Top));
         var left = Math.Clamp(anchor.X + 8, 4, Math.Max(4, DrawingSurface.ActualWidth - 40));
         var top = Math.Clamp(anchor.Y - 18, 4, Math.Max(4, DrawingSurface.ActualHeight - 40));

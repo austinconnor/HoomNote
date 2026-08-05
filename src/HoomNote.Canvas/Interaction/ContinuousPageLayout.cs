@@ -60,6 +60,17 @@ public static class ContinuousPageLayout
         return null;
     }
 
+    public static PointD PageTranslationForSameViewportPosition(
+        RectD sourceBounds,
+        RectD destinationBounds,
+        double zoom)
+    {
+        var safeZoom = double.IsFinite(zoom) && zoom > 0.0001 ? zoom : 1;
+        return new PointD(
+            (sourceBounds.X - destinationBounds.X) / safeZoom,
+            (sourceBounds.Y - destinationBounds.Y) / safeZoom);
+    }
+
     public static double PanYForPageTop(
         double pageTop,
         SizeD pageSize,

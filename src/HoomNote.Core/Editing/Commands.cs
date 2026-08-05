@@ -64,6 +64,47 @@ public sealed class ReplaceObjectsCommand(
     }
 }
 
+public sealed class MoveObjectsBetweenPagesCommand(
+    Guid sourcePageId,
+    Guid destinationPageId,
+    IReadOnlyList<CanvasObject> sourceObjects,
+    IReadOnlyList<CanvasObject> destinationObjects,
+    string description = "Move objects to another page") : IDocumentCommand
+{
+    public string Description => description;
+    public IReadOnlyCollection<Guid> AffectedPageIds { get; } =
+        [sourcePageId, destinationPageId];
+
+    public void Execute(HoomNoteDocument document) =>
+        Move(document, sourcePageId, destinationPageId, sourceObjects, destinationObjects);
+
+    public void Undo(HoomNoteDocument document) =>
+        Move(document, destinationPageId, sourcePageId, destinationObjects, sourceObjects);
+
+    private static void Move(
+        HoomNoteDocument document,
+        Guid removeFromPageId,
+        Guid addToPageId,
+        IReadOnlyList<CanvasObject> remove,
+        IReadOnlyList<CanvasObject> add)
+    {
+        var removeFrom = FindPage(document, removeFromPageId);
+        var addTo = FindPage(document, addToPageId);
+        var ids = remove.Select(item => item.Id).ToHashSet();
+        removeFrom.Objects.RemoveAll(item => ids.Contains(item.Id));
+        addTo.Objects.RemoveAll(item => ids.Contains(item.Id));
+        addTo.Objects.AddRange(add);
+        addTo.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        var now = DateTimeOffset.UtcNow;
+        removeFrom.UpdatedAt = now;
+        addTo.UpdatedAt = now;
+    }
+
+    private static NotePage FindPage(HoomNoteDocument document, Guid pageId) =>
+        document.Pages.FirstOrDefault(page => page.Id == pageId)
+        ?? throw new InvalidOperationException("The target page no longer exists.");
+}
+
 public sealed class DeletePageCommand(Guid pageId) : IDocumentCommand
 {
     private NotePage? _removedPage;

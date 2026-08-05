@@ -621,7 +621,9 @@
                         Background="#EE1D1D1D" BorderBrush="{StaticResource HoomNoteAccentBrush}" BorderThickness="1"
                         Padding="8" TextChanged="OnTextEditorChanged" LostFocus="OnTextEditorLostFocus" />
                     <Button x:Name="SelectionLockOverlayButton" Width="36" Height="36" Padding="0"
-                            Visibility="Collapsed" Click="OnSelectionLockClick"
+                            Visibility="Collapsed" Click="OnSelectionLockClick" CornerRadius="18"
+                            Background="#E61A1C20" Foreground="#FFFFFFFF"
+                            BorderBrush="#BFFFFFFF" BorderThickness="1"
                             ToolTipService.ToolTip="Selected object is unlocked • click to lock">
                         <Grid>
                             <PathIcon x:Name="SelectionLockedOverlayIcon"

@@ -12,7 +12,8 @@ public static class ShapeRecognizer
 
     public static Recognition? RecognizeDetailed(
         IReadOnlyList<InkPoint> samples,
-        bool deliberateGesture = true)
+        bool deliberateGesture = true,
+        bool snapToClosest = false)
     {
         if (samples.Count < 2) return null;
         var source = RemoveAdjacentDuplicates(samples.Select(sample => sample.Position));
@@ -20,20 +21,32 @@ public static class ShapeRecognizer
         var bounds = RectD.FromPoints(source);
         var minimumDimension = Math.Min(bounds.Width, bounds.Height);
         var diagonal = Math.Sqrt(bounds.Width * bounds.Width + bounds.Height * bounds.Height);
-        if (Math.Max(bounds.Width, bounds.Height) < 18 || minimumDimension < 14) return null;
+        if (Math.Max(bounds.Width, bounds.Height) < 12 || minimumDimension < 8) return null;
 
         var pathLength = PathLength(source);
-        if (pathLength < 18) return null;
+        if (pathLength < 14) return null;
         var first = source[0];
         var end = source[^1];
         var endDistance = Vector2.Distance(first.ToVector2(), end.ToVector2());
-        if (endDistance > Math.Max(18, diagonal * 0.24)) return null;
+        var closureTolerance = snapToClosest ? Math.Max(12, diagonal * 0.40) : Math.Max(14, diagonal * 0.30);
+        if (endDistance > closureTolerance) return null;
         if (!deliberateGesture && minimumDimension < 60) return null;
 
         var points = ResampleClosed(source, 96);
         var rectangleError = RectangleError(points, bounds) / minimumDimension;
         var ellipseError = points.Average(point => EllipseError(point, bounds));
         var starError = StarError(points, bounds) / minimumDimension;
+
+        if (snapToClosest)
+        {
+            var closest = new[]
+            {
+                (Score: rectangleError / 0.12, Kind: ShapeKind.Rectangle),
+                (Score: ellipseError / 0.16, Kind: ShapeKind.Ellipse),
+                (Score: starError / 0.125, Kind: ShapeKind.Star)
+            }.MinBy(candidate => candidate.Score);
+            return new Recognition(closest.Kind, first, end);
+        }
 
         // Stars must be materially more star-like than the smooth/box candidates. This stops
         // arbitrary closed scribbles from falling through to the old broad oval fallback.
@@ -43,9 +56,9 @@ public static class ShapeRecognizer
 
         // Corners place rectangle samples directly on an edge, while ellipse samples stay
         // radially consistent. Compare the fits before applying strict absolute thresholds.
-        if (rectangleError <= 0.095 && rectangleError < ellipseError * 0.92)
+        if (rectangleError <= 0.12 && rectangleError < ellipseError)
             return new Recognition(ShapeKind.Rectangle, first, end);
-        if (ellipseError <= 0.135 && ellipseError < rectangleError * 1.15)
+        if (ellipseError <= 0.16 && ellipseError < rectangleError * 1.25)
             return new Recognition(ShapeKind.Ellipse, first, end);
         return null;
     }
