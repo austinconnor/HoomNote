@@ -271,10 +271,12 @@ public sealed partial class MainPage : Page
         float Dpi,
         bool InteractionActive,
         int EditVersion);
+    private sealed record PageRenderSwitch(NotePage? SourcePage, Guid? TargetPageId);
     private sealed record AdjacentPagePreview(
         Guid PageId,
         SizeD PageSize,
-        CanvasBitmap Bitmap);
+        CanvasBitmap Bitmap,
+        long ByteSize);
 
     private readonly struct CanvasBlendScope(CanvasDrawingSession session, CanvasBlend previous) : IDisposable
     {
@@ -324,6 +326,8 @@ public sealed partial class MainPage : Page
     // GPU resources are created, drawn, and disposed while holding this renderer-owned gate.
     private readonly object _pageRenderGate = new();
     private int _pageRenderInvalidationRequested;
+    private int _allPageRenderInvalidationRequested;
+    private PageRenderSwitch? _pendingPageRenderSwitch;
     private int _strokeGeometryClearRequested;
     private int _navigationTileClearRequested;
     private int _erasePreviewCommitVersion = -1;
@@ -352,7 +356,15 @@ public sealed partial class MainPage : Page
     private CanvasCommandList? _pageRenderCache;
     private CanvasRenderTarget? _lowZoomPageRaster;
     private Guid? _lowZoomPageRasterPageId;
+    private bool _lowZoomPageRasterInvalidated;
+    // Keep the previous composed page alive so switching between two dense tabs is a texture
+    // swap rather than another synchronous replay of millions of ink samples.
+    private CanvasRenderTarget? _standbyLowZoomPageRaster;
+    private Guid? _standbyLowZoomPageRasterPageId;
     private readonly Dictionary<Guid, AdjacentPagePreview> _notebookPagePreviews = [];
+    private readonly LinkedList<Guid> _notebookPagePreviewLru = [];
+    private readonly Dictionary<Guid, LinkedListNode<Guid>> _notebookPagePreviewLruNodes = [];
+    private long _notebookPagePreviewBytes;
     private readonly Dictionary<Guid, Task> _notebookPagePreviewLoads = [];
     private readonly HashSet<Guid> _notebookPagePreviewRefreshPending = [];
     private Guid? _preloadedFallbackPageId;
@@ -547,6 +559,8 @@ public sealed partial class MainPage : Page
     private long _searchFlashStarted;
     private long _lastSlowFrameLogTimestamp;
     private int _frameNavigationTileBuilds;
+    private int _frameNavigationTileAborts;
+    private int _renderInteractionPauseRequested;
     private string _frameRenderMode = "none";
     private Guid? _pendingSearchFlashPageId;
     private string? _pendingSearchFlashQuery;
@@ -793,7 +807,7 @@ public sealed partial class MainPage : Page
         lock (_pageRenderGate)
         {
             DisposeNotebookPagePreviewsCore();
-            InvalidatePageRenderCacheCore();
+            InvalidateAllPageRenderCachesCore();
             ClearStrokeGeometryCacheCore();
             ClearImageBitmapCacheCore();
         }
@@ -2603,7 +2617,7 @@ public sealed partial class MainPage : Page
         CommitOrDiscardTextEditor();
         // The game-loop renderer owns retained GPU resources. Page switches publish an
         // invalidation instead of moving render targets on the UI thread.
-        InvalidatePageRenderCache();
+        RequestPageRenderSwitch(page);
         _searchLocateCancellation?.Cancel();
         _searchFlashBounds.Clear();
         _searchFlashStarted = 0;
@@ -2644,7 +2658,7 @@ public sealed partial class MainPage : Page
         InvalidateCanvas();
     }
 
-    private void ResetNotebookPagePreviews()
+    private void ResetNotebookPagePreviews(bool disposeBitmaps = true)
     {
         var cancellation = _notebookPagePreviewCancellation;
         _notebookPagePreviewCancellation = null;
@@ -2653,14 +2667,17 @@ public sealed partial class MainPage : Page
         _notebookPagePreviewGeneration++;
         _notebookPagePreviewLoads.Clear();
         _notebookPagePreviewRefreshPending.Clear();
-        lock (_pageRenderGate) DisposeNotebookPagePreviewsCore();
+        if (disposeBitmaps)
+            lock (_pageRenderGate) DisposeNotebookPagePreviewsCore();
     }
 
     private void StartNotebookPagePreviewPreload(
         HoomNoteDocument document,
         NotePage? selectedPage)
     {
-        ResetNotebookPagePreviews();
+        // Page ids are globally unique. Retain completed previews across tab switches so the
+        // same dense pages are not re-rendered in the background after every activation.
+        ResetNotebookPagePreviews(disposeBitmaps: false);
         if (document.Kind == DocumentKind.InfiniteCanvas || _pageThumbnailRenderer is null ||
             document.Pages.Count == 0) return;
 
@@ -2750,7 +2767,10 @@ public sealed partial class MainPage : Page
     {
         lock (_pageRenderGate)
             if (!refresh && _notebookPagePreviews.ContainsKey(page.Id))
+            {
+                TouchNotebookPagePreviewCore(page.Id);
                 return Task.CompletedTask;
+            }
         if (_notebookPagePreviewLoads.TryGetValue(page.Id, out var existing))
         {
             if (refresh) _notebookPagePreviewRefreshPending.Add(page.Id);
@@ -2776,8 +2796,15 @@ public sealed partial class MainPage : Page
             {
                 if (generation != _notebookPagePreviewGeneration) return;
                 if (_notebookPagePreviews.Remove(page.Id, out var previous))
+                {
+                    _notebookPagePreviewBytes = Math.Max(0, _notebookPagePreviewBytes - previous.ByteSize);
+                    RemoveNotebookPagePreviewLruNodeCore(page.Id);
                     previous.Bitmap.Dispose();
+                }
                 _notebookPagePreviews[page.Id] = preview;
+                _notebookPagePreviewBytes += preview.ByteSize;
+                TouchNotebookPagePreviewCore(page.Id);
+                TrimNotebookPagePreviewsCore();
                 preview = null;
             }
             InvalidateCanvas();
@@ -2824,7 +2851,37 @@ public sealed partial class MainPage : Page
         stream.Seek(0);
         var bitmap = await CanvasBitmap.LoadAsync(PageSurface.Device, stream);
         cancellationToken.ThrowIfCancellationRequested();
-        return new AdjacentPagePreview(page.Id, page.Size, bitmap);
+        var byteSize = Math.Max(1L,
+            (long)bitmap.SizeInPixels.Width * bitmap.SizeInPixels.Height * RenderScalePolicy.BytesPerPixel);
+        return new AdjacentPagePreview(page.Id, page.Size, bitmap, byteSize);
+    }
+
+    private void TouchNotebookPagePreviewCore(Guid pageId)
+    {
+        RemoveNotebookPagePreviewLruNodeCore(pageId);
+        _notebookPagePreviewLruNodes[pageId] = _notebookPagePreviewLru.AddFirst(pageId);
+    }
+
+    private void RemoveNotebookPagePreviewLruNodeCore(Guid pageId)
+    {
+        if (_notebookPagePreviewLruNodes.Remove(pageId, out var node))
+            _notebookPagePreviewLru.Remove(node);
+    }
+
+    private void TrimNotebookPagePreviewsCore()
+    {
+        while (_notebookPagePreviewBytes > NotebookPagePreviewByteBudget &&
+               _notebookPagePreviewLru.Last is not null)
+        {
+            var node = _notebookPagePreviewLru.Last;
+            while (node is not null && _page?.Id == node.Value) node = node.Previous;
+            if (node is null) break;
+            var pageId = node.Value;
+            RemoveNotebookPagePreviewLruNodeCore(pageId);
+            if (!_notebookPagePreviews.Remove(pageId, out var preview)) continue;
+            _notebookPagePreviewBytes = Math.Max(0, _notebookPagePreviewBytes - preview.ByteSize);
+            preview.Bitmap.Dispose();
+        }
     }
 
     private void DisposeNotebookPagePreviewsCore()
@@ -2832,6 +2889,9 @@ public sealed partial class MainPage : Page
         foreach (var preview in _notebookPagePreviews.Values)
             preview.Bitmap.Dispose();
         _notebookPagePreviews.Clear();
+        _notebookPagePreviewLru.Clear();
+        _notebookPagePreviewLruNodes.Clear();
+        _notebookPagePreviewBytes = 0;
     }
 
     private void BeginSemanticTextLoad(NotePage? page)
@@ -3013,9 +3073,11 @@ public sealed partial class MainPage : Page
         lock (_pageRenderGate)
         {
             Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0);
+            Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 0);
+            Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
             Interlocked.Exchange(ref _strokeGeometryClearRequested, 0);
             Interlocked.Exchange(ref _navigationTileClearRequested, 0);
-            InvalidatePageRenderCacheCore();
+            InvalidateAllPageRenderCachesCore();
             ClearStrokeGeometryCacheCore();
             ClearImageBitmapCacheCore();
         }
@@ -3034,6 +3096,7 @@ public sealed partial class MainPage : Page
             var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             _frameStrokeGeometryBuilds = 0;
             _frameNavigationTileBuilds = 0;
+            _frameNavigationTileAborts = 0;
             _frameRenderMode = "none";
 
             var drawingSession = args.DrawingSession;
@@ -3159,13 +3222,71 @@ public sealed partial class MainPage : Page
 
     private void ApplyPendingPageRenderInvalidations()
     {
+        var clearedAllPages = Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 0) != 0;
         var clearedPage = Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0) != 0;
-        if (clearedPage)
+        if (clearedAllPages)
+        {
+            Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
+            InvalidateAllPageRenderCachesCore();
+        }
+        else if (clearedPage)
+        {
+            Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
             InvalidatePageRenderCacheCore();
+        }
+        else if (Interlocked.Exchange(ref _pendingPageRenderSwitch, null) is { } pageSwitch)
+            SwitchPageRenderCacheCore(pageSwitch);
         else if (Interlocked.Exchange(ref _navigationTileClearRequested, 0) != 0)
             ClearNavigationTileCacheCore();
         if (Interlocked.Exchange(ref _strokeGeometryClearRequested, 0) != 0)
             ClearStrokeGeometryCacheCore();
+    }
+
+    private void SwitchPageRenderCacheCore(PageRenderSwitch pageSwitch)
+    {
+        var sourcePage = pageSwitch.SourcePage;
+        if (sourcePage is not null)
+        {
+            // Pull any just-finished strokes into the retained overlay before preserving it.
+            DrainPageRenderAppends(sourcePage.Id);
+            if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == sourcePage.Id &&
+                (_pageRenderOverlayBatches.Count > 0 || _pageRenderOverlays.Count > 0))
+                MergeOverlaysIntoLowZoomRaster(sourcePage);
+        }
+
+        CanvasRenderTarget? restoredRaster = null;
+        if (pageSwitch.TargetPageId is { } targetPageId &&
+            _standbyLowZoomPageRaster is not null &&
+            _standbyLowZoomPageRasterPageId == targetPageId)
+        {
+            restoredRaster = _standbyLowZoomPageRaster;
+            _standbyLowZoomPageRaster = null;
+            _standbyLowZoomPageRasterPageId = null;
+        }
+
+        if (_lowZoomPageRaster is not null && !_lowZoomPageRasterInvalidated)
+        {
+            _standbyLowZoomPageRaster?.Dispose();
+            _standbyLowZoomPageRaster = _lowZoomPageRaster;
+            _standbyLowZoomPageRasterPageId = _lowZoomPageRasterPageId;
+        }
+        else
+        {
+            _lowZoomPageRaster?.Dispose();
+        }
+
+        _lowZoomPageRaster = restoredRaster;
+        _lowZoomPageRasterPageId = restoredRaster is null ? null : pageSwitch.TargetPageId;
+        _lowZoomPageRasterInvalidated = false;
+        _preloadedFallbackPageId = null;
+        ClearNavigationTileCacheCore();
+        _pageRenderCache?.Dispose();
+        _pageRenderCache = null;
+        _pageRenderCachePageId = pageSwitch.TargetPageId;
+        foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
+        _pageRenderOverlayBatches.Clear();
+        _pageRenderOverlays.Clear();
+        _pageRenderCacheObjectIds.Clear();
     }
 
     private void DrainPageRenderAppends(Guid pageId)
@@ -3376,7 +3497,9 @@ public sealed partial class MainPage : Page
         var visibleObjects = _visibleObjects.Count;
         var navigationTiles = _navigationTiles.Count;
         var navigationTileBuilds = _frameNavigationTileBuilds;
+        var navigationTileAborts = _frameNavigationTileAborts;
         var navigationTileMb = Math.Round(_navigationTileBytes / 1024d / 1024d, 1);
+        var renderPauseRequested = Volatile.Read(ref _renderInteractionPauseRequested) != 0;
         // Synchronous file I/O from CanvasControl.Draw turns a slow frame into a larger hitch.
         // The logger is bounded to one event every two seconds, so queueing it is inexpensive.
         _ = Task.Run(() => DiagnosticsLog.Warning("render.slow_frame",
@@ -3393,7 +3516,9 @@ public sealed partial class MainPage : Page
             ("render_mode", renderMode),
             ("navigation_tiles", navigationTiles),
             ("navigation_tile_builds", navigationTileBuilds),
+            ("navigation_tile_aborts", navigationTileAborts),
             ("navigation_tile_mb", navigationTileMb),
+            ("render_pause_requested", renderPauseRequested),
             ("wheel_zoom", wheelZoomAnimating),
             ("active_ink_points", activeInkPoints),
             ("overlay_objects", overlayCount),
@@ -3564,15 +3689,19 @@ public sealed partial class MainPage : Page
         // A single refinement per settled frame bounds worst-case work. The previous renderer
         // built every visible miss synchronously (24 tiles in one observed 35 ms frame). The
         // refined set remains hidden until it is complete, preventing checkerboard loading.
-        if (NavigationRefinementPolicy.TileBuildBudget(state.InteractionActive) > 0 &&
+        if (NavigationRefinementPolicy.CanBuildTile(
+                state.InteractionActive,
+                Volatile.Read(ref _renderInteractionPauseRequested) != 0) &&
             firstMissing is { } missing)
         {
-            GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight);
-            TouchNavigationTile(missing);
-            readyTileCount++;
-            if (!NavigationRefinementPolicy.ShouldPresentTiles(
-                    _visibleNavigationTileKeys.Count, readyTileCount))
-                DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
+            if (GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight) is not null)
+            {
+                TouchNavigationTile(missing);
+                readyTileCount++;
+                if (!NavigationRefinementPolicy.ShouldPresentTiles(
+                        _visibleNavigationTileKeys.Count, readyTileCount))
+                    DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
+            }
         }
 
         if (NavigationRefinementPolicy.ShouldPresentTiles(
@@ -3625,10 +3754,11 @@ public sealed partial class MainPage : Page
         _pageRenderCachePageId = page.Id;
     }
 
-    private CanvasRenderTarget GetOrCreateNavigationTile(CanvasDevice device, NotePage page,
+    private CanvasRenderTarget? GetOrCreateNavigationTile(CanvasDevice device, NotePage page,
         (int X, int Y) key, int fullPixelWidth, int fullPixelHeight)
     {
         if (_navigationTiles.TryGetValue(key, out var existing)) return existing;
+        if (Volatile.Read(ref _renderInteractionPauseRequested) != 0) return null;
 
         var metrics = NavigationTileMetrics.Create(
             key.X,
@@ -3644,6 +3774,7 @@ public sealed partial class MainPage : Page
             metrics.RenderPixelHeight / _navigationTileScale);
         var tile = new CanvasRenderTarget(device,
             metrics.RenderPixelWidth, metrics.RenderPixelHeight, 96);
+        var aborted = false;
         using (var session = tile.CreateDrawingSession())
         {
             session.Clear(Color.FromArgb(0, 0, 0, 0));
@@ -3665,14 +3796,30 @@ public sealed partial class MainPage : Page
                     _visibleObjects.Add(canvasObject);
                 }
             }
+            // Geometry retained for the previous viewport otherwise fills the entire budget and
+            // forces every stroke in a newly visited tile through the raw path on every frame.
+            PruneStrokeGeometryCacheToViewport();
             DrawPageBackground(session, page, tileBounds);
             DrawImportedLayer(session, page);
             if (_temporaryGridVisible) DrawTemporaryGrid(session, page, tileBounds);
             var tileObjects = _visibleObjects.Where(canvasObject =>
-                _pageRenderCacheObjectIds.Contains(canvasObject.Id));
+                _pageRenderCacheObjectIds.Contains(canvasObject.Id)).ToArray();
             foreach (var canvasObject in
-                     CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects))
+                  CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects))
+            {
+                if (Volatile.Read(ref _renderInteractionPauseRequested) != 0)
+                {
+                    aborted = true;
+                    break;
+                }
                 DrawObject(session, canvasObject, cacheInkGeometry: true);
+            }
+        }
+        if (aborted)
+        {
+            _frameNavigationTileAborts++;
+            tile.Dispose();
+            return null;
         }
 
         _navigationTiles[key] = tile;
@@ -3766,7 +3913,25 @@ public sealed partial class MainPage : Page
 
     private void EnsureLowZoomPageRaster(CanvasDevice device, NotePage page)
     {
-        if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id) return;
+        if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id &&
+            !_lowZoomPageRasterInvalidated)
+        {
+            if (_pageRenderCacheObjectIds.Count == 0)
+                _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
+            return;
+        }
+        if (_standbyLowZoomPageRaster is not null && _standbyLowZoomPageRasterPageId == page.Id)
+        {
+            _lowZoomPageRaster?.Dispose();
+            _lowZoomPageRaster = _standbyLowZoomPageRaster;
+            _lowZoomPageRasterPageId = page.Id;
+            _lowZoomPageRasterInvalidated = false;
+            _standbyLowZoomPageRaster = null;
+            _standbyLowZoomPageRasterPageId = null;
+            _pageRenderCacheObjectIds.Clear();
+            _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
+            return;
+        }
         ClearNavigationTileCacheCore();
         var rasterScale = NavigationSnapshotScale(page);
         var width = Math.Max(1, page.Size.Width * rasterScale);
@@ -3781,6 +3946,7 @@ public sealed partial class MainPage : Page
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = raster;
         _lowZoomPageRasterPageId = page.Id;
+        _lowZoomPageRasterInvalidated = false;
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
         _pageRenderCachePageId = page.Id;
@@ -3805,6 +3971,7 @@ public sealed partial class MainPage : Page
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = null;
         _lowZoomPageRasterPageId = null;
+        _lowZoomPageRasterInvalidated = false;
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
         _pageRenderOverlays.Clear();
@@ -4657,6 +4824,7 @@ public sealed partial class MainPage : Page
         PauseBackgroundRecognition();
         PauseThumbnailRefresh();
         _isPointerDown = true;
+        Interlocked.Exchange(ref _renderInteractionPauseRequested, 1);
         _penActive = point.PointerDeviceType == PointerDeviceType.Pen;
         var rightMousePan = point.PointerDeviceType == PointerDeviceType.Mouse && point.Properties.IsRightButtonPressed;
         var middleMousePan = point.PointerDeviceType == PointerDeviceType.Mouse && point.Properties.IsMiddleButtonPressed;
@@ -4665,6 +4833,7 @@ public sealed partial class MainPage : Page
         if (_gestureTool != EditorTool.Pan && !TryActivateVisiblePageAt(point.Position))
         {
             _isPointerDown = false;
+            Interlocked.Exchange(ref _renderInteractionPauseRequested, 0);
             _penActive = false;
             ResumeBackgroundRecognition();
             ResumeThumbnailRefresh();
@@ -4786,7 +4955,14 @@ public sealed partial class MainPage : Page
 
         e.Handled = true;
         if (_gestureTool == EditorTool.Pan) InvalidateCanvas();
-        else InvalidateInteractionOverlay();
+        else
+        {
+            // Publish pointer-down immediately. Without this, the committed-page renderer keeps
+            // refining dense tiles under the ink overlay and can block the first visible stroke.
+            PublishPageRenderState();
+            PageSurface.Invalidate();
+            InvalidateInteractionOverlay();
+        }
     }
 
     private void OnCanvasPointerMoved(object sender, PointerRoutedEventArgs e)
@@ -5007,6 +5183,7 @@ public sealed partial class MainPage : Page
         var retainTransformPreview = _selectionTransformOriginalIds.Count > 0 &&
                                      Volatile.Read(ref _transformPreviewCommitVersion) >= 0;
         _isPointerDown = false;
+        Interlocked.Exchange(ref _renderInteractionPauseRequested, 0);
         _penActive = false;
         _shapeSnapTimer.Stop();
         _heldShapeRecognition = null;
@@ -7332,7 +7509,7 @@ public sealed partial class MainPage : Page
         }
         MarkFullDocumentDirty();
         SyncTemplatePicker();
-        InvalidatePageRenderCache();
+        InvalidateAllPageRenderCaches();
         InvalidateCanvas();
         StatusText.Text = applyExisting.IsChecked == true ? "Updated all notebook pages" : "Updated notebook defaults";
     }
@@ -7756,7 +7933,7 @@ public sealed partial class MainPage : Page
             _temporaryGridVisibilityByDocument[document.Id] = visible;
         if (TemporaryGridToolbarButton.IsChecked != visible)
             TemporaryGridToolbarButton.IsChecked = visible;
-        InvalidatePageRenderCache();
+        InvalidateAllPageRenderCaches();
         InvalidateCanvas();
     }
 
@@ -7789,7 +7966,7 @@ public sealed partial class MainPage : Page
         _syncingTemporaryGridSize = false;
         ScheduleUserPreferencesSave();
         if (!_temporaryGridVisible) return;
-        InvalidatePageRenderCache();
+        InvalidateAllPageRenderCaches();
         InvalidateCanvas();
     }
 
@@ -10444,13 +10621,41 @@ public sealed partial class MainPage : Page
         Interlocked.Exchange(ref _pageRenderInvalidationRequested, 1);
     }
 
-    private void InvalidatePageRenderCacheCore()
+    private void RequestPageRenderSwitch(NotePage? targetPage)
+    {
+        Interlocked.Exchange(ref _pendingPageRenderSwitch,
+            new PageRenderSwitch(_publishedPageSnapshot, targetPage?.Id));
+    }
+
+    private void InvalidatePageRenderCacheCore(bool preserveSharpFallback = true)
     {
         _preloadedFallbackPageId = null;
         ClearNavigationTileCacheCore();
-        _lowZoomPageRaster?.Dispose();
-        _lowZoomPageRaster = null;
-        _lowZoomPageRasterPageId = null;
+        if (_lowZoomPageRasterPageId is { } invalidatedPageId &&
+            _standbyLowZoomPageRasterPageId == invalidatedPageId)
+        {
+            _standbyLowZoomPageRaster?.Dispose();
+            _standbyLowZoomPageRaster = null;
+            _standbyLowZoomPageRasterPageId = null;
+        }
+        // Undo/redo and other same-page edits must never fall through to the lower-resolution
+        // notebook preview. Keep the last complete raster on screen while its replacement is
+        // composed, then EnsureLowZoomPageRaster swaps the corrected frame in atomically.
+        var publishedPageId = Volatile.Read(ref _publishedPageRenderState).Page?.Id;
+        var canPreserveSharpFallback = preserveSharpFallback &&
+            _lowZoomPageRaster is not null &&
+            _lowZoomPageRasterPageId == publishedPageId;
+        if (canPreserveSharpFallback)
+        {
+            _lowZoomPageRasterInvalidated = true;
+        }
+        else
+        {
+            _lowZoomPageRaster?.Dispose();
+            _lowZoomPageRaster = null;
+            _lowZoomPageRasterPageId = null;
+            _lowZoomPageRasterInvalidated = false;
+        }
         _pageRenderCache?.Dispose();
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
@@ -10458,6 +10663,19 @@ public sealed partial class MainPage : Page
         _pageRenderCachePageId = null;
         _pageRenderCacheObjectIds.Clear();
         _pageRenderOverlays.Clear();
+    }
+
+    private void InvalidateAllPageRenderCaches()
+    {
+        Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 1);
+    }
+
+    private void InvalidateAllPageRenderCachesCore()
+    {
+        _standbyLowZoomPageRaster?.Dispose();
+        _standbyLowZoomPageRaster = null;
+        _standbyLowZoomPageRasterPageId = null;
+        InvalidatePageRenderCacheCore(preserveSharpFallback: false);
     }
 
     private void ClearNavigationTileCache()

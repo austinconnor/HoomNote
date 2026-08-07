@@ -25,6 +25,20 @@ public sealed class CanonicalInkPolicyTests
         Assert.Equal(expected, NavigationRefinementPolicy.TileBuildBudget(interactionActive));
     }
 
+    [Theory]
+    [InlineData(false, false, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, false)]
+    public void NavigationRefinementYieldsToImmediateInput(
+        bool interactionActive,
+        bool immediateInputRequested,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            NavigationRefinementPolicy.CanBuildTile(interactionActive, immediateInputRequested));
+    }
+
     [Fact]
     public void RefinementIsPresentedOnlyWhenTheVisibleSetIsComplete()
     {

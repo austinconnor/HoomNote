@@ -1,4 +1,20 @@
-# HoomNote 0.7.40
+# HoomNote 0.7.41
+
+- Undo and redo now keep the current page sharp while the corrected frame is rebuilt, eliminating the distracting blurry flash between history steps.
+- Switching back and forth between two dense notebook tabs now reuses each
+  page's composed GPU snapshot instead of replaying thousands of objects and up
+  to millions of ink samples after every switch.
+- Pen-down now immediately pauses committed-page refinement, preventing tile
+  rendering underneath the ink overlay from delaying the first visible stroke.
+- In-progress navigation-tile builds now yield when input arrives, and retained
+  stroke geometry follows the current viewport instead of remaining filled with
+  geometry from a previously viewed location.
+- Completed page previews are now retained in a bounded cross-tab cache, avoiding
+  repeated background rendering of the same dense pages after every tab switch.
+- Slow-frame diagnostics now report tile-build cancellations and input-priority
+  state for follow-up performance verification on affected devices.
+
+## Previous release: HoomNote 0.7.40
 
 - Switching between open notebook tabs is substantially faster, especially for
   dense handwritten notebooks and lower-end devices: the two most recently used

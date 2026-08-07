@@ -27,6 +27,9 @@ public static class NavigationRefinementPolicy
 {
     public static int TileBuildBudget(bool interactionActive) => interactionActive ? 0 : 1;
 
+    public static bool CanBuildTile(bool interactionActive, bool immediateInputRequested) =>
+        !immediateInputRequested && TileBuildBudget(interactionActive) > 0;
+
     public static bool ShouldPresentTiles(int visibleTileCount, int readyTileCount) =>
         visibleTileCount > 0 && readyTileCount >= visibleTileCount;
 }
