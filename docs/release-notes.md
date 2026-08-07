@@ -1,4 +1,11 @@
-# HoomNote 0.7.42
+# HoomNote 0.7.43
+
+- Opening a dense notebook now reads its large SQLite JSON payloads directly as UTF-8 bytes and parses independent pages through a bounded worker set, avoiding a second UTF-16 copy of millions of ink samples while substantially reducing load time and memory pressure.
+- Repeated clicks on a notebook that is already loading now join the existing load instead of cancelling and restarting the entire multi-million-point parse.
+- Pen and eraser gestures no longer cancel and restart the complete notebook page-preview pass after every interaction.
+- High-resolution page tiles now wait until the pen has been idle and can be cancelled inside a long stroke, preventing refinement work from delaying the next stroke.
+
+## Previous release: HoomNote 0.7.42
 
 - Dense imported ink is now reduced to display-resolution geometry before page snapshots and previews are rendered, avoiding multi-million-point replays that blocked tab switches and first pen input without changing the saved source strokes.
 - Pen input now cancels page and sidebar rendering immediately, and cancelled preview jobs stop inside long strokes instead of continuing to consume CPU after navigation.

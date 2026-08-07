@@ -167,15 +167,17 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         }, cancellationToken);
 
         await using var pageCommand = _connection.CreateCommand();
-        pageCommand.CommandText = "SELECT page_json, recognized_text, recognized_regions_json, updated_utc FROM pages WHERE document_id = $id ORDER BY ordinal;";
+        // Materialize large page payloads as UTF-8 bytes. Going through GetString first creates
+        // a second UTF-16 copy of every page before System.Text.Json can begin parsing it.
+        pageCommand.CommandText = "SELECT CAST(page_json AS BLOB), recognized_text, recognized_regions_json, updated_utc FROM pages WHERE document_id = $id ORDER BY ordinal;";
         pageCommand.Parameters.AddWithValue("$id", documentId.ToString("D"));
         await using var pageReader = await pageCommand.ExecuteReaderAsync(cancellationToken);
-        var serializedPages = new List<(string PageJson, string RecognizedText,
+        var serializedPages = new List<(byte[] PageJson, string RecognizedText,
             string RecognizedRegionsJson, string UpdatedAt)>();
         while (await pageReader.ReadAsync(cancellationToken))
         {
             serializedPages.Add((
-                pageReader.GetString(0),
+                pageReader.GetFieldValue<byte[]>(0),
                 pageReader.GetString(1),
                 pageReader.GetString(2),
                 pageReader.GetString(3)));
@@ -184,20 +186,24 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 
         var pages = await Task.Run(() =>
         {
-            var results = new List<NotePage>(serializedPages.Count);
-            foreach (var serializedPage in serializedPages)
+            var results = new NotePage?[serializedPages.Count];
+            Parallel.For(0, serializedPages.Count, new ParallelOptions
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = Math.Min(4, Math.Max(1, Environment.ProcessorCount))
+            }, index =>
+            {
+                var serializedPage = serializedPages[index];
                 var page = Deserialize<NotePage>(serializedPage.PageJson);
-                if (page is null) continue;
+                if (page is null) return;
                 page.RecognizedText = serializedPage.RecognizedText;
                 page.RecognizedRegions =
                     Deserialize<List<RecognizedTextRegion>>(serializedPage.RecognizedRegionsJson) ?? [];
                 if (DateTimeOffset.TryParse(serializedPage.UpdatedAt, out var pageUpdatedAt))
                     page.UpdatedAt = pageUpdatedAt;
-                results.Add(page);
-            }
-            return results;
+                results[index] = page;
+            });
+            return results.OfType<NotePage>().ToList();
         }, cancellationToken);
         serializedPages.Clear();
         document.Pages.AddRange(pages);
@@ -206,30 +212,33 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         {
             await using var appendCommand = _connection.CreateCommand();
             appendCommand.CommandText = """
-                SELECT j.page_id, j.object_json FROM ink_append_journal j
+                SELECT j.page_id, CAST(j.object_json AS BLOB) FROM ink_append_journal j
                 INNER JOIN pages p ON p.id = j.page_id
                 WHERE p.document_id = $document ORDER BY j.created_utc;
                 """;
             appendCommand.Parameters.AddWithValue("$document", documentId.ToString("D"));
             await using var appendReader = await appendCommand.ExecuteReaderAsync(cancellationToken);
-            var serializedAppends = new List<(Guid PageId, string ObjectJson)>();
+            var serializedAppends = new List<(Guid PageId, byte[] ObjectJson)>();
             while (await appendReader.ReadAsync(cancellationToken))
             {
                 if (Guid.TryParse(appendReader.GetString(0), out var pageId))
-                    serializedAppends.Add((pageId, appendReader.GetString(1)));
+                    serializedAppends.Add((pageId, appendReader.GetFieldValue<byte[]>(1)));
             }
             await appendReader.DisposeAsync();
 
             await Task.Run(() =>
             {
                 var pagesById = document.Pages.ToDictionary(page => page.Id);
+                var objectIdsByPage = document.Pages.ToDictionary(
+                    page => page.Id,
+                    page => page.Objects.Select(item => item.Id).ToHashSet());
                 foreach (var serializedAppend in serializedAppends)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     if (!pagesById.TryGetValue(serializedAppend.PageId, out var page)) continue;
                     var canvasObject = Deserialize<CanvasObject>(serializedAppend.ObjectJson);
                     if (canvasObject is not null &&
-                        page.Objects.All(item => item.Id != canvasObject.Id))
+                        objectIdsByPage[serializedAppend.PageId].Add(canvasObject.Id))
                         page.Objects.Add(canvasObject);
                 }
                 foreach (var page in document.Pages)
@@ -247,14 +256,14 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         int maxSerializedCharacters = int.MaxValue)
     {
         string pageId;
-        string pageJson;
+        byte[] pageJson;
         string recognizedText;
         string recognizedRegionsJson;
         string serializedUpdatedAt;
         await using (var command = _connection.CreateCommand())
         {
             command.CommandText = """
-                SELECT id, page_json, length(page_json), recognized_text, recognized_regions_json, updated_utc
+                SELECT id, CAST(page_json AS BLOB), length(page_json), recognized_text, recognized_regions_json, updated_utc
                 FROM pages
                 WHERE document_id = $id
                 ORDER BY ordinal
@@ -265,7 +274,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             if (!await reader.ReadAsync(cancellationToken)) return null;
             if (reader.GetInt32(2) > maxSerializedCharacters) return null;
             pageId = reader.GetString(0);
-            pageJson = reader.GetString(1);
+            pageJson = reader.GetFieldValue<byte[]>(1);
             recognizedText = reader.GetString(3);
             recognizedRegionsJson = reader.GetString(4);
             serializedUpdatedAt = reader.GetString(5);
@@ -286,14 +295,14 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 
         await using var appendCommand = _connection.CreateCommand();
         appendCommand.CommandText = """
-            SELECT object_json FROM ink_append_journal
+            SELECT CAST(object_json AS BLOB) FROM ink_append_journal
             WHERE page_id = $page ORDER BY created_utc, object_id;
             """;
         appendCommand.Parameters.AddWithValue("$page", pageId);
         await using var appendReader = await appendCommand.ExecuteReaderAsync(cancellationToken);
         while (await appendReader.ReadAsync(cancellationToken))
         {
-            var canvasObject = Deserialize<CanvasObject>(appendReader.GetString(0));
+            var canvasObject = Deserialize<CanvasObject>(appendReader.GetFieldValue<byte[]>(0));
             if (canvasObject is not null && page.Objects.All(item => item.Id != canvasObject.Id))
                 page.Objects.Add(canvasObject);
         }
@@ -759,6 +768,8 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 
     private static string Serialize<T>(T value) => JsonSerializer.Serialize(value, HoomNoteJson.Options);
     private static T? Deserialize<T>(string value) => JsonSerializer.Deserialize<T>(value, HoomNoteJson.Options);
+    private static T? Deserialize<T>(ReadOnlySpan<byte> value) =>
+        JsonSerializer.Deserialize<T>(value, HoomNoteJson.Options);
     private static string BuildFtsPrefixQuery(string query)
     {
         var tokens = query.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

@@ -217,6 +217,8 @@ public sealed partial class MainPage : Page
     private readonly SemaphoreSlim _saveGate = new(1, 1);
     private readonly SemaphoreSlim _documentLoadGate = new(1, 1);
     private CancellationTokenSource? _documentLoadCancellation;
+    private Guid? _documentLoadingId;
+    private Task? _documentLoadingTask;
     private readonly SemaphoreSlim _settingsSaveGate = new(1, 1);
     private readonly SemaphoreSlim _handwritingIndexGate = new(1, 1);
     private readonly List<InkPoint> _activeInk = [];
@@ -389,6 +391,7 @@ public sealed partial class MainPage : Page
     private const int NavigationTileGutterPixels = 2;
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
     private const int NavigationTileObjectThreshold = 256;
+    private const int NavigationTileIdleAfterInputMs = 850;
     private const float ContinuousPageGap = 28;
     private const int AdjacentPagePreviewLongEdge = 1536;
     private const long NotebookPagePreviewByteBudget = 256L * 1024 * 1024;
@@ -471,7 +474,7 @@ public sealed partial class MainPage : Page
     private long _wheelZoomAnimationStarted;
     private float _wheelScrollVelocity;
     private long _wheelScrollTimestamp;
-    private long _lastPenInteractionTimestamp;
+    private long _lastDirectInteractionTimestamp;
     private long _lastNativeTouchTimestamp;
     private int _pointerClassificationLogCount;
     private long _lastInkMovementTimestamp;
@@ -560,6 +563,7 @@ public sealed partial class MainPage : Page
     private int _frameNavigationTileAborts;
     private int _renderInteractionPauseRequested;
     private CancellationTokenSource? _pageRasterBuildCancellation;
+    private CancellationTokenSource? _navigationTileBuildCancellation;
     private string _frameRenderMode = "none";
     private Guid? _pendingSearchFlashPageId;
     private string? _pendingSearchFlashQuery;
@@ -2117,12 +2121,50 @@ public sealed partial class MainPage : Page
 
     private async Task LoadDocumentAsync(Guid id, Guid? pageId = null)
     {
+        if (_document?.Id == id)
+        {
+            SelectRequestedDocumentPage(pageId);
+            return;
+        }
+
+        if (_documentLoadingId == id && _documentLoadingTask is { } existingLoad)
+        {
+            DiagnosticsLog.Info("document.load_coalesced", ("document_id", id));
+            await existingLoad;
+            SelectRequestedDocumentPage(pageId);
+            return;
+        }
+
+        var load = LoadDocumentCoreAsync(id, pageId);
+        _documentLoadingId = id;
+        _documentLoadingTask = load;
+        try
+        {
+            await load;
+        }
+        finally
+        {
+            if (ReferenceEquals(_documentLoadingTask, load))
+            {
+                _documentLoadingId = null;
+                _documentLoadingTask = null;
+            }
+        }
+    }
+
+    private void SelectRequestedDocumentPage(Guid? pageId)
+    {
+        if (pageId is not { } selectedPageId || _document is null) return;
+        if (_document.Pages.FirstOrDefault(page => page.Id == selectedPageId) is { } selectedPage)
+            PageList.SelectedItem = selectedPage;
+    }
+
+    private async Task LoadDocumentCoreAsync(Guid id, Guid? pageId)
+    {
         if (_repository is null) return;
         if (_document?.Id == id)
         {
-            if (pageId is { } selectedPageId &&
-                _document.Pages.FirstOrDefault(page => page.Id == selectedPageId) is { } selectedPage)
-                PageList.SelectedItem = selectedPage;
+            SelectRequestedDocumentPage(pageId);
             return;
         }
 
@@ -3675,9 +3717,13 @@ public sealed partial class MainPage : Page
         // A single refinement per settled frame bounds worst-case work. The previous renderer
         // built every visible miss synchronously (24 tiles in one observed 35 ms frame). The
         // refined set remains hidden until it is complete, preventing checkerboard loading.
+        var penHasSettled = _lastDirectInteractionTimestamp == 0 ||
+                            MillisecondsSince(_lastDirectInteractionTimestamp) >=
+                            NavigationTileIdleAfterInputMs;
         if (NavigationRefinementPolicy.CanBuildTile(
                 state.InteractionActive,
-                Volatile.Read(ref _renderInteractionPauseRequested) != 0) &&
+                Volatile.Read(ref _renderInteractionPauseRequested) != 0,
+                penHasSettled) &&
             firstMissing is { } missing)
         {
             if (GetOrCreateNavigationTile(device, page, missing, fullPixelWidth, fullPixelHeight) is not null)
@@ -3761,8 +3807,11 @@ public sealed partial class MainPage : Page
         var tile = new CanvasRenderTarget(device,
             metrics.RenderPixelWidth, metrics.RenderPixelHeight, 96);
         var aborted = false;
-        using (var session = tile.CreateDrawingSession())
+        var buildCancellation = new CancellationTokenSource();
+        Interlocked.Exchange(ref _navigationTileBuildCancellation, buildCancellation)?.Cancel();
+        try
         {
+            using var session = tile.CreateDrawingSession();
             session.Clear(Color.FromArgb(0, 0, 0, 0));
             session.Transform = Matrix3x2.CreateTranslation(
                                     (float)-tileBounds.X, (float)-tileBounds.Y) *
@@ -3793,13 +3842,25 @@ public sealed partial class MainPage : Page
             foreach (var canvasObject in
                   CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects))
             {
+                buildCancellation.Token.ThrowIfCancellationRequested();
                 if (Volatile.Read(ref _renderInteractionPauseRequested) != 0)
                 {
                     aborted = true;
                     break;
                 }
-                DrawObject(session, canvasObject, cacheInkGeometry: true);
+                DrawObject(session, canvasObject, cacheInkGeometry: true,
+                    cancellationToken: buildCancellation.Token);
             }
+        }
+        catch (OperationCanceledException)
+        {
+            aborted = true;
+        }
+        finally
+        {
+            Interlocked.CompareExchange(
+                ref _navigationTileBuildCancellation, null, buildCancellation);
+            buildCancellation.Dispose();
         }
         if (aborted)
         {
@@ -4833,7 +4894,7 @@ public sealed partial class MainPage : Page
         StopTouchInertia(resumeBackgroundWork: false);
         if (point.PointerDeviceType == PointerDeviceType.Pen)
         {
-            _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
             CancelTouchGestureForPen();
         }
         else if (_touchPoints.Count > 0)
@@ -4855,11 +4916,14 @@ public sealed partial class MainPage : Page
         _isPointerDown = true;
         Interlocked.Exchange(ref _renderInteractionPauseRequested, 1);
         CancelPageRasterBuild();
+        CancelNavigationTileBuild();
         _penActive = point.PointerDeviceType == PointerDeviceType.Pen;
         var rightMousePan = point.PointerDeviceType == PointerDeviceType.Mouse && point.Properties.IsRightButtonPressed;
         var middleMousePan = point.PointerDeviceType == PointerDeviceType.Mouse && point.Properties.IsMiddleButtonPressed;
         _gestureTool = _readMode || rightMousePan || middleMousePan ? EditorTool.Pan :
             point.Properties.IsEraser ? EditorTool.StrokeEraser : _activeTool;
+        if (_gestureTool != EditorTool.Pan)
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         if (_gestureTool != EditorTool.Pan && !TryActivateVisiblePageAt(point.Position))
         {
             _isPointerDown = false;
@@ -5004,9 +5068,9 @@ public sealed partial class MainPage : Page
             OnTouchPointerMoved(e, current);
             return;
         }
-        if (current.PointerDeviceType == PointerDeviceType.Pen)
-            _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         if (!_isPointerDown || _page is null) return;
+        if (_gestureTool != EditorTool.Pan)
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         var redraw = false;
         switch (_gestureTool)
         {
@@ -5104,8 +5168,8 @@ public sealed partial class MainPage : Page
             return;
         }
         if (!_isPointerDown || _page is null || _document is null) return;
-        if (current.PointerDeviceType == PointerDeviceType.Pen)
-            _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (current.PointerDeviceType == PointerDeviceType.Pen || _gestureTool != EditorTool.Pan)
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         var deliberateShapeGesture = _gestureTool == EditorTool.Pen &&
                                      MillisecondsSince(_lastInkMovementTimestamp) >=
                                      ShapeSnapTerminalHoldMs;
@@ -5183,8 +5247,8 @@ public sealed partial class MainPage : Page
             EndTouchPointer(e, releaseCapture: true);
             return;
         }
-        if (current.PointerDeviceType == PointerDeviceType.Pen)
-            _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (current.PointerDeviceType == PointerDeviceType.Pen || _gestureTool != EditorTool.Pan)
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         RestoreEraseSnapshot();
         _textSelectionAnchor = null;
         _textSelectionDragBounds = null;
@@ -5201,7 +5265,7 @@ public sealed partial class MainPage : Page
         }
         if (!_isPointerDown) return;
         if (current.PointerDeviceType == PointerDeviceType.Pen)
-            _lastPenInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         RestoreEraseSnapshot();
         EndPointer(e, releaseCapture: false);
     }
@@ -6769,7 +6833,6 @@ public sealed partial class MainPage : Page
     private void PauseThumbnailRefresh()
     {
         _thumbnailRefreshTimer.Stop();
-        PauseNotebookPagePreviewPreload();
         if (_page is null || !_pageThumbnailLoads.TryGetValue(_page.Id, out var load)) return;
         _pendingThumbnailRefreshPageIds.Add(_page.Id);
         load.Cancel();
@@ -6778,30 +6841,10 @@ public sealed partial class MainPage : Page
     private void ResumeThumbnailRefresh()
     {
         if (_isPointerDown) return;
-        ResumeNotebookPagePreviewPreload();
         EnsureSelectedPageThumbnail();
         if (_pendingThumbnailRefreshPageIds.Count == 0) return;
         _thumbnailRefreshTimer.Stop();
         _thumbnailRefreshTimer.Start();
-    }
-
-    private void PauseNotebookPagePreviewPreload()
-    {
-        var cancellation = _notebookPagePreviewCancellation;
-        if (cancellation is null) return;
-        _notebookPagePreviewCancellation = null;
-        cancellation.Cancel();
-        cancellation.Dispose();
-        _notebookPagePreviewGeneration++;
-        _notebookPagePreviewLoads.Clear();
-        _notebookPagePreviewRefreshPending.Clear();
-    }
-
-    private void ResumeNotebookPagePreviewPreload()
-    {
-        if (_notebookPagePreviewCancellation is not null ||
-            _document is not { } document || _page is not { } page) return;
-        StartNotebookPagePreviewPreload(document, page);
     }
 
     private void EnsureSelectedPageThumbnail()
@@ -10670,6 +10713,18 @@ public sealed partial class MainPage : Page
         try
         {
             Volatile.Read(ref _pageRasterBuildCancellation)?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The render thread completed between the volatile read and cancellation.
+        }
+    }
+
+    private void CancelNavigationTileBuild()
+    {
+        try
+        {
+            Volatile.Read(ref _navigationTileBuildCancellation)?.Cancel();
         }
         catch (ObjectDisposedException)
         {

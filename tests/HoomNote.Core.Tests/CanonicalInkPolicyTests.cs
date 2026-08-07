@@ -40,6 +40,19 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Fact]
+    public void NavigationRefinementWaitsForInputToBecomeIdle()
+    {
+        Assert.False(NavigationRefinementPolicy.CanBuildTile(
+            interactionActive: false,
+            immediateInputRequested: false,
+            inputIdle: false));
+        Assert.True(NavigationRefinementPolicy.CanBuildTile(
+            interactionActive: false,
+            immediateInputRequested: false,
+            inputIdle: true));
+    }
+
+    [Fact]
     public void RefinementIsPresentedOnlyWhenTheVisibleSetIsComplete()
     {
         Assert.False(NavigationRefinementPolicy.ShouldPresentTiles(6, 0));
