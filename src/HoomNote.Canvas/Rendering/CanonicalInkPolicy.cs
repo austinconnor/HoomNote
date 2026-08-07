@@ -35,6 +35,9 @@ public static class NavigationRefinementPolicy
 
     public static bool ShouldPresentTiles(int visibleTileCount, int readyTileCount) =>
         visibleTileCount > 0 && readyTileCount >= visibleTileCount;
+
+    public static bool ShouldDrawVectorFallback(int visibleTileCount, int readyTileCount) =>
+        visibleTileCount > 0 && readyTileCount < visibleTileCount;
 }
 
 public readonly record struct NavigationTileMetrics(

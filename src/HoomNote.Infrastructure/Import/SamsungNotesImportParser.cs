@@ -19,6 +19,9 @@ internal static class SamsungNotesImportParser
     private static readonly HashSet<byte> StrokeObjectTypes = [1, 15];
     private const long MaximumEntryBytes = 256L * 1024 * 1024;
     private const double MaximumPressure = 1400d;
+    // Samsung's stored pen width is a nib-size value rather than a page-space diameter.
+    // Its renderer converts that value to document pixels at 1 / 2.5 before applying pressure.
+    private const float SamsungStrokeWidthDivisor = 2.5f;
 
     internal sealed record SamsungEmbeddedImage(
         int PageIndex, RectD Bounds, int ZIndex, string FileName, byte[] Data);
@@ -721,7 +724,7 @@ internal static class SamsungNotesImportParser
                 PressureForPoint(pressures, index),
                 TimestampMicroseconds: index * 1_000L)).ToList();
             var pressureEnabled = pressures.Count > 0 && pressures.Max() - pressures.Min() > 0.01f;
-            var width = Math.Clamp(metadata.Width * (float)scale, 0.25f, 96f);
+            var width = NormalizeStrokeWidth(metadata.Width, scale);
             var highlighter = metadata.Tool == InkToolKind.Highlighter;
             return new InkStrokeObject
             {
@@ -885,6 +888,12 @@ internal static class SamsungNotesImportParser
         Ensure(data, offset, 4);
         var width = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data[offset..]));
         return float.IsFinite(width) && width is >= 0.05f and <= 96f ? width : 0.8f;
+    }
+
+    private static float NormalizeStrokeWidth(float storedWidth, double pageScale)
+    {
+        var sourcePageWidth = Math.Clamp(storedWidth / SamsungStrokeWidthDivisor, 0.4f, 12f);
+        return Math.Clamp(sourcePageWidth * (float)pageScale, 0.1f, 96f);
     }
 
     private static List<float> DecodePressure(ReadOnlySpan<byte> payload, int pointCount, int deltaOffset, int markerOffset)

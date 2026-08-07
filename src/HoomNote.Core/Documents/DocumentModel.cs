@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace HoomNote.Core.Documents;
 
 public enum DocumentKind
@@ -70,6 +72,11 @@ public sealed record NotePage
     public string RecognizedText { get; set; } = string.Empty;
     public List<RecognizedTextRegion> RecognizedRegions { get; set; } = [];
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    // Editing loads may initially contain metadata-only page shells. This flag is deliberately
+    // excluded from packages/database JSON so existing documents remain fully compatible.
+    [JsonIgnore]
+    public bool IsContentLoaded { get; set; } = true;
 }
 
 public sealed record NotebookSection

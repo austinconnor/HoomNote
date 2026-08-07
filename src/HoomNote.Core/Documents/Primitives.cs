@@ -28,16 +28,21 @@ public readonly record struct RectD(double X, double Y, double Width, double Hei
 
     public static RectD FromPoints(IEnumerable<PointD> points)
     {
-        var materialized = points as IReadOnlyCollection<PointD> ?? points.ToArray();
-        if (materialized.Count == 0)
+        using var iterator = points.GetEnumerator();
+        if (!iterator.MoveNext()) return default;
+        var first = iterator.Current;
+        var minX = first.X;
+        var minY = first.Y;
+        var maxX = first.X;
+        var maxY = first.Y;
+        while (iterator.MoveNext())
         {
-            return default;
+            var point = iterator.Current;
+            minX = Math.Min(minX, point.X);
+            minY = Math.Min(minY, point.Y);
+            maxX = Math.Max(maxX, point.X);
+            maxY = Math.Max(maxY, point.Y);
         }
-
-        var minX = materialized.Min(point => point.X);
-        var minY = materialized.Min(point => point.Y);
-        var maxX = materialized.Max(point => point.X);
-        var maxY = materialized.Max(point => point.Y);
         return new RectD(minX, minY, maxX - minX, maxY - minY);
     }
 }
@@ -79,4 +84,3 @@ public readonly record struct Transform2D(
 
     public Transform2D Then(Transform2D next) => FromMatrix(ToMatrix() * next.ToMatrix());
 }
-

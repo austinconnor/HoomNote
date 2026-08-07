@@ -61,6 +61,15 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Fact]
+    public void RefinementUsesCrispVectorsUntilTheVisibleTileSetIsComplete()
+    {
+        Assert.False(NavigationRefinementPolicy.ShouldDrawVectorFallback(0, 0));
+        Assert.True(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 0));
+        Assert.True(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 5));
+        Assert.False(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 6));
+    }
+
+    [Fact]
     public void DenseRasterSamplesAreReducedWithoutLosingEndpoints()
     {
         var points = Enumerable.Range(0, 2_001)
@@ -90,6 +99,22 @@ public sealed class CanonicalInkPolicyTests
 
         Assert.Contains(points[2], sampled);
         Assert.Contains(points[3], sampled);
+    }
+
+    [Fact]
+    public void RasterSamplingHasBoundedCostForAdversarialZigZag()
+    {
+        var points = Enumerable.Range(0, 50_000)
+            .Select(index => new InkPoint(index * 0.01, index % 2, 0.5f, 0, 0, index))
+            .ToArray();
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var sampled = StrokeRenderSampler.ForRaster(points, pixelsPerDocumentUnit: 1);
+
+        started.Stop();
+        Assert.NotEmpty(sampled);
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(1),
+            $"Linear raster sampling exceeded its budget: {started.Elapsed}.");
     }
 
     [Fact]

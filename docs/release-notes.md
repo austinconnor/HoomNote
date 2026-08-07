@@ -1,4 +1,14 @@
-# HoomNote 0.7.43
+# HoomNote 0.7.44
+
+- Notebooks now open by loading metadata and the requested page first, while a two-page preview cushion is fully hydrated before it can enter the viewport, reducing initial memory use without visible adjacent-page pop-in.
+- Settled zooms now draw the visible page directly from source vectors until native-resolution tiles are complete, so handwriting becomes sharp immediately instead of lingering as an enlarged snapshot; tile cancellation still yields promptly to new input.
+- Dense stroke sampling now has linear worst-case cost, ink bounds use a single allocation-free pass, and long text edits no longer rebuild the complete rich-text model on every keystroke.
+- Background thumbnails use an independent SQLite read connection so cache misses cannot queue ahead of interactive loads or autosaves.
+- Incremental ink journals now compact after bounded row or byte thresholds, while partial saves preserve unloaded page data and pending journal entries.
+- Embedded note images now decode directly at their display resolution, with two bounded decodes allowed in parallel, so image-heavy pages appear sooner without full-resolution memory spikes.
+- Samsung Notes imports now convert Samsung's stored nib-size value to page-space stroke width, matching the source app's handwriting and highlighter thickness instead of rendering strokes 2.5 times too wide.
+
+## Previous release: HoomNote 0.7.43
 
 - Opening a dense notebook now reads its large SQLite JSON payloads directly as UTF-8 bytes and parses independent pages through a bounded worker set, avoiding a second UTF-16 copy of millions of ink samples while substantially reducing load time and memory pressure.
 - Repeated clicks on a notebook that is already loading now join the existing load instead of cancelling and restarting the entire multi-million-point parse.

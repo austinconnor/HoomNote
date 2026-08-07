@@ -21,67 +21,35 @@ public static class StrokeRenderSampler
         var scale = Math.Max(0.01, pixelsPerDocumentUnit);
         var tolerance = Math.Max(0.01, minimumPixelDistance / scale);
         var toleranceSquared = tolerance * tolerance;
-        var keep = new bool[points.Count];
-        keep[0] = true;
-        keep[^1] = true;
-        var segments = new Stack<(int Start, int End)>();
-        segments.Push((0, points.Count - 1));
-        var inspected = 0;
-        while (segments.TryPop(out var segment))
-        {
-            if (segment.End - segment.Start <= 1) continue;
-            var start = points[segment.Start];
-            var end = points[segment.End];
-            var largestScore = 0d;
-            var splitIndex = -1;
-            for (var index = segment.Start + 1; index < segment.End; index++)
-            {
-                if ((++inspected & 511) == 0) cancellationToken.ThrowIfCancellationRequested();
-                var (distanceSquared, amount) = DistanceToSegment(points[index], start, end);
-                var geometryScore = distanceSquared / toleranceSquared;
-                var expectedPressure = start.Pressure + (end.Pressure - start.Pressure) * amount;
-                var pressureScore = Math.Pow((points[index].Pressure - expectedPressure) / 0.04, 2);
-                var score = Math.Max(geometryScore, pressureScore);
-                if (score <= largestScore) continue;
-                largestScore = score;
-                splitIndex = index;
-            }
-            if (largestScore <= 1 || splitIndex < 0) continue;
-            keep[splitIndex] = true;
-            segments.Push((segment.Start, splitIndex));
-            segments.Push((splitIndex, segment.End));
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
         var sampled = new List<InkPoint>(Math.Min(points.Count, 4_096));
-        for (var index = 0; index < points.Count; index++)
-            if (keep[index]) sampled.Add(points[index]);
-        return sampled.Count == points.Count ? points : sampled;
-    }
-
-    private static (double DistanceSquared, double Amount) DistanceToSegment(
-        InkPoint point,
-        InkPoint start,
-        InkPoint end)
-    {
-        var segmentX = end.X - start.X;
-        var segmentY = end.Y - start.Y;
-        var lengthSquared = segmentX * segmentX + segmentY * segmentY;
-        if (lengthSquared <= double.Epsilon)
+        sampled.Add(points[0]);
+        var lastKept = points[0];
+        for (var index = 1; index < points.Count - 1; index++)
         {
-            var deltaX = point.X - start.X;
-            var deltaY = point.Y - start.Y;
-            return (deltaX * deltaX + deltaY * deltaY, 0);
-        }
+            if ((index & 511) == 0) cancellationToken.ThrowIfCancellationRequested();
+            var point = points[index];
+            var deltaX = point.X - lastKept.X;
+            var deltaY = point.Y - lastKept.Y;
+            var pressureChanged = Math.Abs(point.Pressure - lastKept.Pressure) >= 0.04f;
+            var next = points[index + 1];
+            var firstX = point.X - lastKept.X;
+            var firstY = point.Y - lastKept.Y;
+            var secondX = next.X - point.X;
+            var secondY = next.Y - point.Y;
+            var cross = Math.Abs(firstX * secondY - firstY * secondX);
+            var firstLength = Math.Sqrt(firstX * firstX + firstY * firstY);
+            var secondLength = Math.Sqrt(secondX * secondX + secondY * secondY);
+            var sharpTurn = firstLength > double.Epsilon && secondLength > double.Epsilon &&
+                            cross / (firstLength * secondLength) > 0.35;
+            var cornerChanged = sharpTurn || cross > tolerance * Math.Max(tolerance, secondLength);
+            if (deltaX * deltaX + deltaY * deltaY < toleranceSquared &&
+                !pressureChanged && !cornerChanged) continue;
 
-        var amount = Math.Clamp(
-            ((point.X - start.X) * segmentX + (point.Y - start.Y) * segmentY) / lengthSquared,
-            0,
-            1);
-        var projectionX = start.X + segmentX * amount;
-        var projectionY = start.Y + segmentY * amount;
-        var distanceX = point.X - projectionX;
-        var distanceY = point.Y - projectionY;
-        return (distanceX * distanceX + distanceY * distanceY, amount);
+            sampled.Add(point);
+            lastKept = point;
+        }
+        sampled.Add(points[^1]);
+        cancellationToken.ThrowIfCancellationRequested();
+        return sampled.Count == points.Count ? points : sampled;
     }
 }

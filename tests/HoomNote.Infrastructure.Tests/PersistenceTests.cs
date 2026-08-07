@@ -333,6 +333,80 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_EditingLoadHydratesPreferredPageAndPreservesUnloadedContent()
+    {
+        await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "lazy-pages.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Lazy pages");
+        var first = AddPage(document);
+        first.Objects.Add(new RichTextObject { Content = RichTextDocument.FromPlainText("first payload") });
+        var preferred = AddPage(document);
+        preferred.Objects.Add(new RichTextObject { Content = RichTextDocument.FromPlainText("preferred payload") });
+        var last = AddPage(document);
+        last.Objects.Add(new RichTextObject { Content = RichTextDocument.FromPlainText("last payload") });
+        await repository.SaveAsync(document);
+
+        var appended = new InkStrokeObject
+        {
+            Points = [new InkPoint(1, 2), new InkPoint(3, 4)]
+        };
+        first.Objects.Add(appended);
+        first.UpdatedAt = first.UpdatedAt.AddSeconds(1);
+        Assert.True(await repository.SaveInkAppendsAsync(document, [(first.Id, appended)]));
+
+        var editing = await repository.LoadForEditingAsync(document.Id, preferred.Id);
+
+        Assert.NotNull(editing);
+        Assert.False(editing.Pages[0].IsContentLoaded);
+        Assert.True(editing.Pages[1].IsContentLoaded);
+        Assert.False(editing.Pages[2].IsContentLoaded);
+        editing.Title = "Lazy pages renamed";
+        editing.Pages[1].Objects.Add(new RichTextObject
+        {
+            Content = RichTextDocument.FromPlainText("new preferred content")
+        });
+        editing.Pages[1].UpdatedAt = editing.Pages[1].UpdatedAt.AddSeconds(2);
+        await repository.SaveAsync(editing);
+
+        var fullyLoaded = await repository.LoadAsync(document.Id);
+        Assert.NotNull(fullyLoaded);
+        Assert.Equal("Lazy pages renamed", fullyLoaded.Title);
+        Assert.Contains(fullyLoaded.Pages[0].Objects, item => item.Id == appended.Id);
+        Assert.Contains(fullyLoaded.Pages[0].Objects.OfType<RichTextObject>(),
+            item => item.Content.PlainText == "first payload");
+        Assert.Contains(fullyLoaded.Pages[1].Objects.OfType<RichTextObject>(),
+            item => item.Content.PlainText == "new preferred content");
+        Assert.Contains(fullyLoaded.Pages[2].Objects.OfType<RichTextObject>(),
+            item => item.Content.PlainText == "last payload");
+    }
+
+    [Fact]
+    public async Task Repository_AppendJournalRequestsCompactionAtBoundedRowLimit()
+    {
+        await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "journal-limit.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Bounded journal");
+        var page = AddPage(document);
+        await repository.SaveAsync(document);
+        var strokes = Enumerable.Range(0, 128).Select(index => new InkStrokeObject
+        {
+            ZIndex = index,
+            Points = [new InkPoint(index, index), new InkPoint(index + 1, index + 1)]
+        }).ToArray();
+        page.Objects.AddRange(strokes);
+        page.UpdatedAt = page.UpdatedAt.AddSeconds(1);
+
+        var appendOnlyAccepted = await repository.SaveInkAppendsAsync(
+            document, strokes.Select(stroke => (page.Id, stroke)).ToArray());
+
+        Assert.False(appendOnlyAccepted);
+        await repository.SaveAsync(document);
+        var loaded = await repository.LoadAsync(document.Id);
+        Assert.NotNull(loaded);
+        Assert.Equal(strokes.Length, loaded.Pages[0].Objects.OfType<InkStrokeObject>().Count());
+    }
+
+    [Fact]
     public async Task AssetStore_DeduplicatesIdenticalContent()
     {
         var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets"));
@@ -528,7 +602,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.True(stroke.Style.PressureEnabled);
         Assert.True(stroke.Style.PreserveSourceGeometry);
         Assert.Equal("#112233", stroke.Style.Color);
-        Assert.Equal(1.75f, stroke.Style.Width, 3);
+        Assert.Equal(0.7f, stroke.Style.Width, 3);
         Assert.Equal("#F5DDEE", page.Template.PaperColor);
         Assert.InRange(stroke.Points.Max(point => point.X), 119.9, 120.1);
         Assert.Contains(result.Warnings, warning => warning.Contains("editable vector ink", StringComparison.Ordinal));
@@ -555,7 +629,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         {
             Assert.Equal(InkToolKind.Highlighter, highlighter.Style.Tool);
             Assert.Equal("#FFCB30", highlighter.Style.Color);
-            Assert.Equal(19.375f, highlighter.Style.Width, 3);
+            Assert.Equal(7.75f, highlighter.Style.Width, 3);
             Assert.Equal(0x72 / 255f / CanvasObjectRenderPolicy.HighlighterStrengthScale,
                 highlighter.Style.Opacity, 3);
             Assert.False(highlighter.Style.PressureEnabled);

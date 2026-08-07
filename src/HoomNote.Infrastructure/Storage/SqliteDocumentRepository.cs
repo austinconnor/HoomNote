@@ -8,6 +8,8 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed class SqliteDocumentRepository : IDocumentRepository
 {
+    private const int AppendJournalCompactionRowLimit = 128;
+    private const long AppendJournalCompactionByteLimit = 8L * 1024 * 1024;
     private static int _providerInitialized;
     private readonly SqliteConnection _connection;
     private bool _ftsEnabled;
@@ -250,6 +252,115 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         return document;
     }
 
+    public async Task<HoomNoteDocument?> LoadForEditingAsync(
+        Guid documentId,
+        Guid? preferredPageId = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            SELECT title, kind, created_utc, updated_utc, schema_version,
+                   tags_json, settings_json, sections_json
+            FROM documents WHERE id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", documentId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var title = reader.GetString(0);
+        var kind = (DocumentKind)reader.GetInt32(1);
+        var createdAt = reader.GetString(2);
+        var updatedAt = reader.GetString(3);
+        var schemaVersion = reader.GetInt32(4);
+        var tagsJson = reader.GetString(5);
+        var settingsJson = reader.GetString(6);
+        var sectionsJson = reader.GetString(7);
+        await reader.DisposeAsync();
+
+        var document = await Task.Run(() => new HoomNoteDocument
+        {
+            Id = documentId,
+            Title = title,
+            Kind = kind,
+            CreatedAt = DateTimeOffset.Parse(createdAt),
+            UpdatedAt = DateTimeOffset.Parse(updatedAt),
+            SchemaVersion = schemaVersion,
+            Tags = Deserialize<List<string>>(tagsJson) ?? [],
+            Settings = Deserialize<DocumentSettings>(settingsJson) ?? new(),
+            Sections = Deserialize<List<NotebookSection>>(sectionsJson) ?? []
+        }, cancellationToken);
+
+        await using var pageCommand = _connection.CreateCommand();
+        pageCommand.CommandText = """
+            SELECT id, title, recognized_text, recognized_regions_json, updated_utc
+            FROM pages WHERE document_id = $id ORDER BY ordinal;
+            """;
+        pageCommand.Parameters.AddWithValue("$id", documentId.ToString("D"));
+        await using var pageReader = await pageCommand.ExecuteReaderAsync(cancellationToken);
+        while (await pageReader.ReadAsync(cancellationToken))
+        {
+            document.Pages.Add(new NotePage
+            {
+                Id = Guid.Parse(pageReader.GetString(0)),
+                Title = pageReader.GetString(1),
+                RecognizedText = pageReader.GetString(2),
+                RecognizedRegions = Deserialize<List<RecognizedTextRegion>>(pageReader.GetString(3)) ?? [],
+                UpdatedAt = DateTimeOffset.Parse(pageReader.GetString(4)),
+                IsContentLoaded = false
+            });
+        }
+        await pageReader.DisposeAsync();
+
+        if (document.Pages.Count == 0) return document;
+        var selectedIndex = preferredPageId is { } selectedId
+            ? document.Pages.FindIndex(page => page.Id == selectedId)
+            : 0;
+        selectedIndex = Math.Max(0, selectedIndex);
+        var loadedPage = await LoadPageAsync(document.Pages[selectedIndex].Id, cancellationToken);
+        if (loadedPage is not null) document.Pages[selectedIndex] = loadedPage;
+        return document;
+    }
+
+    public async Task<NotePage?> LoadPageAsync(Guid pageId, CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            SELECT CAST(page_json AS BLOB), recognized_text, recognized_regions_json, updated_utc
+            FROM pages WHERE id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", pageId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var pageJson = reader.GetFieldValue<byte[]>(0);
+        var recognizedText = reader.GetString(1);
+        var recognizedRegionsJson = reader.GetString(2);
+        var serializedUpdatedAt = reader.GetString(3);
+        await reader.DisposeAsync();
+
+        var page = await Task.Run(() => Deserialize<NotePage>(pageJson), cancellationToken);
+        if (page is null) return null;
+        page.RecognizedText = recognizedText;
+        page.RecognizedRegions = Deserialize<List<RecognizedTextRegion>>(recognizedRegionsJson) ?? [];
+        if (DateTimeOffset.TryParse(serializedUpdatedAt, out var updatedAt)) page.UpdatedAt = updatedAt;
+        page.IsContentLoaded = true;
+
+        await using var appendCommand = _connection.CreateCommand();
+        appendCommand.CommandText = """
+            SELECT CAST(object_json AS BLOB) FROM ink_append_journal
+            WHERE page_id = $page ORDER BY created_utc, object_id;
+            """;
+        appendCommand.Parameters.AddWithValue("$page", pageId.ToString("D"));
+        await using var appendReader = await appendCommand.ExecuteReaderAsync(cancellationToken);
+        var objectIds = page.Objects.Select(item => item.Id).ToHashSet();
+        while (await appendReader.ReadAsync(cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var canvasObject = Deserialize<CanvasObject>(appendReader.GetFieldValue<byte[]>(0));
+            if (canvasObject is not null && objectIds.Add(canvasObject.Id)) page.Objects.Add(canvasObject);
+        }
+        page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        return page;
+    }
+
     public async Task<NotePage?> LoadFirstPageAsync(
         Guid documentId,
         CancellationToken cancellationToken = default,
@@ -367,7 +478,9 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         var currentPageIds = pages.Select(item => item.Id).ToHashSet();
         var removedPageIds = persistedVersions.Keys.Where(id => !currentPageIds.Contains(id)).ToArray();
         var changedSnapshots = pages
-            .Where(item => !persistedVersions.TryGetValue(item.Id, out var persisted) || persisted != item.UpdatedAt)
+            .Where(item => item.Page.IsContentLoaded &&
+                           (!persistedVersions.TryGetValue(item.Id, out var persisted) ||
+                            persisted != item.UpdatedAt))
             .Select(item => item.Page with { Objects = [.. item.Page.Objects] })
             .ToArray();
         // Dense imported pages can contain hundreds of thousands of points. Serialize only pages
@@ -456,14 +569,17 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 await pageCommand.ExecuteNonQueryAsync(cancellationToken);
             }
 
-            await using (var clearAppends = _connection.CreateCommand())
+            if (changedSnapshots.Length > 0)
             {
+                await using var clearAppends = _connection.CreateCommand();
                 clearAppends.Transaction = transaction;
-                clearAppends.CommandText = """
-                    DELETE FROM ink_append_journal WHERE page_id IN
-                        (SELECT id FROM pages WHERE document_id = $document);
+                clearAppends.CommandText = $"""
+                    DELETE FROM ink_append_journal
+                    WHERE page_id IN ({string.Join(',', changedSnapshots.Select((_, index) => $"$changed{index}"))});
                     """;
-                clearAppends.Parameters.AddWithValue("$document", document.Id.ToString("D"));
+                for (var index = 0; index < changedSnapshots.Length; index++)
+                    clearAppends.Parameters.AddWithValue(
+                        $"$changed{index}", changedSnapshots[index].Id.ToString("D"));
                 await clearAppends.ExecuteNonQueryAsync(cancellationToken);
             }
 
@@ -561,13 +677,32 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 await appendCommand.ExecuteNonQueryAsync(cancellationToken);
             }
             await transaction.CommitAsync(cancellationToken);
-            return true;
         }
         catch
         {
             await transaction.RollbackAsync(cancellationToken);
             throw;
         }
+        return !await AppendJournalNeedsCompactionAsync(pageIds, cancellationToken);
+    }
+
+    private async Task<bool> AppendJournalNeedsCompactionAsync(
+        IReadOnlyList<Guid> pageIds,
+        CancellationToken cancellationToken)
+    {
+        if (pageIds.Count == 0) return false;
+        await using var command = _connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT COUNT(*), COALESCE(SUM(length(object_json)), 0)
+            FROM ink_append_journal
+            WHERE page_id IN ({string.Join(',', pageIds.Select((_, index) => $"$journalPage{index}"))});
+            """;
+        for (var index = 0; index < pageIds.Count; index++)
+            command.Parameters.AddWithValue($"$journalPage{index}", pageIds[index].ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return false;
+        return reader.GetInt64(0) >= AppendJournalCompactionRowLimit ||
+               reader.GetInt64(1) >= AppendJournalCompactionByteLimit;
     }
 
     public async Task DeleteAsync(Guid documentId, CancellationToken cancellationToken = default)
