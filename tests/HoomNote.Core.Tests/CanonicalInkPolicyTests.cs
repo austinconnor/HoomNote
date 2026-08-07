@@ -48,6 +48,38 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Fact]
+    public void DenseRasterSamplesAreReducedWithoutLosingEndpoints()
+    {
+        var points = Enumerable.Range(0, 2_001)
+            .Select(index => new InkPoint(index / 100d, 12, 0.5f, 0, 0, index))
+            .ToArray();
+
+        var sampled = StrokeRenderSampler.ForRaster(points, pixelsPerDocumentUnit: 2);
+
+        Assert.True(sampled.Count < points.Length / 10);
+        Assert.Equal(points[0], sampled[0]);
+        Assert.Equal(points[^1], sampled[^1]);
+    }
+
+    [Fact]
+    public void RasterSamplingKeepsShortCornersAndPressureChanges()
+    {
+        var points = new[]
+        {
+            new InkPoint(0, 0, 0.2f, 0, 0, 0),
+            new InkPoint(0.05, 0, 0.2f, 0, 0, 1),
+            new InkPoint(0.05, 0.4, 0.2f, 0, 0, 2),
+            new InkPoint(0.5, 0.4, 0.8f, 0, 0, 3),
+            new InkPoint(0.6, 0.4, 0.8f, 0, 0, 4)
+        };
+
+        var sampled = StrokeRenderSampler.ForRaster(points, pixelsPerDocumentUnit: 1);
+
+        Assert.Contains(points[2], sampled);
+        Assert.Contains(points[3], sampled);
+    }
+
+    [Fact]
     public void AdjacentTilesHaveContiguousCoresAndOverlappingRenderGutters()
     {
         var left = NavigationTileMetrics.Create(0, 0, 512, 1_200, 900, 2);

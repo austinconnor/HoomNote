@@ -95,7 +95,8 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
                          CanvasObjectRenderPolicy.VisibleInAuthoredOrder(page.Objects))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    DrawObject(session, canvasObject, imageBitmaps, roundStyle, darkSurface);
+                    DrawObject(session, canvasObject, imageBitmaps, roundStyle, darkSurface,
+                        scale, cancellationToken);
                 }
             }
 
@@ -164,14 +165,16 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         CanvasObject canvasObject,
         IReadOnlyDictionary<string, CanvasBitmap> images,
         CanvasStrokeStyle roundStyle,
-        bool darkSurface)
+        bool darkSurface,
+        float renderScale,
+        CancellationToken cancellationToken)
     {
         var previous = session.Transform;
         session.Transform = canvasObject.Transform.ToMatrix() * previous;
         switch (canvasObject)
         {
             case InkStrokeObject ink:
-                DrawInk(session, ink, roundStyle, darkSurface);
+                DrawInk(session, ink, roundStyle, darkSurface, renderScale, cancellationToken);
                 break;
             case RichTextObject text:
                 DrawText(session, text);
@@ -191,27 +194,31 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         CanvasDrawingSession session,
         InkStrokeObject stroke,
         CanvasStrokeStyle roundStyle,
-        bool darkSurface)
+        bool darkSurface,
+        float renderScale,
+        CancellationToken cancellationToken)
     {
         if (stroke.Points.Count == 0) return;
         var style = stroke.Style.Normalize();
         using var blend = ConfigureInkBlend(session, style, darkSurface, out var color);
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
-            var points = StrokeOutlineBuilder.FitCenterline(stroke);
+            var points = StrokeRenderSampler.ForRaster(
+                StrokeOutlineBuilder.FitCenterline(stroke), renderScale, cancellationToken);
             var width = StrokeOutlineBuilder.VectorCenterlineWidth(style);
             if (points.Count == 1)
             {
                 session.FillCircle(points[0].Position.ToVector2(), width / 2f, color);
                 return;
             }
-            for (var index = 1; index < points.Count; index++)
-                session.DrawLine(points[index - 1].Position.ToVector2(), points[index].Position.ToVector2(),
-                    color, width, roundStyle);
+            using var centerlineGeometry = CreateCenterlineGeometry(session, points, cancellationToken);
+            session.DrawGeometry(centerlineGeometry, color, width, roundStyle);
             return;
         }
 
-        var outline = StrokeOutlineBuilder.Build(stroke.Points, style);
+        var renderPoints = StrokeRenderSampler.ForRaster(
+            stroke.Points, renderScale, cancellationToken);
+        var outline = StrokeOutlineBuilder.Build(renderPoints, style);
         if (outline.Contour.Count < 3)
         {
             var point = stroke.Points[0];
@@ -262,6 +269,22 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         builder.BeginFigure(points[0].ToVector2());
         for (var index = 1; index < points.Count; index++) builder.AddLine(points[index].ToVector2());
         builder.EndFigure(CanvasFigureLoop.Closed);
+        return CanvasGeometry.CreatePath(builder);
+    }
+
+    private static CanvasGeometry CreateCenterlineGeometry(
+        ICanvasResourceCreator creator,
+        IReadOnlyList<InkPoint> points,
+        CancellationToken cancellationToken)
+    {
+        using var builder = new CanvasPathBuilder(creator);
+        builder.BeginFigure(points[0].Position.ToVector2());
+        for (var index = 1; index < points.Count; index++)
+        {
+            if ((index & 511) == 0) cancellationToken.ThrowIfCancellationRequested();
+            builder.AddLine(points[index].Position.ToVector2());
+        }
+        builder.EndFigure(CanvasFigureLoop.Open);
         return CanvasGeometry.CreatePath(builder);
     }
 

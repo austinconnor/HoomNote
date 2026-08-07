@@ -1,4 +1,12 @@
-# HoomNote 0.7.41
+# HoomNote 0.7.42
+
+- Dense imported ink is now reduced to display-resolution geometry before page snapshots and previews are rendered, avoiding multi-million-point replays that blocked tab switches and first pen input without changing the saved source strokes.
+- Pen input now cancels page and sidebar rendering immediately, and cancelled preview jobs stop inside long strokes instead of continuing to consume CPU after navigation.
+- The full-page snapshot builder no longer starts beneath an active pen stroke; the already-composed preview remains visible until input finishes.
+- SQLite operations now run through a serialized worker queue instead of synchronously occupying the WinUI thread while large notebook pages are fetched, saved, or indexed.
+- First-page cover thumbnails are regenerated only when the library needs them instead of after every editing pause, preventing dense cover rendering from competing with writing and tab switching.
+
+## Previous release: HoomNote 0.7.41
 
 - Undo and redo now keep the current page sharp while the corrected frame is rebuilt, eliminating the distracting blurry flash between history steps.
 - Switching back and forth between two dense notebook tabs now reuses each
