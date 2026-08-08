@@ -407,6 +407,30 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repository_PagePreviewCacheRequiresCurrentPageVersionAndResolution()
+    {
+        await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "page-preview.db"));
+        await repository.InitializeAsync();
+        var document = HoomNoteDocument.Create("Cached previews");
+        var page = AddPage(document);
+        await repository.SaveAsync(document);
+        var png = new byte[] { 1, 2, 3, 4 };
+
+        await repository.SaveCachedPagePreviewAsync(page, 1536, png);
+
+        var cached = await repository.LoadCachedPagePreviewAsync(page.Id, 1200);
+        Assert.NotNull(cached);
+        Assert.Equal(png, cached.Png);
+        Assert.Equal(page.Size, cached.PageSize);
+        Assert.Null(await repository.LoadCachedPagePreviewAsync(page.Id, 1600));
+
+        page.UpdatedAt = page.UpdatedAt.AddSeconds(1);
+        await repository.SaveAsync(document);
+
+        Assert.Null(await repository.LoadCachedPagePreviewAsync(page.Id, 1200));
+    }
+
+    [Fact]
     public async Task AssetStore_DeduplicatesIdenticalContent()
     {
         var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets"));

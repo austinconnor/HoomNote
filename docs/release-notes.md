@@ -1,4 +1,10 @@
-# HoomNote 0.7.44
+# HoomNote 0.7.45
+
+- Opening a notebook now presents the selected page as soon as its own payload is parsed instead of waiting for up to four neighboring dense pages and their rendered previews.
+- Completed page previews are persisted with page-version and resolution checks, allowing adjacent pages to restore from compact PNGs on repeat opens while stale previews are rejected automatically.
+- Moving, resizing, or erasing objects now keeps the previous complete page frame and its correction overlay visible until the committed replacement frame is actually ready, eliminating the page flash and brief reappearance of old content.
+
+## Previous release: HoomNote 0.7.44
 
 - Notebooks now open by loading metadata and the requested page first, while a two-page preview cushion is fully hydrated before it can enter the viewport, reducing initial memory use without visible adjacent-page pop-in.
 - Settled zooms now draw the visible page directly from source vectors until native-resolution tiles are complete, so handwriting becomes sharp immediately instead of lingering as an enlarged snapshot; tile cancellation still yields promptly to new input.

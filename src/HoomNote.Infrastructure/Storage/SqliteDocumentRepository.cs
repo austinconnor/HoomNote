@@ -8,6 +8,8 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed class SqliteDocumentRepository : IDocumentRepository
 {
+    public sealed record CachedPagePreview(byte[] Png, SizeD PageSize);
+
     private const int AppendJournalCompactionRowLimit = 128;
     private const long AppendJournalCompactionByteLimit = 8L * 1024 * 1024;
     private static int _providerInitialized;
@@ -74,6 +76,14 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
                 page_id TEXT NOT NULL,
                 page_updated_utc TEXT NOT NULL,
+                png BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS page_previews (
+                page_id TEXT PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+                page_updated_utc TEXT NOT NULL,
+                long_edge INTEGER NOT NULL,
+                page_width REAL NOT NULL,
+                page_height REAL NOT NULL,
                 png BLOB NOT NULL
             );
             """, cancellationToken);
@@ -457,6 +467,60 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         command.Parameters.AddWithValue("$document", documentId.ToString("D"));
         command.Parameters.AddWithValue("$page", page.Id.ToString("D"));
         command.Parameters.AddWithValue("$updated", page.UpdatedAt.ToString("O"));
+        command.Parameters.Add("$png", SqliteType.Blob).Value = png;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<CachedPagePreview?> LoadCachedPagePreviewAsync(
+        Guid pageId,
+        int minimumLongEdge,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            SELECT c.png, c.page_width, c.page_height
+            FROM page_previews c
+            INNER JOIN pages p ON p.id = c.page_id
+            WHERE c.page_id = $page
+              AND c.page_updated_utc = p.updated_utc
+              AND c.long_edge >= $long_edge;
+            """;
+        command.Parameters.AddWithValue("$page", pageId.ToString("D"));
+        command.Parameters.AddWithValue("$long_edge", Math.Max(1, minimumLongEdge));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var png = reader.GetFieldValue<byte[]>(0);
+        var width = reader.GetDouble(1);
+        var height = reader.GetDouble(2);
+        if (png.Length == 0 || !double.IsFinite(width) || !double.IsFinite(height) ||
+            width <= 0 || height <= 0) return null;
+        return new CachedPagePreview(png, new SizeD(width, height));
+    }
+
+    public async Task SaveCachedPagePreviewAsync(
+        NotePage page,
+        int longEdge,
+        byte[] png,
+        CancellationToken cancellationToken = default)
+    {
+        if (png.Length == 0 || page.Size.Width <= 0 || page.Size.Height <= 0) return;
+        await using var command = _connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO page_previews(
+                page_id,page_updated_utc,long_edge,page_width,page_height,png)
+            VALUES($page,$updated,$long_edge,$width,$height,$png)
+            ON CONFLICT(page_id) DO UPDATE SET
+                page_updated_utc=excluded.page_updated_utc,
+                long_edge=excluded.long_edge,
+                page_width=excluded.page_width,
+                page_height=excluded.page_height,
+                png=excluded.png;
+            """;
+        command.Parameters.AddWithValue("$page", page.Id.ToString("D"));
+        command.Parameters.AddWithValue("$updated", page.UpdatedAt.ToString("O"));
+        command.Parameters.AddWithValue("$long_edge", Math.Max(1, longEdge));
+        command.Parameters.AddWithValue("$width", page.Size.Width);
+        command.Parameters.AddWithValue("$height", page.Size.Height);
         command.Parameters.Add("$png", SqliteType.Blob).Value = png;
         await command.ExecuteNonQueryAsync(cancellationToken);
     }

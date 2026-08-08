@@ -2428,13 +2428,12 @@ public sealed partial class MainPage : Page
             StartNotebookPagePreviewPreload(loaded, selectedPage);
             if (selectedPage is not null)
             {
-                await EnsurePageNeighborhoodReadyAsync(
-                    selectedPage, radius: 2, cancellation.Token);
-                cancellation.Token.ThrowIfCancellationRequested();
-                selectedPage = loaded.Pages.ElementAtOrDefault(selectedIndex);
-                _loading = true;
-                PageList.SelectedItem = selectedPage;
-                _loading = false;
+                // Present the selected page as soon as its own payload is parsed. Neighbor
+                // hydration and preview rendering used to sit in the notebook-open critical
+                // path and could add tens of seconds on low-end CPUs.
+                var previewToken = _notebookPagePreviewCancellation?.Token ?? CancellationToken.None;
+                _ = EnsurePageNeighborhoodReadyAsync(
+                    selectedPage, radius: 2, previewToken);
             }
             SelectPage(selectedPage);
             bindElapsed = MillisecondsSince(stageStarted);
@@ -2910,7 +2909,6 @@ public sealed partial class MainPage : Page
             ? 0
             : Math.Max(0, document.Pages.FindIndex(page => page.Id == selectedPage.Id));
         var orderedPages = document.Pages
-            .Where(page => page.IsContentLoaded)
             .Select((page, index) => (Page: page, Index: index))
             .OrderBy(item => Math.Abs(item.Index - selectedIndex))
             .ThenBy(item => item.Index)
@@ -2984,7 +2982,6 @@ public sealed partial class MainPage : Page
         CancellationToken cancellationToken,
         bool refresh = false)
     {
-        if (!page.IsContentLoaded) return Task.CompletedTask;
         lock (_pageRenderGate)
             if (!refresh && _notebookPagePreviews.ContainsKey(page.Id))
             {
@@ -2996,7 +2993,7 @@ public sealed partial class MainPage : Page
             if (refresh) _notebookPagePreviewRefreshPending.Add(page.Id);
             return existing;
         }
-        var task = LoadNotebookPagePreviewAsync(page, generation, cancellationToken);
+        var task = LoadNotebookPagePreviewAsync(page, generation, cancellationToken, refresh);
         _notebookPagePreviewLoads[page.Id] = task;
         return task;
     }
@@ -3004,12 +3001,46 @@ public sealed partial class MainPage : Page
     private async Task LoadNotebookPagePreviewAsync(
         NotePage page,
         int generation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool refresh)
     {
         AdjacentPagePreview? preview = null;
         try
         {
-            preview = await RenderNotebookPagePreviewAsync(page, cancellationToken);
+            byte[]? renderedBytes = null;
+            if (!refresh && _thumbnailRepository is not null)
+            {
+                var cached = await RunThumbnailRepositoryAsync(
+                    repository => repository.LoadCachedPagePreviewAsync(
+                        page.Id, _notebookPagePreviewLongEdge, cancellationToken),
+                    cancellationToken);
+                if (cached is not null)
+                {
+                    preview = await DecodeNotebookPagePreviewAsync(
+                        page.Id, cached.PageSize, cached.Png, cancellationToken);
+                }
+            }
+            if (preview is null && page.IsContentLoaded)
+            {
+                (preview, renderedBytes) = await RenderNotebookPagePreviewAsync(
+                    page, cancellationToken);
+                if (preview is not null && renderedBytes is { Length: > 0 } &&
+                    _thumbnailRepository is not null)
+                {
+                    try
+                    {
+                        await RunThumbnailRepositoryAsync(repository =>
+                            repository.SaveCachedPagePreviewAsync(
+                                page, _notebookPagePreviewLongEdge, renderedBytes, cancellationToken),
+                            cancellationToken);
+                    }
+                    catch (Exception exception) when (exception is not OperationCanceledException)
+                    {
+                        DiagnosticsLog.Warning("page.preview_cache_save_failed",
+                            ("page_id", page.Id), ("error", exception.Message));
+                    }
+                }
+            }
             cancellationToken.ThrowIfCancellationRequested();
             if (preview is null || generation != _notebookPagePreviewGeneration) return;
             lock (_pageRenderGate)
@@ -3048,11 +3079,11 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private async Task<AdjacentPagePreview?> RenderNotebookPagePreviewAsync(
+    private async Task<(AdjacentPagePreview? Preview, byte[]? Png)> RenderNotebookPagePreviewAsync(
         NotePage? page,
         CancellationToken cancellationToken)
     {
-        if (page is null || _pageThumbnailRenderer is null) return null;
+        if (page is null || _pageThumbnailRenderer is null) return (null, null);
         var scale = _notebookPagePreviewLongEdge /
                     Math.Max(1d, Math.Max(page.Size.Width, page.Size.Height));
         var pixelWidth = Math.Max(1, (int)Math.Round(page.Size.Width * scale));
@@ -3061,6 +3092,17 @@ public sealed partial class MainPage : Page
             page, pixelWidth, pixelHeight, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
 
+        var preview = await DecodeNotebookPagePreviewAsync(
+            page.Id, page.Size, bytes, cancellationToken);
+        return (preview, bytes);
+    }
+
+    private async Task<AdjacentPagePreview> DecodeNotebookPagePreviewAsync(
+        Guid pageId,
+        SizeD pageSize,
+        byte[] bytes,
+        CancellationToken cancellationToken)
+    {
         using var stream = new InMemoryRandomAccessStream();
         using (var writer = new DataWriter(stream))
         {
@@ -3074,7 +3116,7 @@ public sealed partial class MainPage : Page
         cancellationToken.ThrowIfCancellationRequested();
         var byteSize = Math.Max(1L,
             (long)bitmap.SizeInPixels.Width * bitmap.SizeInPixels.Height * RenderScalePolicy.BytesPerPixel);
-        return new AdjacentPagePreview(page.Id, page.Size, bitmap, byteSize);
+        return new AdjacentPagePreview(pageId, pageSize, bitmap, byteSize);
     }
 
     private void TouchNotebookPagePreviewCore(Guid pageId)
@@ -3325,19 +3367,28 @@ public sealed partial class MainPage : Page
             DrawAdjacentPagePreviews(drawingSession, page, state);
             drawingSession.Transform = PageTransform(
                 page, state.Zoom, state.Pan, state.Width, state.Height);
+            bool presentedCurrentEdit;
             if (ShouldDrawInteractiveViewport(page, state))
             {
                 _frameRenderMode = "viewport-vectors";
                 DrawInteractiveViewport(drawingSession, page, state);
+                presentedCurrentEdit = true;
             }
             else
             {
-                DrawCachedPage(PageSurface.Device, drawingSession, page, state);
+                presentedCurrentEdit = DrawCachedPage(
+                    PageSurface.Device, drawingSession, page, state);
             }
             RecordCanvasFrame(frameStarted);
-            RequestErasePreviewRetire(state.EditVersion);
-            RequestTransformPreviewRetire(state.EditVersion);
-            RequestInkPreviewRetire(state.EditVersion);
+            // The interaction overlay hides stale source objects while a replacement page
+            // raster is composed. Retiring it after a fallback frame briefly resurrected moved
+            // or erased content and looked like a full-page flash.
+            if (presentedCurrentEdit)
+            {
+                RequestErasePreviewRetire(state.EditVersion);
+                RequestTransformPreviewRetire(state.EditVersion);
+                RequestInkPreviewRetire(state.EditVersion);
+            }
         }
     }
 
@@ -3747,7 +3798,7 @@ public sealed partial class MainPage : Page
             ("overlay_batches", overlayBatchCount)));
     }
 
-    private void DrawCachedPage(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
+    private bool DrawCachedPage(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
         PageRenderState state)
     {
         // Normal reading and navigation should be a single textured quad, not a replay of every
@@ -3771,7 +3822,7 @@ public sealed partial class MainPage : Page
             _frameRenderMode = "preloaded-pdf-pending";
             _preloadedFallbackPageId = page.Id;
             RequestPdfPreviewLoad(page);
-            return;
+            return false;
         }
         var drewPreloadedPreview = false;
         if (!retainedPageReady &&
@@ -3787,22 +3838,37 @@ public sealed partial class MainPage : Page
         {
             _preloadedFallbackPageId = page.Id;
             DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
-            return;
+            return false;
         }
 
         if (!EnsureLowZoomPageRaster(device, page))
         {
-            // Live ink owns the input path. If a snapshot was not already ready, keep the
-            // complete preview (or at least the page background) visible rather than starting a
-            // multi-million-point replay under the user's first stroke.
-            if (!drewPreloadedPreview)
+            // Structural edits rebuild a replacement raster incrementally. Keep the previous
+            // complete frame visible until that replacement swaps in; the retained move/erase
+            // overlay masks the obsolete object region during this interval.
+            if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id)
+            {
+                drawingSession.DrawImage(_lowZoomPageRaster,
+                    new Rect(0, 0, page.Size.Width, page.Size.Height));
+                _frameRenderMode = "retained-edit-fallback";
+            }
+            else if (_pageRenderCache is not null && _pageRenderCachePageId == page.Id)
+            {
+                drawingSession.DrawImage(_pageRenderCache);
+                _frameRenderMode = "retained-vector-fallback";
+            }
+            else if (!drewPreloadedPreview)
             {
                 DrawPageBackground(drawingSession, page);
                 DrawImportedLayer(drawingSession, page);
                 if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page);
+                _frameRenderMode = "background-input";
             }
-            _frameRenderMode = drewPreloadedPreview ? "preloaded-input" : "background-input";
-            return;
+            else
+            {
+                _frameRenderMode = "preloaded-input";
+            }
+            return false;
         }
         var useLowZoomRaster = CanUseNavigationSnapshot(page, state);
         if (useLowZoomRaster)
@@ -3847,6 +3913,7 @@ public sealed partial class MainPage : Page
             if (appended.IsHidden) continue;
             DrawObject(drawingSession, appended, cacheInkGeometry: true);
         }
+        return true;
     }
 
     private bool IsImportedPdfPreviewPending(NotePage page)
