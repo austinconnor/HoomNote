@@ -6,6 +6,7 @@ using HoomNote.Core.Documents;
 using HoomNote.Core.Services;
 using HoomNote.Infrastructure.Export;
 using HoomNote.Infrastructure.Import;
+using HoomNote.Infrastructure.Serialization;
 using HoomNote.Infrastructure.Storage;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
@@ -459,6 +460,42 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.NotEqual(document.Id, imported.Id);
         Assert.Equal("Portable notes (Imported)", imported.Title);
         Assert.Equal(hash, imported.Pages[0].ImportedLayer?.AssetHash);
+    }
+
+    [Fact]
+    public async Task Package_SizeOptimizedCompressionBeatsSpeedFirstCompressionForDenseInk()
+    {
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "compression-assets"));
+        var service = new HoomNotePackageService(store);
+        var document = HoomNoteDocument.Create("Dense portable ink");
+        var page = AddPage(document);
+        page.Objects.Add(new InkStrokeObject
+        {
+            Points = Enumerable.Range(0, 25_000)
+                .Select(index => new InkPoint(
+                    index * 0.137,
+                    320 + Math.Sin(index * 0.031) * 95,
+                    0.65f,
+                    TimestampMicroseconds: index * 7_500L))
+                .ToList()
+        });
+        var optimizedPath = Path.Combine(_root, "optimized.hoomnote");
+        var speedFirstPath = Path.Combine(_root, "speed-first.hoomnote");
+
+        await service.ExportAsync(document, optimizedPath);
+        await using (var stream = new FileStream(speedFirstPath, FileMode.CreateNew, FileAccess.ReadWrite))
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create))
+        {
+            var manifest = archive.CreateEntry("manifest.json", CompressionLevel.Fastest);
+            await using var output = manifest.Open();
+            await System.Text.Json.JsonSerializer.SerializeAsync(
+                output, document, HoomNoteJson.Options);
+        }
+
+        var optimizedLength = new FileInfo(optimizedPath).Length;
+        var speedFirstLength = new FileInfo(speedFirstPath).Length;
+        Assert.True(optimizedLength < speedFirstLength,
+            $"Expected size-oriented package ({optimizedLength:N0} bytes) to beat speed-first ZIP ({speedFirstLength:N0} bytes).");
     }
 
     [Fact]

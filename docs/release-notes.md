@@ -1,4 +1,12 @@
-# HoomNote 0.7.45
+# HoomNote 0.7.46
+
+- Opening a `.hoomnote` file from Windows now imports it into the local library and opens the notebook instead of stopping at the home page; HoomNote also registers the file type and exposes packages in the normal Import picker.
+- Large `.hoomnote` packages now parse away from the UI thread and use size-oriented ZIP compression for dense ink and embedded assets, while interrupted exports clean up their temporary files.
+- Shape previews remain visible for the complete drag gesture, and bounded shapes now keep pointer-down as their fixed top-left corner while lines and arrows remain directional.
+- Pointer-down no longer switches to an obsolete retained page frame after structural edits, preventing erased shapes from reappearing and newly added shapes from disappearing during any tool gesture.
+- Detail-zoom editing now refreshes the retained interaction frame incrementally while idle, preserving the corrected scene without making lower-end machines replay dense vectors on every gesture.
+
+## Previous release: HoomNote 0.7.45
 
 - Opening a notebook now presents the selected page as soon as its own payload is parsed instead of waiting for up to four neighboring dense pages and their rendered previews.
 - Completed page previews are persisted with page-version and resolution checks, allowing adjacent pages to restore from compact PNGs on repeat opens while stale previews are rejected automatically.

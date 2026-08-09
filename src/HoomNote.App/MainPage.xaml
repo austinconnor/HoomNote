@@ -348,7 +348,7 @@
                             <MenuFlyoutItem Text="Add image" Click="OnAddImageClick">
                                 <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImage}" /></MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="Import document…" Click="OnImportClick">
+                            <MenuFlyoutItem Text="Import document or HoomNote notebook…" Click="OnImportClick">
                                 <MenuFlyoutItem.Icon><PathIcon Data="{StaticResource IconImport}" /></MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
                             <MenuFlyoutItem Text="Import Samsung Notes files…" Click="OnImportSamsungFilesClick">

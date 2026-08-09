@@ -69,6 +69,21 @@ public sealed class CanonicalInkPolicyTests
         Assert.False(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 6));
     }
 
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    public void InteractionNeverReplaysAnObsoleteRetainedFrame(
+        bool interactionActive,
+        bool retainedFrameCurrent,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            NavigationRefinementPolicy.ShouldUseSourceVectorsForInteraction(
+                interactionActive, retainedFrameCurrent));
+    }
+
     [Fact]
     public void DenseRasterSamplesAreReducedWithoutLosingEndpoints()
     {

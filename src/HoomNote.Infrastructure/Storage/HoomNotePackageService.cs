@@ -13,26 +13,38 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
         var fullDestination = Path.GetFullPath(destinationPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullDestination)!);
         var temporary = fullDestination + $".{Guid.NewGuid():N}.tmp";
-        await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
-                         128 * 1024, FileOptions.Asynchronous))
-        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: false))
+        try
         {
-            var manifest = archive.CreateEntry("manifest.json", CompressionLevel.Fastest);
-            await using (var output = manifest.Open())
-                await JsonSerializer.SerializeAsync(output, document, HoomNoteJson.Options, cancellationToken);
-
-            foreach (var asset in ReferencedAssets(document).Distinct(StringComparer.OrdinalIgnoreCase))
+            await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
+                             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: false))
             {
-                var sourcePath = assetStore.GetPath(asset);
-                if (!File.Exists(sourcePath)) continue;
-                var entry = archive.CreateEntry($"assets/{asset}", CompressionLevel.Fastest);
-                await using var output = entry.Open();
-                await using var input = File.OpenRead(sourcePath);
-                await input.CopyToAsync(output, cancellationToken);
-            }
-        }
+                // Ink manifests are repetitive JSON and shrink substantially at the maximum
+                // Deflate level. Packages are exported infrequently, so portability and transfer
+                // size matter more here than minimizing a few seconds of export CPU time.
+                var manifest = archive.CreateEntry("manifest.json", CompressionLevel.SmallestSize);
+                await using (var output = manifest.Open())
+                    await JsonSerializer.SerializeAsync(output, document, HoomNoteJson.Options, cancellationToken);
 
-        File.Move(temporary, fullDestination, overwrite: true);
+                foreach (var asset in ReferencedAssets(document).Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var sourcePath = assetStore.GetPath(asset);
+                    if (!File.Exists(sourcePath)) continue;
+                    var entry = archive.CreateEntry($"assets/{asset}", CompressionLevel.SmallestSize);
+                    await using var output = entry.Open();
+                    await using var input = new FileStream(
+                        sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    await input.CopyToAsync(output, cancellationToken);
+                }
+            }
+
+            File.Move(temporary, fullDestination, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 
     public async Task<HoomNoteDocument> ImportAsync(string packagePath, CancellationToken cancellationToken = default)

@@ -411,6 +411,7 @@ public sealed partial class MainPage : Page
     private readonly SemaphoreSlim _thumbnailRepositoryOperationGate = new(1, 1);
     private MainWindow? _hostWindow;
     private Guid? _startupDocumentId;
+    private string? _startupPackagePath;
     private bool _isPrimaryWindow;
     private Window? HostWindow => _hostWindow ?? App.MainAppWindow;
     private ContentAddressedAssetStore? _assetStore;
@@ -490,6 +491,7 @@ public sealed partial class MainPage : Page
     private int _pointerClassificationLogCount;
     private long _lastInkMovementTimestamp;
     private ShapeRecognizer.Recognition? _heldShapeRecognition;
+    private ShapeObject? _shapePreview;
     private double _zoom = 1;
     private double _minimumZoom = 0.08;
     private double _maximumZoom = 8;
@@ -742,12 +744,14 @@ public sealed partial class MainPage : Page
         if (e.Parameter is not MainPageNavigationContext context) return;
         _hostWindow = context.HostWindow;
         _startupDocumentId = context.InitialDocumentId;
+        _startupPackagePath = context.InitialPackagePath;
         _isPrimaryWindow = context.IsPrimary;
     }
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
         DiagnosticsLog.Info("main.loaded_start");
+        var startupPackageRequested = _startupPackagePath is not null;
         if (_hostWindow is { NativeTouchSource: { } nativeTouch })
         {
             nativeTouch.Frame -= OnNativeTouchFrame;
@@ -830,8 +834,20 @@ public sealed partial class MainPage : Page
             _importService = new DocumentImportService(_assetStore,
                 new SlideWorkerConverter(workerPath, Path.Combine(root, "import-temp")));
             await RefreshLibraryAsync();
+            if (_startupPackagePath is { } startupPackagePath)
+            {
+                _startupPackagePath = null;
+                try
+                {
+                    await ImportHoomNotePackagesAsync([startupPackagePath], openedFromShell: true);
+                }
+                catch (Exception exception)
+                {
+                    ShowError("The HoomNote notebook could not be opened.", exception);
+                }
+            }
             ConfigureTransientToolTips(this);
-            StatusText.Text = "Ready • autosave enabled";
+            if (!startupPackageRequested) StatusText.Text = "Ready • autosave enabled";
             DiagnosticsLog.Info("main.loaded_complete", ("notebooks", _allDocuments.Count),
                 ("log_directory", DiagnosticsLog.LogDirectory));
             if (_isPrimaryWindow)
@@ -3367,8 +3383,17 @@ public sealed partial class MainPage : Page
             DrawAdjacentPagePreviews(drawingSession, page, state);
             drawingSession.Transform = PageTransform(
                 page, state.Zoom, state.Pan, state.Width, state.Height);
+            var drawInteractiveViewport = ShouldDrawInteractiveViewport(page, state);
+            // At detail zoom, source vectors are already the visible result, so the retained
+            // interaction raster was not being asked to build or replace an invalidated frame.
+            // Compose one bounded chunk per idle frame; until it swaps in, pointer input continues
+            // to draw the current vectors below.
+            if (drawInteractiveViewport && !state.InteractionActive &&
+                !HasCurrentRetainedFrame(page))
+                _ = EnsureLowZoomPageRaster(PageSurface.Device, page);
+
             bool presentedCurrentEdit;
-            if (ShouldDrawInteractiveViewport(page, state))
+            if (drawInteractiveViewport)
             {
                 _frameRenderMode = "viewport-vectors";
                 DrawInteractiveViewport(drawingSession, page, state);
@@ -3652,17 +3677,11 @@ public sealed partial class MainPage : Page
             }
         }
 
-        if (_isPointerDown && _gestureTool == EditorTool.Shape && _activeInk.Count > 0)
-        {
-            var start = _activeInk[0].Position;
-            var end = _activeInk[^1].Position;
-            var shapeKind = SelectedShapeKind();
-            DrawObject(drawingSession, new ShapeObject
-            {
-                Shape = shapeKind, Bounds = ShapeGeometry.BoundsFromDrag(start, end, shapeKind), StrokeColor = _inkColor,
-                StrokeWidth = (float)StrokeWidthSlider.Value, StartPoint = start, EndPoint = end
-            });
-        }
+        // Keep one explicit preview object for the entire pointer gesture. Every overlay
+        // invalidation now replays the last complete shape even when pointer samples are
+        // coalesced or rejected as duplicates.
+        if (_isPointerDown && _gestureTool == EditorTool.Shape && _shapePreview is not null)
+            DrawObject(drawingSession, _shapePreview);
 
         DrawSearchFlash(drawingSession);
         DrawTextSelection(drawingSession);
@@ -3926,8 +3945,11 @@ public sealed partial class MainPage : Page
 
     private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
     {
-        // Interaction must never replay a dense vector scene. Keep presenting retained content
-        // while pan/pinch/wheel state changes; native tiles refine only after the viewport settles.
+        if (NavigationRefinementPolicy.ShouldUseSourceVectorsForInteraction(
+                state.InteractionActive, HasCurrentRetainedFrame(page)))
+            return true;
+        // When a current retained frame exists, interaction stays a single textured page plus
+        // transient overlays. Native tiles refine only after the viewport settles.
         if (state.InteractionActive) return false;
         // The retained snapshot is used only while it has enough source pixels for the current
         // monitor. Beyond that point, draw the visible vector scene through the spatial index.
@@ -3935,6 +3957,11 @@ public sealed partial class MainPage : Page
         // renderer to oscillate between three unrelated pipelines at intermediate zoom levels.
         return !CanUseNavigationSnapshot(page, state) && !CanUseNativeNavigationTiles(page, state);
     }
+
+    private bool HasCurrentRetainedFrame(NotePage page) =>
+        (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id &&
+         !_lowZoomPageRasterInvalidated) ||
+        (_pageRenderCache is not null && _pageRenderCachePageId == page.Id);
 
     private static bool CanUseNavigationSnapshot(NotePage page, PageRenderState state)
     {
@@ -5313,6 +5340,7 @@ public sealed partial class MainPage : Page
         if (_gestureTool is EditorTool.Lasso or EditorTool.BoxSelect && SelectionContainsInteraction(_gestureStart))
             _gestureTool = EditorTool.Select;
         _activeInk.Clear();
+        _shapePreview = null;
         _heldShapeRecognition = null;
         _shapeSnapTimer.Stop();
         _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -5639,6 +5667,7 @@ public sealed partial class MainPage : Page
         _heldShapeRecognition = null;
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         _activeInk.Clear();
+        _shapePreview = null;
         ClearLiveInkGeometryCache();
         _eraserPath.Clear();
         if (!retainErasePreview) _eraseDirtyRegions.Clear();
@@ -6708,6 +6737,11 @@ public sealed partial class MainPage : Page
                            (_gestureTool == EditorTool.Highlighter && HighlighterStraightCheckBox.IsChecked == true);
         if (endpointOnly && _activeInk.Count > 1) _activeInk[^1] = sample;
         else _activeInk.Add(sample);
+        if (_gestureTool == EditorTool.Shape)
+            _shapePreview = CreateShapeFromDrag(
+                _activeInk[0].Position,
+                _activeInk[^1].Position,
+                zIndex: 0);
         if (!force)
         {
             _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -6801,20 +6835,30 @@ public sealed partial class MainPage : Page
     private void CommitShape()
     {
         if (_document is null || _page is null || _activeInk.Count < 2) return;
-        var shapeKind = SelectedShapeKind();
-        var shape = new ShapeObject
-        {
-            Shape = shapeKind,
-            Bounds = ShapeGeometry.BoundsFromDrag(_activeInk[0].Position, _activeInk[^1].Position, shapeKind),
-            StartPoint = _activeInk[0].Position,
-            EndPoint = _activeInk[^1].Position,
-            StrokeColor = _inkColor,
-            StrokeWidth = (float)StrokeWidthSlider.Value,
-            ZIndex = NextZIndex()
-        };
+        var shape = CreateShapeFromDrag(
+            _activeInk[0].Position,
+            _activeInk[^1].Position,
+            NextZIndex());
         _history.Execute(new AddObjectCommand(_page.Id, shape), _document);
         RetainInkCommitPreview(shape, _editVersion + 1);
         OnDocumentChanged(recognizeInk: false, appendedObject: shape);
+    }
+
+    private ShapeObject CreateShapeFromDrag(PointD start, PointD end, int zIndex)
+    {
+        var shapeKind = SelectedShapeKind();
+        var bounds = ShapeGeometry.BoundsFromDrag(start, end, shapeKind);
+        var directional = shapeKind is ShapeKind.Line or ShapeKind.Arrow;
+        return new ShapeObject
+        {
+            Shape = shapeKind,
+            Bounds = bounds,
+            StartPoint = start,
+            EndPoint = directional ? end : new PointD(bounds.Right, bounds.Bottom),
+            StrokeColor = _inkColor,
+            StrokeWidth = (float)StrokeWidthSlider.Value,
+            ZIndex = zIndex
+        };
     }
 
     private void ApplyRealtimeErase()
@@ -9723,32 +9767,44 @@ public sealed partial class MainPage : Page
             picker.FileTypeFilter.Add(".ppt");
             picker.FileTypeFilter.Add(".pptx");
             picker.FileTypeFilter.Add(".sdocx");
+            picker.FileTypeFilter.Add(".hoomnote");
             var files = await picker.PickMultipleFilesAsync();
             if (files.Count == 0) return;
-            if (files.Count > 1)
+            var packagePaths = files
+                .Where(file => Path.GetExtension(file.Path).Equals(".hoomnote", StringComparison.OrdinalIgnoreCase))
+                .Select(file => file.Path)
+                .ToArray();
+            if (packagePaths.Length > 0)
+                await ImportHoomNotePackagesAsync(packagePaths);
+
+            var documentPaths = files
+                .Where(file => !Path.GetExtension(file.Path).Equals(".hoomnote", StringComparison.OrdinalIgnoreCase))
+                .Select(file => file.Path)
+                .ToArray();
+            if (documentPaths.Length == 0) return;
+            if (documentPaths.Length > 1)
             {
-                var options = await ShowBatchImportOptionsAsync(
-                    files.Select(file => file.Path).ToArray());
+                var options = await ShowBatchImportOptionsAsync(documentPaths);
                 if (options is null) return;
                 await ImportDocumentsBatchAsync(
-                    files.Select(file => new BatchImportSource(file.Path, string.Empty)).ToArray(),
+                    documentPaths.Select(path => new BatchImportSource(path, string.Empty)).ToArray(),
                     rootFolderName: null,
                     options);
                 return;
             }
 
-            var file = files[0];
+            var sourcePath = documentPaths[0];
             StatusText.Text = "Importing document…";
-            var request = await ShowImportOptionsAsync(file.Path);
+            var request = await ShowImportOptionsAsync(sourcePath);
             if (request is null) return;
             if (_document is null)
             {
                 await ImportDocumentsBatchAsync(
-                    [new BatchImportSource(file.Path, string.Empty)],
+                    [new BatchImportSource(sourcePath, string.Empty)],
                     rootFolderName: null,
                     new BatchImportOptions(
                         false,
-                        Path.GetFileNameWithoutExtension(file.Path),
+                        Path.GetFileNameWithoutExtension(sourcePath),
                         request.PageIndexes,
                         request.Margin,
                         request.RotationDegrees));
@@ -9784,6 +9840,60 @@ public sealed partial class MainPage : Page
             await SaveNowAsync();
         }
         catch (Exception exception) { ShowError("Import failed.", exception); }
+    }
+
+    private async Task ImportHoomNotePackagesAsync(
+        IReadOnlyList<string> packagePaths,
+        bool openedFromShell = false)
+    {
+        if (_packageService is null || _repository is null || packagePaths.Count == 0) return;
+        var imported = new List<HoomNoteDocument>();
+        var failures = new List<string>();
+        foreach (var packagePath in packagePaths
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                StatusText.Text = $"Opening {Path.GetFileName(packagePath)}…";
+                // ZIP decompression and dense ink JSON parsing are CPU work. Keep them off the UI
+                // dispatcher so a large portable notebook does not freeze its opening window.
+                var document = await Task.Run(() => _packageService.ImportAsync(packagePath));
+                await RunRepositoryAsync(repository => repository.SaveAsync(document));
+                if (_selectedFolderId is { } folderId)
+                    _userPreferences.DocumentFolders[document.Id.ToString("D")] = folderId.ToString("D");
+                _userPreferences.NotebookOrder.Add(document.Id.ToString("D"));
+                imported.Add(document);
+            }
+            catch (Exception exception)
+            {
+                DiagnosticsLog.Error("package.import_failed", exception,
+                    ("path", packagePath));
+                failures.Add($"{Path.GetFileName(packagePath)}: {exception.Message}");
+            }
+        }
+
+        if (imported.Count > 0)
+        {
+            await PersistUserPreferencesAsync("Imported HoomNote package");
+            var first = imported[0];
+            await RefreshLibraryAsync(first.Id);
+            SelectLibraryDocument(first.Id, revealInLibrary: true);
+            ImportInfo.Title = openedFromShell
+                ? $"Opened {Path.GetFileName(packagePaths[0])}"
+                : imported.Count == 1 ? "HoomNote notebook imported" : $"Imported {imported.Count} HoomNote notebooks";
+            ImportInfo.Message = failures.Count == 0
+                ? $"{first.Title} is now in your library."
+                : string.Join(" ", failures.Take(3));
+            ImportInfo.Severity = failures.Count == 0
+                ? InfoBarSeverity.Success
+                : InfoBarSeverity.Warning;
+            ImportInfo.IsOpen = true;
+            StatusText.Text = $"Opened {first.Title}";
+            return;
+        }
+
+        if (failures.Count > 0)
+            throw new InvalidDataException(string.Join(" ", failures.Take(3)));
     }
 
     private async void OnImportSamsungFilesClick(object sender, RoutedEventArgs e)

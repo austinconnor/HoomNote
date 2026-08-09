@@ -1,5 +1,7 @@
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
+using Microsoft.Windows.AppLifecycle;
+using HoomNote_App.Services;
 using Velopack;
 
 namespace HoomNote_App;
@@ -14,12 +16,23 @@ public static class Program
         VelopackApp.Build().Run();
 
         WinRT.ComWrappersSupport.InitializeComWrappers();
+        var initialPackagePath = HoomNoteFileActivation.FindPackagePath(args);
+        try
+        {
+            initialPackagePath ??= HoomNoteFileActivation.FindPackagePath(
+                AppInstance.GetCurrent().GetActivatedEventArgs());
+        }
+        catch
+        {
+            // Plain command-line activation still works when App Lifecycle activation data is
+            // unavailable (for example, a portable executable selected through Open with).
+        }
         Application.Start(initialization =>
         {
             var context = new DispatcherQueueSynchronizationContext(
                 DispatcherQueue.GetForCurrentThread());
             SynchronizationContext.SetSynchronizationContext(context);
-            _ = new App();
+            _ = new App(initialPackagePath);
         });
         return 0;
     }

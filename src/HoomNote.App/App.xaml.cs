@@ -14,6 +14,7 @@ using HoomNote_App.Services;
 using HoomNote.Infrastructure.Storage;
 using System.Runtime.InteropServices;
 using Windows.Graphics;
+using Microsoft.Windows.AppLifecycle;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -29,13 +30,15 @@ public partial class App : Application
     private readonly HashSet<MainWindow> _windows = [];
     private readonly SemaphoreSlim _userPreferencesGate = new(1, 1);
     private UserPreferences? _sharedUserPreferences;
+    private readonly string? _initialPackagePath;
     
     /// <summary>
     /// Initializes the singleton application object.  This is the first line of authored code
     /// executed, and as such is the logical equivalent of main() or WinMain().
     /// </summary>
-    public App()
+    public App(string? initialPackagePath = null)
     {
+        _initialPackagePath = initialPackagePath;
         LocalDataMigration.MovePreviousLibrary();
         DiagnosticsLog.Initialize();
         DiagnosticsLog.Info("app.constructing");
@@ -64,17 +67,42 @@ public partial class App : Application
         try
         {
             DiagnosticsLog.Info("app.launching", ("arguments_length", args.Arguments?.Length ?? 0));
-            var mainWindow = new MainWindow(isPrimary: true);
+            var packagePath = _initialPackagePath ??
+                              HoomNoteFileActivation.NormalizePackagePath(args.Arguments);
+            var mainWindow = new MainWindow(initialPackagePath: packagePath, isPrimary: true);
             MainAppWindow = mainWindow;
             RegisterWindow(mainWindow);
             mainWindow.Activate();
             DiagnosticsLog.Info("app.launched");
-            _ = Task.Run(WindowsShellBranding.RefreshInstalledAppIcon);
+            _ = Task.Run(() =>
+            {
+                WindowsShellBranding.RefreshInstalledAppIcon();
+                RegisterHoomNoteFileType();
+            });
         }
         catch (Exception exception)
         {
             DiagnosticsLog.Critical("app.launch_failed", exception);
             throw;
+        }
+    }
+
+    private static void RegisterHoomNoteFileType()
+    {
+        try
+        {
+            var executable = Environment.ProcessPath ?? string.Empty;
+            var logo = string.IsNullOrWhiteSpace(executable) ? string.Empty : $"{executable},0";
+            ActivationRegistrationManager.RegisterForFileTypeActivation(
+                [".hoomnote"], logo, "HoomNote notebook", ["open"], executable);
+            DiagnosticsLog.Info("shell.file_type_registered", ("extension", ".hoomnote"));
+        }
+        catch (Exception exception)
+        {
+            // Packaged builds already declare the association in Package.appxmanifest. Failure
+            // here must not prevent portable builds or an existing user association from working.
+            DiagnosticsLog.Warning("shell.file_type_registration_failed",
+                ("exception", exception.GetType().Name));
         }
     }
 

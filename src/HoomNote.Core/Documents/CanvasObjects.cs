@@ -113,19 +113,23 @@ public static class ShapeGeometry
 
     public static RectD BoundsFromDrag(PointD start, PointD end, ShapeKind shape)
     {
-        if (!HasFixedAspectRatio(shape))
+        // Lines and arrows are directional gestures and may be dragged in any direction.
+        // Bounded shapes use pointer-down as a fixed top-left corner so their opposite corner
+        // follows the pointer without the whole shape flipping around the anchor.
+        if (shape is ShapeKind.Line or ShapeKind.Arrow)
             return new RectD(
                 Math.Min(start.X, end.X),
                 Math.Min(start.Y, end.Y),
                 Math.Max(1, Math.Abs(end.X - start.X)),
                 Math.Max(1, Math.Abs(end.Y - start.Y)));
 
-        var size = Math.Max(1, Math.Max(Math.Abs(end.X - start.X), Math.Abs(end.Y - start.Y)));
-        return new RectD(
-            end.X >= start.X ? start.X : start.X - size,
-            end.Y >= start.Y ? start.Y : start.Y - size,
-            size,
-            size);
+        var width = Math.Max(1, end.X - start.X);
+        var height = Math.Max(1, end.Y - start.Y);
+        if (!HasFixedAspectRatio(shape))
+            return new RectD(start.X, start.Y, width, height);
+
+        var size = Math.Max(width, height);
+        return new RectD(start.X, start.Y, size, size);
     }
 
     public static IReadOnlyList<PointD> StarPoints(RectD bounds)

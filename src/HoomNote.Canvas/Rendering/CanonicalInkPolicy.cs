@@ -38,6 +38,16 @@ public static class NavigationRefinementPolicy
 
     public static bool ShouldDrawVectorFallback(int visibleTileCount, int readyTileCount) =>
         visibleTileCount > 0 && readyTileCount < visibleTileCount;
+
+    /// <summary>
+    /// Pointer input may use a retained page to avoid replaying a dense scene, but an obsolete
+    /// retained frame must never replace the current document. This is the source-of-truth
+    /// fallback after structural edits while a replacement raster is still being composed.
+    /// </summary>
+    public static bool ShouldUseSourceVectorsForInteraction(
+        bool interactionActive,
+        bool retainedFrameCurrent) =>
+        interactionActive && !retainedFrameCurrent;
 }
 
 public readonly record struct NavigationTileMetrics(

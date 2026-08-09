@@ -933,15 +933,19 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
-    public void ShapeGeometry_CreatesConstrainedSquareCircleAndFiniteStar()
+    public void ShapeGeometry_AnchorsBoundedShapesAtPointerDownAndPreservesDirectionalLines()
     {
         var square = ShapeGeometry.BoundsFromDrag(new PointD(20, 30), new PointD(80, 65), ShapeKind.Square);
         var circle = ShapeGeometry.BoundsFromDrag(new PointD(80, 65), new PointD(20, 30), ShapeKind.Circle);
+        var rectangle = ShapeGeometry.BoundsFromDrag(new PointD(15, 25), new PointD(95, 75), ShapeKind.Rectangle);
+        var reverseLine = ShapeGeometry.BoundsFromDrag(new PointD(80, 65), new PointD(20, 30), ShapeKind.Line);
 
         Assert.Equal(square.Width, square.Height);
         Assert.Equal(circle.Width, circle.Height);
         Assert.Equal(60, square.Width);
-        Assert.Equal(60, circle.Width);
+        Assert.Equal(new RectD(80, 65, 1, 1), circle);
+        Assert.Equal(new RectD(15, 25, 80, 50), rectangle);
+        Assert.Equal(new RectD(20, 30, 60, 35), reverseLine);
 
         var star = ShapeGeometry.StarPoints(new RectD(10, 20, 80, 80));
         Assert.Equal(10, star.Count);
@@ -952,6 +956,15 @@ public sealed class GeometryAndEditingTests
             Assert.InRange(point.X, 10, 90);
             Assert.InRange(point.Y, 20, 100);
         });
+    }
+
+    [Fact]
+    public void ShapeGeometry_UsesTheLargerDragAxisForTopLeftAnchoredSquares()
+    {
+        var square = ShapeGeometry.BoundsFromDrag(
+            new PointD(20, 30), new PointD(55, 95), ShapeKind.Square);
+
+        Assert.Equal(new RectD(20, 30, 65, 65), square);
     }
 
     [Fact]

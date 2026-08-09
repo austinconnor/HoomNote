@@ -18,7 +18,10 @@ public sealed partial class MainWindow : Window
     internal bool IsPrimary { get; }
     internal MainPage? MainPage => RootFrame.Content as MainPage;
 
-    public MainWindow(Guid? initialDocumentId = null, bool isPrimary = false)
+    public MainWindow(
+        Guid? initialDocumentId = null,
+        string? initialPackagePath = null,
+        bool isPrimary = false)
     {
         IsPrimary = isPrimary;
         InitializeComponent();
@@ -44,7 +47,7 @@ public sealed partial class MainWindow : Window
         // Each page receives its actual host window so touch input and native file pickers
         // remain attached to the correct HWND after a notebook tab is detached.
         RootFrame.Navigate(typeof(MainPage),
-            new MainPageNavigationContext(this, initialDocumentId, isPrimary));
+            new MainPageNavigationContext(this, initialDocumentId, initialPackagePath, isPrimary));
     }
 
     internal void UpdateNotebookTitle(string? notebookTitle)
@@ -67,4 +70,5 @@ public sealed partial class MainWindow : Window
 internal sealed record MainPageNavigationContext(
     MainWindow HostWindow,
     Guid? InitialDocumentId,
+    string? InitialPackagePath,
     bool IsPrimary);
