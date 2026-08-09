@@ -204,10 +204,13 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, Task<NotePage?>> _pageContentLoads = [];
     private const int OpenDocumentCacheLimit = 4;
     private const int OpenDocumentProtectedHotSetSize = 2;
-    // Keep the two notebooks a user is actively switching between even when both contain dense
-    // Samsung ink. The previous 400k ceiling evicted a 596k-point notebook immediately, forcing
-    // another full JSON parse on every return navigation.
+    // Small notebooks remain instant to switch between. Dense notebooks count against the total
+    // budget while current and use the inactive ceiling below after the user switches away.
     private const int OpenDocumentCachePointBudget = 1_000_000;
+    // A dormant imported notebook can retain its hydrated model, spatial index, render geometry,
+    // and undo graph. Keep dense documents hot only while they are current; otherwise a blank
+    // notebook can inherit hundreds of MB of GC pressure from a tab the user is not touching.
+    private const int InactiveOpenDocumentPointLimit = 300_000;
     private const int ToolbarPresetLimit = 50;
     private readonly Dictionary<Guid, SpatialIndex> _pageSpatialIndexCache = [];
     private readonly LinkedList<Guid> _pageSpatialIndexLru = [];
@@ -500,6 +503,8 @@ public sealed partial class MainPage : Page
     private long _lastDirectInteractionTimestamp;
     private long _lastNativeTouchTimestamp;
     private int _pointerClassificationLogCount;
+    private uint? _nativeTouchClassificationPointerId;
+    private bool _nativeTouchClassification;
     private long _lastInkMovementTimestamp;
     private ShapeRecognizer.Recognition? _heldShapeRecognition;
     private ShapeObject? _shapePreview;
@@ -586,6 +591,8 @@ public sealed partial class MainPage : Page
     private readonly List<RectD> _searchFlashBounds = [];
     private long _searchFlashStarted;
     private long _lastSlowFrameLogTimestamp;
+    private long _lastSlowInteractionFrameLogTimestamp;
+    private long _lastSlowSelectionCacheLogTimestamp;
     private int _frameNavigationTileBuilds;
     private int _frameNavigationTileAborts;
     private int _renderInteractionPauseRequested;
@@ -653,8 +660,10 @@ public sealed partial class MainPage : Page
         _navigationSettleTimer.IsRepeating = false;
         _navigationSettleTimer.Tick += OnNavigationSettleTick;
         _shapeSnapTimer = DispatcherQueue.CreateTimer();
-        _shapeSnapTimer.Interval = TimeSpan.FromMilliseconds(ShapeSnapTerminalHoldMs);
-        _shapeSnapTimer.IsRepeating = false;
+        // Poll for a terminal hold while the pointer is down. Restarting a DispatcherQueueTimer
+        // for every coalesced pen sample made the UI dispatcher part of the handwriting hot path.
+        _shapeSnapTimer.Interval = TimeSpan.FromMilliseconds(64);
+        _shapeSnapTimer.IsRepeating = true;
         _shapeSnapTimer.Tick += OnShapeSnapTimerTick;
         _zoomIndicatorTimer = DispatcherQueue.CreateTimer();
         _zoomIndicatorTimer.Interval = TimeSpan.FromMilliseconds(850);
@@ -2437,6 +2446,7 @@ public sealed partial class MainPage : Page
             if (!_documentHistories.TryGetValue(id, out var history))
                 _documentHistories[id] = history = new CommandHistory();
             _history = history;
+            if (_document?.Id != loaded.Id) ResetInteractionCachesForDocumentSwitch();
             _document = loaded;
             RestoreTemporaryGridVisibility(loaded.Id);
             var inkPointCount = fromCache && _openDocumentPointCounts.TryGetValue(id, out var cachedPointCount)
@@ -3647,6 +3657,7 @@ public sealed partial class MainPage : Page
     private void OnCanvasDraw(CanvasControl sender, CanvasDrawEventArgs args)
     {
         if (_page is null) return;
+        var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var drawingSession = args.DrawingSession;
         drawingSession.Transform = PageTransform();
         var styleBrushPreview = _isPointerDown && _gestureTool == EditorTool.Style && !_styleToolPickMode;
@@ -3732,6 +3743,37 @@ public sealed partial class MainPage : Page
 
         DrawPageNumber(drawingSession);
         UpdateSelectionLockOverlay();
+        RecordInteractionFrame(frameStarted);
+    }
+
+    private void RecordInteractionFrame(long frameStarted)
+    {
+        var elapsedMs = MillisecondsSince(frameStarted);
+        if (elapsedMs < 20 || MillisecondsSince(_lastSlowInteractionFrameLogTimestamp) < 2_000 ||
+            _page is null) return;
+        _lastSlowInteractionFrameLogTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        var gesture = _gestureTool;
+        var pointerDown = _isPointerDown;
+        var objectCount = _page.Objects.Count;
+        var activeInkPoints = _activeInk.Count;
+        var pendingInkPreviews = _pendingInkCommitPreviews.Count;
+        var eraseRegions = _eraseDirtyRegions.Count;
+        var selectedObjects = _selectedObjects.Count;
+        var transformObjects = _multiTransformPreviews.Count + (_transformPreview is null ? 0 : 1);
+        var usesMoveCache = _selectionTransformUsesMoveCache &&
+                            _selectionTransformSourceCache is not null &&
+                            _selectionTransformObjectCache is not null;
+        _ = Task.Run(() => DiagnosticsLog.Warning("interaction.slow_frame",
+            ("elapsed_ms", Math.Round(elapsedMs, 1)),
+            ("gesture", gesture),
+            ("pointer_down", pointerDown),
+            ("objects", objectCount),
+            ("active_ink_points", activeInkPoints),
+            ("pending_ink_previews", pendingInkPreviews),
+            ("erase_regions", eraseRegions),
+            ("selected_objects", selectedObjects),
+            ("transform_objects", transformObjects),
+            ("selection_move_cache", usesMoveCache)));
     }
 
     private void DrawPageNumber(CanvasDrawingSession drawingSession)
@@ -3992,14 +4034,13 @@ public sealed partial class MainPage : Page
 
     private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
     {
-        // Editing pauses refinement without entering the low-resolution navigation path. If no
-        // current retained frame exists, use the source scene until input ends rather than showing
-        // an obsolete frame or waiting for an idle raster build.
+        // Editing pauses refinement and source-vector replay. A stale retained region is masked
+        // by the interaction overlay until the corrected raster swaps in; replaying thousands of
+        // vectors on the shared device is what used to block writing and make drags jump.
         var immediateInputRequested = Volatile.Read(ref _renderInteractionPauseRequested) != 0;
-        if (NavigationRefinementPolicy.ShouldUseSourceVectorsForInteraction(
-                state.InteractionActive || immediateInputRequested,
-                HasCurrentRetainedFrame(page)))
-            return true;
+        if (NavigationRefinementPolicy.ShouldDeferSourceVectorsForInteraction(
+                state.InteractionActive || immediateInputRequested))
+            return false;
         // When a current retained frame exists, interaction stays a single textured page plus
         // transient overlays. Native tiles refine only after the viewport settles.
         if (state.InteractionActive) return false;
@@ -4074,8 +4115,9 @@ public sealed partial class MainPage : Page
             readyTileCount++;
         }
 
-        // Build a single tile per settled frame. While that cache fills, the viewport is drawn
-        // directly from vectors below so handwriting becomes sharp as soon as zoom settles.
+        // Build a single tile per settled frame and present every ready tile over the retained
+        // page. Replaying the complete visible vector scene after each tile caused large managed
+        // allocation spikes and competed with the interaction overlay on the shared device.
         if (NavigationRefinementPolicy.CanBuildTile(
                 state.InteractionActive,
                 Volatile.Read(ref _renderInteractionPauseRequested) != 0) &&
@@ -4085,28 +4127,17 @@ public sealed partial class MainPage : Page
             {
                 TouchNavigationTile(missing);
                 readyTileCount++;
-                if (!NavigationRefinementPolicy.ShouldPresentTiles(
-                        _visibleNavigationTileKeys.Count, readyTileCount))
+                if (readyTileCount < _visibleNavigationTileKeys.Count)
                     DispatcherQueue.TryEnqueue(() => PageSurface.Invalidate());
             }
         }
 
-        var presentTiles = NavigationRefinementPolicy.ShouldPresentTiles(
-            _visibleNavigationTileKeys.Count, readyTileCount);
-        if (presentTiles)
+        if (NavigationRefinementPolicy.ShouldPresentAvailableTiles(readyTileCount))
         {
             foreach (var key in _visibleNavigationTileKeys)
-                DrawNavigationTile(drawingSession, _navigationTiles[key], key,
-                    fullPixelWidth, fullPixelHeight, scale);
-        }
-        else if (!state.InteractionActive && NavigationRefinementPolicy.ShouldDrawVectorFallback(
-                     _visibleNavigationTileKeys.Count, readyTileCount))
-        {
-            // Never leave a settled zoom showing only an enlarged low-resolution snapshot.
-            // The spatial index limits this source-of-truth render to the visible viewport;
-            // complete native tiles replace it atomically once the cache is ready.
-            DrawInteractiveViewport(
-                drawingSession, page, state, _pageRenderCacheObjectIds);
+                if (_navigationTiles.TryGetValue(key, out var tile))
+                    DrawNavigationTile(drawingSession, tile, key,
+                        fullPixelWidth, fullPixelHeight, scale);
         }
         TrimNavigationTiles();
     }
@@ -5411,7 +5442,7 @@ public sealed partial class MainPage : Page
             point.PointerDeviceType == PointerDeviceType.Pen,
             point.PointerDeviceType == PointerDeviceType.Mouse,
             e.IsGenerated,
-            NativePointerClassifier.IsTouch(point.PointerId),
+            GetNativeTouchClassification(point),
             contact.Width > 0.5 && contact.Height > 0.5);
         if (_gestureTool is EditorTool.Lasso or EditorTool.BoxSelect && SelectionContainsInteraction(_gestureStart))
             _gestureTool = EditorTool.Select;
@@ -5788,6 +5819,7 @@ public sealed partial class MainPage : Page
         _penActive = false;
         _shapeSnapTimer.Stop();
         _heldShapeRecognition = null;
+        ForgetNativeTouchClassification(e.Pointer.PointerId);
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         _activeInk.Clear();
         _shapePreview = null;
@@ -5868,7 +5900,7 @@ public sealed partial class MainPage : Page
     {
         if (_touchPoints.ContainsKey(point.PointerId)) return true;
         var contact = point.Properties.ContactRect;
-        var nativeTouch = NativePointerClassifier.IsTouch(point.PointerId);
+        var nativeTouch = GetNativeTouchClassification(point);
         var isNavigation = TouchInputPolicy.IsNavigationContact(
             point.PointerDeviceType == PointerDeviceType.Touch,
             point.PointerDeviceType == PointerDeviceType.Mouse,
@@ -5890,6 +5922,25 @@ public sealed partial class MainPage : Page
                 ("touch_navigation", isNavigation)));
         }
         return isNavigation;
+    }
+
+    private bool GetNativeTouchClassification(PointerPoint point)
+    {
+        // WinUI already identifies pen and raw touch reliably. Only promoted mouse contacts need
+        // the user32 fallback, and a pointer's native type is stable for its captured lifetime.
+        if (point.PointerDeviceType != PointerDeviceType.Mouse) return false;
+        if (_nativeTouchClassificationPointerId == point.PointerId)
+            return _nativeTouchClassification;
+        _nativeTouchClassificationPointerId = point.PointerId;
+        _nativeTouchClassification = NativePointerClassifier.IsTouch(point.PointerId);
+        return _nativeTouchClassification;
+    }
+
+    private void ForgetNativeTouchClassification(uint pointerId)
+    {
+        if (_nativeTouchClassificationPointerId != pointerId) return;
+        _nativeTouchClassificationPointerId = null;
+        _nativeTouchClassification = false;
     }
 
     private void OnNativeTouchFrame(object? sender, NativeTouchFrameEventArgs e)
@@ -5997,6 +6048,7 @@ public sealed partial class MainPage : Page
     {
         var wasPageScroll = _touchPageScrollActive;
         var removed = _touchPoints.Remove(e.Pointer.PointerId);
+        ForgetNativeTouchClassification(e.Pointer.PointerId);
         if (releaseCapture) DrawingSurface.ReleasePointerCapture(e.Pointer);
         e.Handled = true;
         if (!removed) return;
@@ -6742,6 +6794,8 @@ public sealed partial class MainPage : Page
             _selectionTransformSourceBounds is not { } sourceBounds || originals.Count == 0)
             return;
 
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var backgroundObjects = 0;
         CanvasCommandList? sourceCache = null;
         CanvasCommandList? objectCache = null;
         try
@@ -6758,7 +6812,9 @@ public sealed partial class MainPage : Page
                              .Where(item => !_selectionTransformOriginalIds.Contains(item.Id))
                              .OrderBy(item => item.ZIndex))
                 {
-                    if (!canvasObject.IsHidden) DrawObject(session, canvasObject);
+                    if (canvasObject.IsHidden) continue;
+                    backgroundObjects++;
+                    DrawObject(session, canvasObject);
                 }
             }
 
@@ -6776,7 +6832,19 @@ public sealed partial class MainPage : Page
         {
             sourceCache?.Dispose();
             objectCache?.Dispose();
+            RecordSelectionMoveCache(started, originals.Count, backgroundObjects);
         }
+    }
+
+    private void RecordSelectionMoveCache(long started, int selectedObjects, int backgroundObjects)
+    {
+        var elapsedMs = MillisecondsSince(started);
+        if (elapsedMs < 20 || MillisecondsSince(_lastSlowSelectionCacheLogTimestamp) < 2_000) return;
+        _lastSlowSelectionCacheLogTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        _ = Task.Run(() => DiagnosticsLog.Warning("interaction.slow_move_cache",
+            ("elapsed_ms", Math.Round(elapsedMs, 1)),
+            ("selected_objects", selectedObjects),
+            ("background_objects", backgroundObjects)));
     }
 
     private void DisposeSelectionTransformCaches()
@@ -6929,8 +6997,8 @@ public sealed partial class MainPage : Page
             if (_gestureTool == EditorTool.Pen)
             {
                 _heldShapeRecognition = null;
-                _shapeSnapTimer.Stop();
-                if (SmartShapesToggle.IsOn) _shapeSnapTimer.Start();
+                if (SmartShapesToggle.IsOn && !_shapeSnapTimer.IsRunning)
+                    _shapeSnapTimer.Start();
             }
         }
         return true;
@@ -6940,7 +7008,13 @@ public sealed partial class MainPage : Page
     {
         if (!_isPointerDown || _gestureTool != EditorTool.Pen || !SmartShapesToggle.IsOn ||
             _activeInk.Count < 4)
+        {
+            if (!_isPointerDown || _gestureTool != EditorTool.Pen || !SmartShapesToggle.IsOn)
+                sender.Stop();
             return;
+        }
+        if (MillisecondsSince(_lastInkMovementTimestamp) < ShapeSnapTerminalHoldMs) return;
+        sender.Stop();
         _heldShapeRecognition = ShapeRecognizer.RecognizeDetailed(
             _activeInk, deliberateGesture: true, snapToClosest: true);
         if (_heldShapeRecognition is null) return;
@@ -11381,7 +11455,8 @@ public sealed partial class MainPage : Page
                 : CountInkPoints(document));
         TouchOpenDocument(document.Id);
         while (_openDocumentLru.Count > OpenDocumentCacheLimit ||
-               _openDocumentPointCounts.Values.Sum(value => (long)value) > OpenDocumentCachePointBudget)
+               _openDocumentPointCounts.Values.Sum(value => (long)value) > OpenDocumentCachePointBudget ||
+               HasOversizedInactiveDocument())
         {
             var node = _openDocumentLru.Last;
             while (node is not null && IsProtectedOpenDocument(node)) node = node.Previous;
@@ -11406,6 +11481,8 @@ public sealed partial class MainPage : Page
     private bool IsProtectedOpenDocument(LinkedListNode<Guid> node)
     {
         if (_document?.Id == node.Value) return true;
+        if (_openDocumentPointCounts.GetValueOrDefault(node.Value) > InactiveOpenDocumentPointLimit)
+            return false;
         var hotNode = _openDocumentLru.First;
         for (var index = 0; index < OpenDocumentProtectedHotSetSize && hotNode is not null; index++)
         {
@@ -11414,6 +11491,10 @@ public sealed partial class MainPage : Page
         }
         return false;
     }
+
+    private bool HasOversizedInactiveDocument() =>
+        _openDocumentPointCounts.Any(entry =>
+            entry.Key != _document?.Id && entry.Value > InactiveOpenDocumentPointLimit);
 
     private static int CountInkPoints(HoomNoteDocument document)
     {
@@ -11444,6 +11525,16 @@ public sealed partial class MainPage : Page
         _openDocumentPointCounts.Remove(documentId);
         _openDocumentLru.Remove(documentId);
         if (_document?.Id != documentId) _documentHistories.Remove(documentId);
+    }
+
+    private void ResetInteractionCachesForDocumentSwitch()
+    {
+        _spatialIndexBuildCancellation?.Cancel();
+        _pageSpatialIndexCache.Clear();
+        _pageSpatialIndexLru.Clear();
+        _spatialIndex = new SpatialIndex();
+        ClearStrokeGeometryCache();
+        DisposeSelectionTransformCaches();
     }
 
     private void PrepareSpatialIndex(NotePage? page)

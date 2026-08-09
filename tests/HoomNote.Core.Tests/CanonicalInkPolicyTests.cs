@@ -74,35 +74,22 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Fact]
-    public void RefinementIsPresentedOnlyWhenTheVisibleSetIsComplete()
+    public void RefinementPresentsEveryAvailableCrispTile()
     {
-        Assert.False(NavigationRefinementPolicy.ShouldPresentTiles(6, 0));
-        Assert.False(NavigationRefinementPolicy.ShouldPresentTiles(6, 5));
-        Assert.True(NavigationRefinementPolicy.ShouldPresentTiles(6, 6));
-    }
-
-    [Fact]
-    public void RefinementUsesCrispVectorsUntilTheVisibleTileSetIsComplete()
-    {
-        Assert.False(NavigationRefinementPolicy.ShouldDrawVectorFallback(0, 0));
-        Assert.True(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 0));
-        Assert.True(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 5));
-        Assert.False(NavigationRefinementPolicy.ShouldDrawVectorFallback(6, 6));
+        Assert.False(NavigationRefinementPolicy.ShouldPresentAvailableTiles(0));
+        Assert.True(NavigationRefinementPolicy.ShouldPresentAvailableTiles(1));
+        Assert.True(NavigationRefinementPolicy.ShouldPresentAvailableTiles(6));
     }
 
     [Theory]
-    [InlineData(true, false, true)]
-    [InlineData(true, true, false)]
-    [InlineData(false, false, false)]
-    [InlineData(false, true, false)]
-    public void InteractionNeverReplaysAnObsoleteRetainedFrame(
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void DirectInteractionDefersSourceVectorReplay(
         bool interactionActive,
-        bool retainedFrameCurrent,
         bool expected)
     {
         Assert.Equal(expected,
-            NavigationRefinementPolicy.ShouldUseSourceVectorsForInteraction(
-                interactionActive, retainedFrameCurrent));
+            NavigationRefinementPolicy.ShouldDeferSourceVectorsForInteraction(interactionActive));
     }
 
     [Fact]

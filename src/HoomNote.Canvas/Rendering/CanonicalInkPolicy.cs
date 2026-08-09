@@ -48,21 +48,14 @@ public static class NavigationRefinementPolicy
         bool inputIdle = true) =>
         inputIdle && !immediateInputRequested && TileBuildBudget(interactionActive) > 0;
 
-    public static bool ShouldPresentTiles(int visibleTileCount, int readyTileCount) =>
-        visibleTileCount > 0 && readyTileCount >= visibleTileCount;
-
-    public static bool ShouldDrawVectorFallback(int visibleTileCount, int readyTileCount) =>
-        visibleTileCount > 0 && readyTileCount < visibleTileCount;
+    public static bool ShouldPresentAvailableTiles(int readyTileCount) => readyTileCount > 0;
 
     /// <summary>
-    /// Pointer input may use a retained page to avoid replaying a dense scene, but an obsolete
-    /// retained frame must never replace the current document. This is the source-of-truth
-    /// fallback after structural edits while a replacement raster is still being composed.
+    /// Direct input must never start a source-vector replay on the shared Win2D device. The
+    /// interaction overlay masks stale regions until the corrected retained frame is ready.
     /// </summary>
-    public static bool ShouldUseSourceVectorsForInteraction(
-        bool interactionActive,
-        bool retainedFrameCurrent) =>
-        interactionActive && !retainedFrameCurrent;
+    public static bool ShouldDeferSourceVectorsForInteraction(bool interactionActive) =>
+        interactionActive;
 
     /// <summary>
     /// A retained texture is current only when it was composed from this exact page revision.

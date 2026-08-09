@@ -1,5 +1,7 @@
-# HoomNote 0.7.49
+# HoomNote 0.7.50
 
-- Moving ink, shapes, images, and multi-object selections now keeps the fast GPU move cache active through pointer release and the committed-page handoff, avoiding an expensive UI-thread redraw at the end of a drag.
-- Retained, pending, and standby page textures are now matched against the exact page revision, preventing a pre-move texture from being accepted as current and briefly restoring the original object.
-- A valid selection preview is now committed when Windows cancels a captured pointer, preventing completed moves from snapping back or being silently discarded on affected input devices.
+- Writing, erasing, and dragging no longer trigger full source-vector page replays on the shared graphics device while the pointer is down.
+- Zoomed pages progressively retain every completed high-resolution tile without redrawing the entire visible scene after each tile.
+- Switching away from a dense notebook now releases its inactive document, undo, spatial-index, and stroke-geometry caches before editing another notebook.
+- Smart-shape recognition and pointer classification perform less work in the per-sample writing path.
+- Diagnostics now report slow live interaction frames and expensive selection move-cache preparation separately from committed-page rendering.
