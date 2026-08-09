@@ -2,6 +2,7 @@ using HoomNote.Core.Documents;
 using HoomNote.Core.Services;
 using Microsoft.Graphics.Canvas;
 using System.Numerics;
+using System.Runtime.InteropServices.WindowsRuntime;
 using Windows.Data.Pdf;
 using Windows.Foundation;
 using Windows.Globalization;
@@ -14,7 +15,7 @@ namespace HoomNote_App.Services;
 
 public sealed record PageOcrResult(string Text, IReadOnlyList<RecognizedTextRegion> Regions);
 
-public sealed class WindowsPageOcrService(IAssetStore assetStore)
+public sealed class WindowsPageOcrService(IAssetStore assetStore, SharedPdfDocumentCache pdfDocuments)
 {
     private sealed record RawOcrRegion(string Text, Rect Bounds);
     private sealed record OcrSnapshot(string Text, uint PixelWidth, uint PixelHeight,
@@ -107,23 +108,21 @@ public sealed class WindowsPageOcrService(IAssetStore assetStore)
         return await RecognizeStreamAsync(engine, stream, cancellationToken);
     }
 
-    private static async Task<OcrSnapshot> RecognizePdfPageAsync(OcrEngine engine, string path, int pageIndex,
+    private async Task<OcrSnapshot> RecognizePdfPageAsync(OcrEngine engine, string path, int pageIndex,
         CancellationToken cancellationToken)
     {
-        var file = await StorageFile.GetFileFromPathAsync(path);
-        var document = await PdfDocument.LoadFromFileAsync(file);
-        if (pageIndex < 0 || (uint)pageIndex >= document.PageCount)
-            return new OcrSnapshot(string.Empty, 0, 0, []);
-        using var page = document.GetPage((uint)pageIndex);
-        using var stream = new InMemoryRandomAccessStream();
-        var scale = Math.Min(2d, OcrEngine.MaxImageDimension / Math.Max(page.Size.Width, page.Size.Height));
-        await page.RenderToStreamAsync(stream, new PdfPageRenderOptions
+        return await pdfDocuments.UsePageAsync(path, pageIndex, async page =>
         {
-            DestinationWidth = (uint)Math.Max(1, page.Size.Width * scale),
-            DestinationHeight = (uint)Math.Max(1, page.Size.Height * scale)
-        });
-        stream.Seek(0);
-        return await RecognizeStreamAsync(engine, stream, cancellationToken);
+            using var stream = new InMemoryRandomAccessStream();
+            var scale = Math.Min(2d, OcrEngine.MaxImageDimension / Math.Max(page.Size.Width, page.Size.Height));
+            await page.RenderToStreamAsync(stream, new PdfPageRenderOptions
+            {
+                DestinationWidth = (uint)Math.Max(1, page.Size.Width * scale),
+                DestinationHeight = (uint)Math.Max(1, page.Size.Height * scale)
+            });
+            stream.Seek(0);
+            return await RecognizeStreamAsync(engine, stream, cancellationToken);
+        }, cancellationToken) ?? new OcrSnapshot(string.Empty, 0, 0, []);
     }
 
     private static async Task<OcrSnapshot> RecognizeVectorInkRasterAsync(OcrEngine engine, NotePage page,
@@ -159,10 +158,12 @@ public sealed class WindowsPageOcrService(IAssetStore assetStore)
                 }
             }
         }
-        using var stream = new InMemoryRandomAccessStream();
-        await target.SaveAsync(stream, CanvasBitmapFileFormat.Png);
-        stream.Seek(0);
-        return await RecognizeStreamAsync(engine, stream, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        var pixelWidth = (uint)target.SizeInPixels.Width;
+        var pixelHeight = (uint)target.SizeInPixels.Height;
+        using var bitmap = SoftwareBitmap.CreateCopyFromBuffer(target.GetPixelBytes().AsBuffer(),
+            BitmapPixelFormat.Bgra8, (int)pixelWidth, (int)pixelHeight, BitmapAlphaMode.Premultiplied);
+        return await RecognizeBitmapAsync(engine, bitmap, pixelWidth, pixelHeight, cancellationToken);
     }
 
     private static async Task<OcrSnapshot> RecognizeStreamAsync(OcrEngine engine, IRandomAccessStream stream,
@@ -180,6 +181,13 @@ public sealed class WindowsPageOcrService(IAssetStore assetStore)
         using var bitmap = await decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8,
             BitmapAlphaMode.Premultiplied, transform, ExifOrientationMode.RespectExifOrientation,
             ColorManagementMode.ColorManageToSRgb);
+        return await RecognizeBitmapAsync(engine, bitmap, transform.ScaledWidth, transform.ScaledHeight,
+            cancellationToken);
+    }
+
+    private static async Task<OcrSnapshot> RecognizeBitmapAsync(OcrEngine engine, SoftwareBitmap bitmap,
+        uint pixelWidth, uint pixelHeight, CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
         var result = await engine.RecognizeAsync(bitmap);
         var regions = result.Lines.SelectMany(line => line.Words)
@@ -187,6 +195,6 @@ public sealed class WindowsPageOcrService(IAssetStore assetStore)
             .Select(word => new RawOcrRegion(word.Text.Trim(), word.BoundingRect))
             .ToArray();
         return new OcrSnapshot(result.Text?.Trim() ?? string.Empty,
-            transform.ScaledWidth, transform.ScaledHeight, regions);
+            pixelWidth, pixelHeight, regions);
     }
 }

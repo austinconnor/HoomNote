@@ -13,27 +13,56 @@ public static class LassoSelection
 
         if (canvasObject is InkStrokeObject stroke)
         {
-            var points = stroke.Points
-                .Select(point => stroke.Transform.Apply(point.Position))
-                .ToArray();
-            if (points.Any(point => Contains(point, polygon))) return true;
-            for (var index = 1; index < points.Length; index++)
-                if (IntersectsPolygon(points[index - 1], points[index], polygon)) return true;
+            if (stroke.Points.Count == 0) return false;
+            var previous = stroke.Transform.Apply(stroke.Points[0].Position);
+            if (Contains(previous, polygon)) return true;
+            for (var index = 1; index < stroke.Points.Count; index++)
+            {
+                var current = stroke.Transform.Apply(stroke.Points[index].Position);
+                if (Contains(current, polygon) ||
+                    RectD.FromPoints([previous, current]).Intersects(polygonBounds) &&
+                    IntersectsPolygon(previous, current, polygon)) return true;
+                previous = current;
+            }
             return false;
         }
 
-        var corners = new[]
-        {
-            new PointD(objectBounds.Left, objectBounds.Top),
-            new PointD(objectBounds.Right, objectBounds.Top),
-            new PointD(objectBounds.Right, objectBounds.Bottom),
-            new PointD(objectBounds.Left, objectBounds.Bottom)
-        };
+        var corners = objectBounds.Corners();
         return corners.Any(point => Contains(point, polygon)) ||
                Contains(objectBounds.Center, polygon) ||
                polygon.Any(objectBounds.Contains) ||
                corners.Select((point, index) => (Start: point, End: corners[(index + 1) % corners.Length]))
                    .Any(edge => IntersectsPolygon(edge.Start, edge.End, polygon));
+    }
+
+    public static IReadOnlyList<PointD> Simplify(IReadOnlyList<PointD> polygon, double tolerance)
+    {
+        if (polygon.Count < 4 || tolerance <= 0) return polygon;
+        var retained = new bool[polygon.Count];
+        retained[0] = retained[^1] = true;
+        var ranges = new Stack<(int Start, int End)>();
+        ranges.Push((0, polygon.Count - 1));
+        while (ranges.TryPop(out var range))
+        {
+            var furthestDistance = 0d;
+            var furthestIndex = -1;
+            for (var index = range.Start + 1; index < range.End; index++)
+            {
+                var distance = StrokeGeometry.DistanceToSegment(
+                    polygon[index].ToVector2(), polygon[range.Start].ToVector2(), polygon[range.End].ToVector2());
+                if (distance <= furthestDistance) continue;
+                furthestDistance = distance;
+                furthestIndex = index;
+            }
+            if (furthestIndex < 0 || furthestDistance <= tolerance) continue;
+            retained[furthestIndex] = true;
+            ranges.Push((range.Start, furthestIndex));
+            ranges.Push((furthestIndex, range.End));
+        }
+        var result = new List<PointD>();
+        for (var index = 0; index < polygon.Count; index++)
+            if (retained[index]) result.Add(polygon[index]);
+        return result;
     }
 
     public static bool Contains(PointD point, IReadOnlyList<PointD> polygon)

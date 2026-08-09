@@ -97,7 +97,7 @@ public sealed record DocumentSettings
 
 public sealed record HoomNoteDocument
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
     public Guid Id { get; init; } = Guid.NewGuid();

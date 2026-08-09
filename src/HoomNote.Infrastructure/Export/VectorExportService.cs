@@ -58,8 +58,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
             var path = document.Pages.Count == 1
                 ? destinationPath
                 : Path.Combine(root, $"{baseName}-page-{index + 1}.svg");
-            var svg = BuildSvg(page, warnings);
-            await File.WriteAllTextAsync(path, svg, new UTF8Encoding(false), cancellationToken);
+            await Task.Run(() => WriteSvg(page, path, warnings, cancellationToken), cancellationToken);
         }
 
         return new ExportResult(destinationPath, warnings);
@@ -230,18 +229,22 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
         }
     }
 
-    private string BuildSvg(NotePage page, List<string> warnings)
+    private void WriteSvg(NotePage page, string destinationPath, List<string> warnings,
+        CancellationToken cancellationToken)
     {
-        var builder = new StringBuilder();
-        builder.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-        builder.AppendLine(FormattableString.Invariant($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{page.Size.Width}\" height=\"{page.Size.Height}\" viewBox=\"0 0 {page.Size.Width} {page.Size.Height}\">"));
-        builder.AppendLine($"<rect width=\"100%\" height=\"100%\" fill=\"{Escape(page.Template.PaperColor)}\"/>");
-        AppendSvgTemplate(builder, page);
+        using var stream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None,
+            128 * 1024, FileOptions.SequentialScan);
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false), 128 * 1024);
+        writer.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        writer.WriteLine(FormattableString.Invariant($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{page.Size.Width}\" height=\"{page.Size.Height}\" viewBox=\"0 0 {page.Size.Width} {page.Size.Height}\">"));
+        writer.WriteLine($"<rect width=\"100%\" height=\"100%\" fill=\"{Escape(page.Template.PaperColor)}\"/>");
+        AppendSvgTemplate(writer, page);
         if (page.ImportedLayer is not null)
             warnings.Add($"SVG export does not embed imported PDF page {page.ImportedLayer.SourcePageIndex + 1}; HoomNote vector overlays were preserved.");
 
         foreach (var canvasObject in page.Objects.Where(item => !item.IsHidden).OrderBy(item => item.ZIndex))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var matrix = canvasObject.Transform;
             var transform = FormattableString.Invariant($"matrix({matrix.M11} {matrix.M12} {matrix.M21} {matrix.M22} {matrix.M31} {matrix.M32})");
             switch (canvasObject)
@@ -255,14 +258,14 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                         if (centerline.Count == 1)
                         {
                             var point = centerline[0];
-                            builder.AppendLine(FormattableString.Invariant(
+                            writer.WriteLine(FormattableString.Invariant(
                                 $"<circle cx=\"{point.X}\" cy=\"{point.Y}\" r=\"{StrokeOutlineBuilder.VectorCenterlineWidth(stroke.Style) / 2f}\" fill=\"{Escape(stroke.Style.Color)}\" fill-opacity=\"{inkOpacity}\" transform=\"{transform}\"/>"));
                         }
                         else
                         {
                             var pathData = string.Join(" ", centerline.Select((point, index) =>
                                 FormattableString.Invariant($"{(index == 0 ? "M" : "L")} {point.X} {point.Y}")));
-                            builder.AppendLine(FormattableString.Invariant(
+                            writer.WriteLine(FormattableString.Invariant(
                                 $"<path d=\"{pathData}\" fill=\"none\" stroke=\"{Escape(stroke.Style.Color)}\" stroke-opacity=\"{inkOpacity}\" stroke-width=\"{StrokeOutlineBuilder.VectorCenterlineWidth(stroke.Style)}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" transform=\"{transform}\"/>"));
                         }
                     }
@@ -273,7 +276,7 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                         {
                             var pathData = string.Join(" ", outline.Contour.Select((point, index) =>
                                 FormattableString.Invariant($"{(index == 0 ? "M" : "L")} {point.X} {point.Y}")));
-                            builder.AppendLine(FormattableString.Invariant(
+                            writer.WriteLine(FormattableString.Invariant(
                                 $"<path d=\"{pathData} Z\" fill=\"{Escape(stroke.Style.Color)}\" fill-opacity=\"{inkOpacity}\" fill-rule=\"nonzero\" transform=\"{transform}\"/>"));
                         }
                     }
@@ -299,10 +302,10 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                         _ => FormattableString.Invariant(
                             $"<rect x=\"{shape.Bounds.X}\" y=\"{shape.Bounds.Y}\" width=\"{shape.Bounds.Width}\" height=\"{shape.Bounds.Height}\" {style}/>")
                     };
-                    builder.AppendLine(shapeElement);
+                    writer.WriteLine(shapeElement);
                     break;
                 case RichTextObject text:
-                    builder.AppendLine(FormattableString.Invariant(
+                    writer.WriteLine(FormattableString.Invariant(
                         $"<foreignObject x=\"{text.Bounds.X}\" y=\"{text.Bounds.Y}\" width=\"{text.Bounds.Width}\" height=\"{text.Bounds.Height}\" transform=\"{transform}\"><div xmlns=\"http://www.w3.org/1999/xhtml\" style=\"font: {text.Content.FontSize}px Segoe UI; color: #f4f7fb; white-space: pre-wrap\">{Escape(text.Content.PlainText)}</div></foreignObject>"));
                     break;
                 case ImageObject image:
@@ -316,9 +319,18 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                             ".bmp" => "image/bmp",
                             _ => "image/png"
                         };
-                        var data = Convert.ToBase64String(File.ReadAllBytes(path));
-                        builder.AppendLine(FormattableString.Invariant(
-                            $"<image x=\"{image.Bounds.X}\" y=\"{image.Bounds.Y}\" width=\"{image.Bounds.Width}\" height=\"{image.Bounds.Height}\" preserveAspectRatio=\"xMidYMid meet\" href=\"data:{mime};base64,{data}\" transform=\"{transform}\"/>"));
+                        writer.Write(FormattableString.Invariant(
+                            $"<image x=\"{image.Bounds.X}\" y=\"{image.Bounds.Y}\" width=\"{image.Bounds.Width}\" height=\"{image.Bounds.Height}\" preserveAspectRatio=\"xMidYMid meet\" href=\"data:{mime};base64,"));
+                        using var imageStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                            57 * 1024, FileOptions.SequentialScan);
+                        var buffer = new byte[57 * 1024];
+                        int read;
+                        while ((read = imageStream.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            writer.Write(Convert.ToBase64String(buffer, 0, read));
+                        }
+                        writer.WriteLine(FormattableString.Invariant($"\" transform=\"{transform}\"/>"));
                     }
                     catch (Exception exception)
                     {
@@ -327,24 +339,23 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                     break;
             }
         }
-        builder.AppendLine("</svg>");
-        return builder.ToString();
+        writer.WriteLine("</svg>");
     }
 
-    private static void AppendSvgTemplate(StringBuilder builder, NotePage page)
+    private static void AppendSvgTemplate(TextWriter writer, NotePage page)
     {
         var spacing = Math.Max(4, page.Template.Spacing);
         if (page.Template.Kind == PageTemplateKind.Lined)
         {
             for (var y = page.Template.Margin; y < page.Size.Height; y += spacing)
-                builder.AppendLine(FormattableString.Invariant($"<line x1=\"{page.Template.Margin}\" y1=\"{y}\" x2=\"{page.Size.Width - page.Template.Margin}\" y2=\"{y}\" stroke=\"{page.Template.LineColor}\" stroke-width=\"{page.Template.LineWidth}\"/>"));
+                writer.WriteLine(FormattableString.Invariant($"<line x1=\"{page.Template.Margin}\" y1=\"{y}\" x2=\"{page.Size.Width - page.Template.Margin}\" y2=\"{y}\" stroke=\"{page.Template.LineColor}\" stroke-width=\"{page.Template.LineWidth}\"/>"));
         }
         else if (page.Template.Kind is PageTemplateKind.SquareGrid or PageTemplateKind.Graph)
         {
             for (var x = 0d; x < page.Size.Width; x += spacing)
-                builder.AppendLine(FormattableString.Invariant($"<line x1=\"{x}\" y1=\"0\" x2=\"{x}\" y2=\"{page.Size.Height}\" stroke=\"{page.Template.LineColor}\"/>"));
+                writer.WriteLine(FormattableString.Invariant($"<line x1=\"{x}\" y1=\"0\" x2=\"{x}\" y2=\"{page.Size.Height}\" stroke=\"{page.Template.LineColor}\"/>"));
             for (var y = 0d; y < page.Size.Height; y += spacing)
-                builder.AppendLine(FormattableString.Invariant($"<line x1=\"0\" y1=\"{y}\" x2=\"{page.Size.Width}\" y2=\"{y}\" stroke=\"{page.Template.LineColor}\"/>"));
+                writer.WriteLine(FormattableString.Invariant($"<line x1=\"0\" y1=\"{y}\" x2=\"{page.Size.Width}\" y2=\"{y}\" stroke=\"{page.Template.LineColor}\"/>"));
         }
     }
 

@@ -4,7 +4,7 @@ namespace HoomNote.Canvas.Rendering;
 
 public static class CanvasObjectRenderPolicy
 {
-    public const float HighlighterStrengthScale = 0.76f;
+    public const float HighlighterStrengthScale = InkStyle.HighlighterCompositingStrength;
     public const float MaximumHighlighterBlendStrength = 0.48f;
     public const float MaximumDarkSurfaceHighlighterBlendStrength = 0.24f;
 

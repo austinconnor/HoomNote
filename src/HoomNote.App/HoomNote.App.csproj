@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <Version>0.7.51</Version>
+    <Version>0.8.0</Version>
     <AssemblyName>HoomNote</AssemblyName>
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
@@ -106,7 +106,5 @@
          both from published builds, causing startup failure and library initialization
          failure. Keep framework code intact until all JSON contracts are source-generated. -->
     <PublishTrimmed>False</PublishTrimmed>
-    <DebugType Condition="'$(Configuration)' != 'Debug'">None</DebugType>
-    <DebugSymbols Condition="'$(Configuration)' != 'Debug'">False</DebugSymbols>
   </PropertyGroup>
 </Project>

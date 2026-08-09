@@ -217,9 +217,14 @@ public sealed partial class MainPage : Page
     private const int PageSpatialIndexCacheLimit = 2;
     private readonly HashSet<Guid> _visibleObjectIds = [];
     private readonly List<CanvasObject> _visibleObjects = [];
+    private readonly HashSet<Guid> _eraseQueryIds = [];
+    private readonly List<CanvasObject> _eraseQueryObjects = [];
     private CancellationTokenSource? _spatialIndexBuildCancellation;
     private readonly PdfPreviewCache _pdfPreview = new();
+    private readonly SharedPdfDocumentCache _pdfDocuments = new();
     private readonly SemaphoreSlim _saveGate = new(1, 1);
+    private string? _backupDirectory;
+    private DateTime _lastBackupUtc = DateTime.MinValue;
     private readonly SemaphoreSlim _documentLoadGate = new(1, 1);
     private CancellationTokenSource? _documentLoadCancellation;
     private Guid? _documentLoadingId;
@@ -231,6 +236,7 @@ public sealed partial class MainPage : Page
     private readonly List<RectD> _eraseDirtyRegions = [];
     private readonly List<InkStrokeObject> _pendingRecognitionStrokes = [];
     private readonly List<(Guid PageId, InkStrokeObject Stroke)> _pendingInkAppends = [];
+    private readonly HashSet<Guid> _pendingSavePageIds = [];
     private readonly Dictionary<string, CanvasBitmap> _imageBitmapCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, long> _imageBitmapSizes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _imageBitmapLru = [];
@@ -328,6 +334,7 @@ public sealed partial class MainPage : Page
     private PointD? _textSelectionAnchor;
     private RectD? _textSelectionDragBounds;
     private readonly Dictionary<Guid, CanvasObject> _multiTransformPreviews = [];
+    private readonly List<CanvasObject> _multiTransformPreviewObjects = [];
     private readonly HashSet<Guid> _selectionTransformOriginalIds = [];
     private RectD? _selectionTransformSourceBounds;
     private CanvasCommandList? _selectionTransformSourceCache;
@@ -335,6 +342,7 @@ public sealed partial class MainPage : Page
     private bool _selectionTransformUsesMoveCache;
     private Transform2D _selectionTransformPreviewDelta = Transform2D.Identity;
     private readonly Dictionary<Guid, CanvasObject> _styleBrushOriginals = [];
+    private readonly List<CanvasObject> _styleBrushPreviewObjects = [];
     // The committed page is rendered by CanvasAnimatedControl on its dedicated game-loop
     // thread. UI/input mutations publish immutable page/viewport state through InvalidateCanvas.
     // GPU resources are created, drawn, and disposed while holding this renderer-owned gate.
@@ -423,7 +431,10 @@ public sealed partial class MainPage : Page
     private const double PageRasterFrameBudgetMs = 6;
     private const float ContinuousPageGap = 28;
     private const int AdjacentPagePreviewLongEdge = 1536;
-    private const long NotebookPagePreviewByteBudget = 256L * 1024 * 1024;
+    private static long NotebookPagePreviewByteBudget => Math.Clamp(
+        (long)MemoryManager.AppMemoryUsageLimit / 48,
+        24L * 1024 * 1024,
+        64L * 1024 * 1024);
     private const int NotebookPagePreviewLookAhead = 5;
 
     private SqliteDocumentRepository? _repository;
@@ -718,6 +729,60 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private async Task InitializePrimaryRepositoryWithRecoveryAsync(
+        string databasePath,
+        string backupDirectory)
+    {
+        _repository = new SqliteDocumentRepository(databasePath);
+        try
+        {
+            await RunRepositoryAsync(async repository =>
+            {
+                await repository.InitializeAsync();
+                if (!await repository.CheckIntegrityAsync())
+                    throw new InvalidDataException("The HoomNote library failed its SQLite integrity check.");
+            });
+        }
+        catch (Exception exception)
+        {
+            try { await _repository.DisposeAsync(); }
+            catch { }
+            _repository = null;
+            var quarantineDirectory = Path.Combine(Path.GetDirectoryName(databasePath)!, "corrupt",
+                DateTime.UtcNow.ToString("yyyyMMdd-HHmmss"));
+            Directory.CreateDirectory(quarantineDirectory);
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var source = databasePath + suffix;
+                if (!File.Exists(source)) continue;
+                File.Move(source, Path.Combine(quarantineDirectory, Path.GetFileName(source)), overwrite: true);
+            }
+
+            var latestBackup = Directory.Exists(backupDirectory)
+                ? new DirectoryInfo(backupDirectory).EnumerateFiles("library-*.db")
+                    .OrderByDescending(file => file.CreationTimeUtc).FirstOrDefault()
+                : null;
+            if (latestBackup is not null) File.Copy(latestBackup.FullName, databasePath, overwrite: true);
+            DiagnosticsLog.Critical("database.quarantined", exception,
+                ("restored_backup", latestBackup is not null),
+                ("quarantine_directory", quarantineDirectory));
+
+            _repository = new SqliteDocumentRepository(databasePath);
+            await RunRepositoryAsync(async repository =>
+            {
+                await repository.InitializeAsync();
+                if (!await repository.CheckIntegrityAsync())
+                    throw new InvalidDataException("The restored HoomNote library failed its integrity check.");
+            });
+        }
+
+        if (Directory.Exists(backupDirectory))
+            _lastBackupUtc = new DirectoryInfo(backupDirectory).EnumerateFiles("library-*.db")
+                .OrderByDescending(file => file.CreationTimeUtc)
+                .Select(file => file.CreationTimeUtc)
+                .FirstOrDefault();
+    }
+
     private async Task<T> RunRepositoryAsync<T>(
         Func<SqliteDocumentRepository, Task<T>> operation,
         CancellationToken cancellationToken = default)
@@ -851,10 +916,11 @@ public sealed partial class MainPage : Page
             RebuildPresetToolbar();
             RebuildFolderTree();
             _assetStore = new ContentAddressedAssetStore(Path.Combine(root, "assets"));
-            _pageThumbnailRenderer = new PageThumbnailRenderer(_assetStore);
+            _pageThumbnailRenderer = new PageThumbnailRenderer(_assetStore, _pdfDocuments);
+            _pageOcr = new WindowsPageOcrService(_assetStore, _pdfDocuments);
             var databasePath = Path.Combine(root, "library.db");
-            _repository = new SqliteDocumentRepository(databasePath);
-            await RunRepositoryAsync(repository => repository.InitializeAsync());
+            _backupDirectory = Path.Combine(root, "backups");
+            await InitializePrimaryRepositoryWithRecoveryAsync(databasePath, _backupDirectory);
             // Home-card cache misses can deserialize and render a dense first page. Give that
             // disposable background work its own read connection so it cannot sit ahead of an
             // interactive notebook load or autosave in the primary repository queue.
@@ -898,8 +964,8 @@ public sealed partial class MainPage : Page
         _saveTimer.Stop();
         if (_hostWindow is { NativeTouchSource: { } nativeTouch })
             nativeTouch.Frame -= OnNativeTouchFrame;
-        _searchDebounce?.Cancel();
-        _searchLocateCancellation?.Cancel();
+        CancelAndDispose(ref _searchDebounce);
+        CancelAndDispose(ref _searchLocateCancellation);
         _recognitionTimer.Stop();
         _thumbnailRefreshTimer.Stop();
         _navigationSettleTimer.Stop();
@@ -915,20 +981,27 @@ public sealed partial class MainPage : Page
         _penActive = false;
         _heldShapeRecognition = null;
         DrawingSurface.ReleasePointerCaptures();
-        foreach (var cancellation in _pageThumbnailLoads.Values) cancellation.Cancel();
+        foreach (var cancellation in _pageThumbnailLoads.Values)
+        {
+            cancellation.Cancel();
+            cancellation.Dispose();
+        }
         _pageThumbnailLoads.Clear();
-        foreach (var cancellation in _homeThumbnailLoads.Values) cancellation.Cancel();
+        foreach (var cancellation in _homeThumbnailLoads.Values)
+        {
+            cancellation.Cancel();
+            cancellation.Dispose();
+        }
         _homeThumbnailLoads.Clear();
-        _documentLoadCancellation?.Cancel();
-        _notebookPagePreviewCancellation?.Cancel();
-        _notebookPagePreviewCancellation = null;
+        CancelAndDispose(ref _documentLoadCancellation);
+        CancelAndDispose(ref _notebookPagePreviewCancellation);
         _pageThumbnailCache.Clear();
         _pageThumbnailLru.Clear();
-        _settingsSaveDebounce?.Cancel();
-        _handwritingIndexCancellation?.Cancel();
-        _incrementalRecognitionCancellation?.Cancel();
-        _toolTipCloseCancellation?.Cancel();
-        _spatialIndexBuildCancellation?.Cancel();
+        CancelAndDispose(ref _settingsSaveDebounce);
+        CancelAndDispose(ref _handwritingIndexCancellation);
+        CancelAndDispose(ref _incrementalRecognitionCancellation);
+        CancelAndDispose(ref _toolTipCloseCancellation);
+        CancelAndDispose(ref _spatialIndexBuildCancellation);
         foreach (var animation in _sidebarAnimations.Values) animation.Cancel();
         await _documentLoadGate.WaitAsync();
         _documentLoadGate.Release();
@@ -2053,14 +2126,10 @@ public sealed partial class MainPage : Page
         await _saveGate.WaitAsync();
         try
         {
-            var document = _document?.Id == target.Id
-                ? _document
-                : await RunRepositoryAsync(repository => repository.LoadAsync(target.Id));
-            if (document is null) return;
-            document.Title = name;
-            await RunRepositoryAsync(repository => repository.SaveAsync(document));
+            await RunRepositoryAsync(repository => repository.RenameAsync(target.Id, name));
             if (_document?.Id == target.Id)
             {
+                _document.Title = name;
                 _pendingInkAppends.Clear();
                 _requiresFullSave = false;
                 _hasUnsavedChanges = false;
@@ -2097,6 +2166,19 @@ public sealed partial class MainPage : Page
         {
             if (deletingCurrent) _document = null;
             await RunRepositoryAsync(repository => repository.DeleteAsync(target.Id));
+            if (_assetStore is not null)
+            {
+                var referencedAssets = new HashSet<string>(await RunRepositoryAsync(
+                    repository => repository.GetReferencedAssetHashesAsync()),
+                    StringComparer.OrdinalIgnoreCase);
+                if (_backupDirectory is not null && Directory.Exists(_backupDirectory))
+                {
+                    var backupAssets = await SqliteDocumentRepository.GetReferencedAssetHashesFromBackupsAsync(
+                        Directory.EnumerateFiles(_backupDirectory, "library-*.db"));
+                    referencedAssets.UnionWith(backupAssets);
+                }
+                await _assetStore.CollectGarbageAsync(referencedAssets);
+            }
         }
         finally { _saveGate.Release(); }
 
@@ -2400,9 +2482,7 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        _documentLoadCancellation?.Cancel();
-        var cancellation = new CancellationTokenSource();
-        _documentLoadCancellation = cancellation;
+        var cancellation = ReplaceCancellation(ref _documentLoadCancellation);
         var lockTaken = false;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var saveElapsed = 0d;
@@ -2877,14 +2957,14 @@ public sealed partial class MainPage : Page
         _wheelZoomAnimating = false;
         _wheelZoomTarget = _zoom;
         _recognitionTimer.Stop();
-        _incrementalRecognitionCancellation?.Cancel();
+        CancelAndDispose(ref _incrementalRecognitionCancellation);
         _pendingRecognitionStrokes.Clear();
         _recognitionPageId = page?.Id;
         CommitOrDiscardTextEditor();
         // The game-loop renderer owns retained GPU resources. Page switches publish an
         // invalidation instead of moving render targets on the UI thread.
         RequestPageRenderSwitch(page);
-        _searchLocateCancellation?.Cancel();
+        CancelAndDispose(ref _searchLocateCancellation);
         _searchFlashBounds.Clear();
         _searchFlashStarted = 0;
         _eraseDirtyRegions.Clear();
@@ -2900,6 +2980,7 @@ public sealed partial class MainPage : Page
         _selectedObjects.Clear();
         ClearTextSelection();
         _multiTransformPreviews.Clear();
+        _multiTransformPreviewObjects.Clear();
         _transformPreview = null;
         _selectionTransformOriginalIds.Clear();
         _selectionTransformSourceBounds = null;
@@ -2948,7 +3029,7 @@ public sealed partial class MainPage : Page
             document.Pages.Count == 0) return;
 
         var generation = _notebookPagePreviewGeneration;
-        var cancellation = _notebookPagePreviewCancellation = new CancellationTokenSource();
+        var cancellation = ReplaceCancellation(ref _notebookPagePreviewCancellation);
         _notebookPagePreviewLongEdge = Math.Clamp(
             (int)Math.Floor(Math.Sqrt(
                 NotebookPagePreviewByteBudget / (4d * document.Pages.Count))),
@@ -3315,6 +3396,7 @@ public sealed partial class MainPage : Page
         EnsureFitViewport();
         ClampHorizontalPan();
         _canvasDpi = DrawingSurface.Dpi;
+        UpdateSelectionLockOverlay();
         PublishPageRenderState();
         // Invalidate is nonblocking. The committed page consumes the latest published viewport
         // on the Win2D game-loop thread while the UI-thread overlay remains responsive.
@@ -3681,7 +3763,7 @@ public sealed partial class MainPage : Page
 
         if (styleBrushPreview)
         {
-            foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
+            foreach (var preview in _styleBrushPreviewObjects)
                 DrawObject(drawingSession, preview);
             if (_styleBrushPoint is { } brushPoint)
             {
@@ -3714,7 +3796,7 @@ public sealed partial class MainPage : Page
         if (selectionTransformPreview)
             DrawSelectionTransformPreview(drawingSession, _page);
 
-        foreach (var pending in _pendingInkCommitPreviews.OrderBy(item => item.Object.ZIndex))
+        foreach (var pending in _pendingInkCommitPreviews)
             if (!pending.Object.IsHidden)
                 DrawObject(drawingSession, pending.Object);
 
@@ -3751,7 +3833,6 @@ public sealed partial class MainPage : Page
             DrawSelectionMarquee(drawingSession);
 
         DrawPageNumber(drawingSession);
-        UpdateSelectionLockOverlay();
         RecordInteractionFrame(frameStarted);
     }
 
@@ -3852,15 +3933,14 @@ public sealed partial class MainPage : Page
             DrawPageBackground(drawingSession, page, sourceBounds);
             DrawImportedLayer(drawingSession, page);
             if (_temporaryGridVisible) DrawTemporaryGrid(drawingSession, page, sourceBounds);
-            foreach (var canvasObject in _spatialIndex.Query(sourceBounds)
-                         .Where(item => !_selectionTransformOriginalIds.Contains(item.Id))
-                         .OrderBy(item => item.ZIndex))
+            foreach (var canvasObject in _spatialIndex.Query(sourceBounds))
             {
+                if (_selectionTransformOriginalIds.Contains(canvasObject.Id)) continue;
                 if (!canvasObject.IsHidden) DrawObject(drawingSession, canvasObject);
             }
         }
 
-        foreach (var preview in _multiTransformPreviews.Values.OrderBy(item => item.ZIndex))
+        foreach (var preview in _multiTransformPreviewObjects)
             DrawObject(drawingSession, preview);
         if (_transformPreview is not null)
             DrawObject(drawingSession, _transformPreview);
@@ -4041,7 +4121,7 @@ public sealed partial class MainPage : Page
         var layer = page.ImportedLayer;
         if (layer is null || !layer.IsVisible || _assetStore is null) return false;
         var path = _assetStore.GetPath(layer.AssetHash);
-        return _pdfPreview.TryGet(path, layer.SourcePageIndex) is null;
+        return !_pdfPreview.Contains(path, layer.SourcePageIndex);
     }
 
     private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
@@ -4204,7 +4284,11 @@ public sealed partial class MainPage : Page
     private void EnsureNavigationTileSet(NotePage page, double scale)
     {
         if (_navigationTilePageId == page.Id && Math.Abs(_navigationTileScale - scale) < 0.0001)
+        {
+            if (_pageRenderCacheObjectIds.Count == 0)
+                _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
             return;
+        }
 
         ClearNavigationTileCacheCore();
         _navigationTilePageId = page.Id;
@@ -4242,7 +4326,9 @@ public sealed partial class MainPage : Page
             metrics.RenderPixelWidth, metrics.RenderPixelHeight, 96);
         var aborted = false;
         var buildCancellation = new CancellationTokenSource();
-        Interlocked.Exchange(ref _navigationTileBuildCancellation, buildCancellation)?.Cancel();
+        var previousNavigationBuild = Interlocked.Exchange(ref _navigationTileBuildCancellation, buildCancellation);
+        previousNavigationBuild?.Cancel();
+        previousNavigationBuild?.Dispose();
         try
         {
             using var session = tile.CreateDrawingSession();
@@ -4446,7 +4532,9 @@ public sealed partial class MainPage : Page
             _pendingLowZoomPageRasterScale = rasterScale;
             _pendingLowZoomPageRasterObjectIndex = 0;
             var cancellation = new CancellationTokenSource();
-            Interlocked.Exchange(ref _pageRasterBuildCancellation, cancellation)?.Cancel();
+            var previousRasterBuild = Interlocked.Exchange(ref _pageRasterBuildCancellation, cancellation);
+            previousRasterBuild?.Cancel();
+            previousRasterBuild?.Dispose();
             using var backgroundSession = _pendingLowZoomPageRaster.CreateDrawingSession();
             backgroundSession.Clear(Color.FromArgb(0, 0, 0, 0));
             backgroundSession.Transform = Matrix3x2.CreateScale((float)rasterScale);
@@ -4571,6 +4659,38 @@ public sealed partial class MainPage : Page
         _pageRenderCache = null;
         _pageRenderCachePageId = null;
         _pageRenderCacheUpdatedAt = null;
+    }
+
+    private void MergeOverlaysIntoNavigationTiles(NotePage page)
+    {
+        if (_navigationTilePageId != page.Id || _navigationTiles.Count == 0 ||
+            _navigationTileScale <= 0 ||
+            (_pageRenderOverlayBatches.Count == 0 && _pageRenderOverlays.Count == 0)) return;
+
+        var fullPixelWidth = Math.Max(1, (int)Math.Ceiling(page.Size.Width * _navigationTileScale));
+        var fullPixelHeight = Math.Max(1, (int)Math.Ceiling(page.Size.Height * _navigationTileScale));
+        foreach (var (key, tile) in _navigationTiles)
+        {
+            var metrics = NavigationTileMetrics.Create(
+                key.X,
+                key.Y,
+                NavigationTilePixels,
+                fullPixelWidth,
+                fullPixelHeight,
+                NavigationTileGutterPixels);
+            var tileBounds = new RectD(
+                metrics.RenderPixelLeft / _navigationTileScale,
+                metrics.RenderPixelTop / _navigationTileScale,
+                metrics.RenderPixelWidth / _navigationTileScale,
+                metrics.RenderPixelHeight / _navigationTileScale);
+            using var session = tile.CreateDrawingSession();
+            session.Transform = Matrix3x2.CreateTranslation(
+                                    (float)-tileBounds.X, (float)-tileBounds.Y) *
+                                Matrix3x2.CreateScale((float)_navigationTileScale);
+            foreach (var batch in _pageRenderOverlayBatches) session.DrawImage(batch);
+            foreach (var overlay in _pageRenderOverlays)
+                if (!overlay.IsHidden) DrawObject(session, overlay, cacheInkGeometry: true);
+        }
     }
 
     private static double NavigationSnapshotScale(NotePage page) =>
@@ -4756,14 +4876,13 @@ public sealed partial class MainPage : Page
         var layer = page.ImportedLayer;
         if (layer is null || !layer.IsVisible || _assetStore is null) return;
         var path = _assetStore.GetPath(layer.AssetHash);
-        var bitmap = _pdfPreview.TryGet(path, layer.SourcePageIndex);
-        if (bitmap is not null)
+        if (_pdfPreview.TryUse(path, layer.SourcePageIndex, bitmap =>
         {
             var previous = drawingSession.Transform;
             drawingSession.Transform = layer.Transform.ToMatrix() * previous;
             drawingSession.DrawImage(bitmap, new Rect(0, 0, page.Size.Width, page.Size.Height));
             drawingSession.Transform = previous;
-        }
+        })) return;
         else
         {
             // Selection can happen before the async page load or after a device/resource reset.
@@ -5546,7 +5665,9 @@ public sealed partial class MainPage : Page
                 break;
             case EditorTool.Style:
                 _styleBrushOriginals.Clear();
+                _styleBrushPreviewObjects.Clear();
                 _multiTransformPreviews.Clear();
+                _multiTransformPreviewObjects.Clear();
                 if (_styleToolPickMode)
                 {
                     PickStyleAtPoint(_gestureStart);
@@ -5773,8 +5894,15 @@ public sealed partial class MainPage : Page
                 baseRotation: 0);
             _selectionTransformPreviewDelta = delta;
             _multiTransformPreviews.Clear();
+            _multiTransformPreviewObjects.Clear();
             foreach (var original in originals)
-                _multiTransformPreviews[original.Id] = ApplySelectionTransform(original, delta);
+            {
+                var preview = ApplySelectionTransform(original, delta);
+                _multiTransformPreviews[original.Id] = preview;
+                _multiTransformPreviewObjects.Add(preview);
+            }
+            CanvasObjectOrdering.SortStable(_multiTransformPreviewObjects);
+            UpdateSelectionLockOverlay();
             return true;
         }
         if (_transformOriginal is null) return false;
@@ -5787,6 +5915,7 @@ public sealed partial class MainPage : Page
             TransformRotation(_transformOriginal.Transform));
         _selectionTransformPreviewDelta = singleDelta;
         _transformPreview = ApplySelectionTransform(_transformOriginal, singleDelta);
+        UpdateSelectionLockOverlay();
         return true;
     }
 
@@ -5865,6 +5994,7 @@ public sealed partial class MainPage : Page
         _multiTransformOriginals = null;
         if (!retainTransformPreview) ClearTransformPreviewState();
         _styleBrushOriginals.Clear();
+        _styleBrushPreviewObjects.Clear();
         _styleBrushPoint = null;
         _eraseSnapshot = null;
         _transformHandle = TransformHandle.None;
@@ -5881,6 +6011,7 @@ public sealed partial class MainPage : Page
     {
         _transformPreview = null;
         _multiTransformPreviews.Clear();
+        _multiTransformPreviewObjects.Clear();
         _selectionTransformOriginalIds.Clear();
         _selectionTransformSourceBounds = null;
         _selectionTransformUsesMoveCache = false;
@@ -7103,6 +7234,7 @@ public sealed partial class MainPage : Page
     private void RetainInkCommitPreview(CanvasObject canvasObject, int commitVersion)
     {
         _pendingInkCommitPreviews.Add((canvasObject, commitVersion));
+        _pendingInkCommitPreviews.Sort(static (left, right) => left.Object.ZIndex.CompareTo(right.Object.ZIndex));
         Volatile.Write(ref _inkPreviewCommitVersion, commitVersion);
     }
 
@@ -7161,10 +7293,10 @@ public sealed partial class MainPage : Page
         var changed = false;
         if (_gestureTool == EditorTool.SegmentEraser)
         {
-            var candidates = _spatialIndex.Query(queryArea).OfType<InkStrokeObject>()
-                .Where(stroke => !stroke.IsLocked).ToArray();
-            foreach (var stroke in candidates)
+            _spatialIndex.Query(queryArea, _eraseQueryIds, _eraseQueryObjects);
+            foreach (var stroke in _eraseQueryObjects.OfType<InkStrokeObject>())
             {
+                if (stroke.IsLocked) continue;
                 var fragments = SegmentEraser.Erase(stroke, recentPath, radius);
                 if (fragments.Count == 1 && fragments[0].Id == stroke.Id) continue;
                 var objectIndex = _page.Objects.FindIndex(item => item.Id == stroke.Id);
@@ -7179,18 +7311,18 @@ public sealed partial class MainPage : Page
         }
         else
         {
-            var removed = _spatialIndex.Query(queryArea)
-                .Where(item => !item.IsLocked && StrokeGeometry.HitTest(item, last, radius))
-                .ToArray();
-            if (removed.Length > 0)
+            _spatialIndex.Query(queryArea, _eraseQueryIds, _eraseQueryObjects);
+            _eraseQueryObjects.RemoveAll(item => item.IsLocked || !StrokeGeometry.HitTest(item, last, radius));
+            if (_eraseQueryObjects.Count > 0)
             {
-                var ids = removed.Select(item => item.Id).ToHashSet();
-                foreach (var item in removed)
+                _eraseQueryIds.Clear();
+                foreach (var item in _eraseQueryObjects)
                 {
+                    _eraseQueryIds.Add(item.Id);
                     AddEraseDirtyRegion(StrokeGeometry.GetWorldBounds(item).Inflate(2));
                     _spatialIndex.Remove(item.Id);
                 }
-                _page.Objects.RemoveAll(item => ids.Contains(item.Id));
+                _page.Objects.RemoveAll(item => _eraseQueryIds.Contains(item.Id));
                 changed = true;
             }
         }
@@ -7260,49 +7392,23 @@ public sealed partial class MainPage : Page
     {
         if (_page is null || _activeInk.Count < 2) return;
         var points = _activeInk.Select(point => point.Position).ToArray();
-        var area = RectD.FromPoints(points);
-        var selected = _page.Objects.Where(item => !item.IsLocked && !item.IsHidden)
+        var selectionPolygon = lasso ? LassoSelection.Simplify(points, Math.Max(0.5, 1.5 / _zoom)) : points;
+        var area = RectD.FromPoints(selectionPolygon);
+        var selected = _spatialIndex.Query(area).Where(item => !item.IsLocked && !item.IsHidden)
             .Where(item =>
             {
-                var bounds = StrokeGeometry.GetWorldBounds(item);
+                var bounds = _spatialIndex.TryGetBounds(item.Id, out var cachedBounds)
+                    ? cachedBounds
+                    : StrokeGeometry.GetWorldBounds(item);
                 if (!bounds.Intersects(area)) return false;
                 if (!lasso) return true;
-                return LassoSelection.Intersects(item, points);
+                return LassoSelection.Intersects(item, selectionPolygon);
             }).ToArray();
         _selectedObjects.Clear();
         _selectedObjects.AddRange(selected);
         _selectedObject = selected.Length == 1 ? selected[0] : null;
         ClearTextSelection();
         UpdateSelectionUi();
-    }
-
-    private void CommitSegmentErase()
-    {
-        if (_document is null || _page is null || _eraserPath.Count == 0) return;
-        var before = new List<CanvasObject>();
-        var after = new List<CanvasObject>();
-        foreach (var stroke in _page.Objects.OfType<InkStrokeObject>().Where(stroke => !stroke.IsLocked))
-        {
-            var fragments = SegmentEraser.Erase(stroke, _eraserPath, EraserRadius());
-            if (fragments.Count == 1 && fragments[0].Id == stroke.Id) continue;
-            before.Add(stroke);
-            after.AddRange(fragments);
-        }
-        if (before.Count == 0) return;
-        _history.Execute(new ReplaceObjectsCommand(_page.Id, before, after, "Erase ink segments"), _document);
-        _selectedObject = null;
-        OnDocumentChanged(recognizeInk: true);
-    }
-
-    private void CommitStrokeErase()
-    {
-        if (_document is null || _page is null || _eraserPath.Count == 0) return;
-        var removed = _page.Objects.Where(item => !item.IsLocked &&
-            _eraserPath.Any(point => StrokeGeometry.HitTest(item, point, EraserRadius()))).ToArray();
-        if (removed.Length == 0) return;
-        _history.Execute(new ReplaceObjectsCommand(_page.Id, removed, [], "Erase strokes"), _document);
-        _selectedObject = null;
-        OnDocumentChanged(recognizeInk: true);
     }
 
     private void AddTextAt(PointD point)
@@ -7457,10 +7563,10 @@ public sealed partial class MainPage : Page
         CanvasObject? appendedObject = null,
         IEnumerable<Guid>? affectedPageIds = null)
     {
-        _ = recognizeInk;
         if (_page is not null) _page.UpdatedAt = DateTimeOffset.UtcNow;
         _hasUnsavedChanges = true;
         _editVersion++;
+        if (recognizeInk) ScheduleRecognition(appendedObject as InkStrokeObject);
         if (appendedObject is InkStrokeObject appendedInk && _page is not null)
         {
             _pendingInkAppends.Add((_page.Id, appendedInk));
@@ -7472,6 +7578,10 @@ public sealed partial class MainPage : Page
         }
         else
         {
+            // A structural edit makes every queued append redundant: the replacement frame is
+            // composed from the current page snapshot. In particular, an append undone before
+            // the render thread drains it must never be replayed into the retained overlay.
+            while (_pendingPageRenderAppends.TryDequeue(out _)) { }
             _requiresFullSave = true;
             _fullSaveVersion++;
         }
@@ -7485,12 +7595,10 @@ public sealed partial class MainPage : Page
             if (appendOnly)
                 _spatialIndex.Add(appendedObject!);
             else
-            {
-                _spatialIndex.Rebuild(_page.Objects);
-            }
+                _spatialIndex.Synchronize(_page.Objects);
             if (_spatialIndex.Count == _page.Objects.Count)
             {
-                _spatialIndexBuildCancellation?.Cancel();
+                CancelAndDispose(ref _spatialIndexBuildCancellation);
                 _pageSpatialIndexCache[_page.Id] = _spatialIndex;
                 TouchSpatialIndex(_page.Id);
             }
@@ -7506,11 +7614,19 @@ public sealed partial class MainPage : Page
         _saveTimer.Start();
         if (affectedPageIds is null)
         {
-            if (_page is not null) _pendingThumbnailRefreshPageIds.Add(_page.Id);
+            if (_page is not null)
+            {
+                _pendingSavePageIds.Add(_page.Id);
+                _pendingThumbnailRefreshPageIds.Add(_page.Id);
+            }
         }
         else
         {
-            foreach (var pageId in affectedPageIds) _pendingThumbnailRefreshPageIds.Add(pageId);
+            foreach (var pageId in affectedPageIds)
+            {
+                _pendingSavePageIds.Add(pageId);
+                _pendingThumbnailRefreshPageIds.Add(pageId);
+            }
         }
         _thumbnailRefreshTimer.Stop();
         _thumbnailRefreshTimer.Start();
@@ -7571,54 +7687,6 @@ public sealed partial class MainPage : Page
             RequestPageThumbnail(page, prioritize: true);
     }
 
-    private async void OnSaveTimerTick(DispatcherQueueTimer sender, object args)
-    {
-        if (_isPointerDown)
-        {
-            sender.Start();
-            return;
-        }
-        try
-        {
-            await SaveNowAsync();
-        }
-        catch (Exception exception)
-        {
-            ShowError("Autosave failed.", exception);
-        }
-    }
-
-    private async Task SaveNowAsync(CancellationToken cancellationToken = default)
-    {
-        if (_repository is null || !_hasUnsavedChanges) return;
-        await _saveGate.WaitAsync(cancellationToken);
-        try
-        {
-            var document = _document;
-            if (document is null || !_hasUnsavedChanges) return;
-            var editVersion = _editVersion;
-            var fullSaveVersion = _fullSaveVersion;
-            var appendSnapshot = _pendingInkAppends.ToArray();
-            var appendIds = appendSnapshot.Select(item => item.Stroke.Id).ToHashSet();
-            StatusText.Text = "Saving…";
-            var performedFullSave = _requiresFullSave;
-            if (!performedFullSave && appendSnapshot.Length > 0)
-                performedFullSave = !await RunRepositoryAsync(repository =>
-                    repository.SaveInkAppendsAsync(document, appendSnapshot, cancellationToken),
-                    cancellationToken);
-            if (performedFullSave)
-                await RunRepositoryAsync(repository =>
-                    repository.SaveAsync(document, cancellationToken), cancellationToken);
-
-            _pendingInkAppends.RemoveAll(item => appendIds.Contains(item.Stroke.Id));
-            if (performedFullSave && fullSaveVersion == _fullSaveVersion) _requiresFullSave = false;
-            if (editVersion == _editVersion)
-                _hasUnsavedChanges = false;
-            StatusText.Text = $"Saved {DateTime.Now:t}";
-        }
-        finally { _saveGate.Release(); }
-    }
-
     private void ScheduleRecognition(InkStrokeObject? appendedStroke)
     {
         // Recognition is incremental. Imported Samsung source ink can contain hundreds of
@@ -7648,8 +7716,7 @@ public sealed partial class MainPage : Page
         var strokes = _pendingRecognitionStrokes.ToArray();
         _pendingRecognitionStrokes.Clear();
         var language = _document.Settings.RecognitionLanguage;
-        _incrementalRecognitionCancellation?.Cancel();
-        var cancellation = _incrementalRecognitionCancellation = new CancellationTokenSource();
+        var cancellation = ReplaceCancellation(ref _incrementalRecognitionCancellation);
         try
         {
             // Windows Ink recognizer/container objects are context-bound WinRT objects. Keep
@@ -7694,9 +7761,9 @@ public sealed partial class MainPage : Page
         {
             if (_handwritingIndexDocumentId == document.Id &&
                 _handwritingIndexCancellation is { IsCancellationRequested: false }) return;
-            _handwritingIndexCancellation?.Cancel();
+            CancelAndDispose(ref _handwritingIndexCancellation);
         }
-        _handwritingIndexCancellation = new CancellationTokenSource();
+        _handwritingIndexCancellation = ReplaceCancellation(ref _handwritingIndexCancellation);
         _handwritingIndexDocumentId = document.Id;
         _handwritingIndexTask = IndexDocumentHandwritingAsync(document, _handwritingIndexCancellation.Token);
     }
@@ -9109,84 +9176,6 @@ public sealed partial class MainPage : Page
 
     private bool ShortcutTargetsTextInput() => FocusManager.GetFocusedElement(XamlRoot) is TextBox or AutoSuggestBox or NumberBox;
 
-    private async void OnSaveShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        await SaveNowAsync();
-        StatusText.Text = "Saved";
-        args.Handled = true;
-    }
-
-    private async void OnNewNotebookShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        await CreateDocumentAsync(DocumentKind.PagedNotebook, "Untitled notebook");
-        args.Handled = true;
-    }
-
-    private void OnImportShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        OnImportClick(sender, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnExportShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        OnExportClick(sender, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnAddPageShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        OnAddPageClick(sender, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnReadModeShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput()) return;
-        SetReadMode(!_readMode);
-        args.Handled = true;
-    }
-
-    private void OnGridShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        SetTemporaryGridVisible(!_temporaryGridVisible);
-        args.Handled = true;
-    }
-
-    private void OnDeleteSelectionShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        OnDeleteClick(sender, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnCopyShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        CopySelectionToClipboard();
-        args.Handled = true;
-    }
-
-    private void OnCutShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        OnCutClick(sender, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private async void OnPasteShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        await PasteSelectionAsync();
-        args.Handled = true;
-    }
-
     private async void OnGlobalKeyDown(object sender, KeyRoutedEventArgs args)
     {
         if (ShortcutTargetsTextInput()) return;
@@ -9263,6 +9252,7 @@ public sealed partial class MainPage : Page
                 ClearTextSelection();
                 _transformPreview = null;
                 _multiTransformPreviews.Clear();
+                _multiTransformPreviewObjects.Clear();
                 UpdateSelectionUi();
                 InvalidateCanvas();
             }
@@ -9347,41 +9337,6 @@ public sealed partial class MainPage : Page
         for (var current = element; current is not null; current = VisualTreeHelper.GetParent(current))
             if (ReferenceEquals(current, ancestor)) return true;
         return false;
-    }
-
-    private void OnEscapeShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (_readMode)
-        {
-            SetReadMode(false);
-            args.Handled = true;
-            return;
-        }
-        if (ShortcutTargetsTextInput()) return;
-        _selectedObject = null;
-        _selectedObjects.Clear();
-        _transformPreview = null;
-        _multiTransformPreviews.Clear();
-        UpdateSelectionUi();
-        InvalidateCanvas();
-        args.Handled = true;
-    }
-
-    private void OnToolShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        if (ShortcutTargetsTextInput() || _readMode) return;
-        var tool = sender.Key switch
-        {
-            VirtualKey.V => EditorTool.Select,
-            VirtualKey.P => EditorTool.Pen,
-            VirtualKey.E => EditorTool.StrokeEraser,
-            VirtualKey.T => EditorTool.Text,
-            VirtualKey.H => EditorTool.Highlighter,
-            VirtualKey.L => EditorTool.Lasso,
-            _ => EditorTool.Select
-        };
-        ActivateTool(tool);
-        args.Handled = true;
     }
 
     private async void OnSaveCurrentInkPresetClick(object sender, RoutedEventArgs e) =>
@@ -9778,6 +9733,7 @@ public sealed partial class MainPage : Page
             SyncPageCollection(_page?.Id);
         }
         RebindSelectionAfterHistoryChange();
+        PrepareHistoryRenderCorrection();
         OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
     }
 
@@ -9792,7 +9748,45 @@ public sealed partial class MainPage : Page
             SyncPageCollection(_page?.Id);
         }
         RebindSelectionAfterHistoryChange();
+        PrepareHistoryRenderCorrection();
         OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
+    }
+
+    private void PrepareHistoryRenderCorrection()
+    {
+        if (_page is null) return;
+
+        var affectedObjects = _history.LastAffectedCanvasObjects
+            .Where(item => item.PageId == _page.Id)
+            .ToArray();
+        if (affectedObjects.Length == 0) return;
+        var affectedObjectIds = affectedObjects.Select(item => item.Object.Id).ToHashSet();
+
+        // A just-committed stroke can still be owned by the interaction surface for a frame.
+        // Remove previews belonging to this command before an undone or superseded object can
+        // replay above the correction. Unrelated recent strokes are deliberately untouched.
+        _pendingInkCommitPreviews.RemoveAll(preview => affectedObjectIds.Contains(preview.Object.Id));
+        Volatile.Write(ref _inkPreviewCommitVersion,
+            _pendingInkCommitPreviews.Count == 0
+                ? -1
+                : _pendingInkCommitPreviews.Max(item => item.Version));
+
+        RectD? correctionBounds = null;
+        foreach (var affected in affectedObjects)
+        {
+            var bounds = StrokeGeometry.GetWorldBounds(affected.Object);
+            if (!bounds.IsFinite) continue;
+            correctionBounds = correctionBounds is { } existing
+                ? existing.Union(bounds)
+                : bounds;
+        }
+        if (correctionBounds is not { } correction) return;
+
+        // The retained page remains a sharp fallback while its corrected replacement builds.
+        // Redraw only this command's visual delta above it, making undo/redo immediate without
+        // replaying the full page or disturbing unrelated recent strokes.
+        AddEraseDirtyRegion(correction.Inflate(Math.Max(2, 3 / Math.Max(_zoom, 0.08))));
+        Volatile.Write(ref _erasePreviewCommitVersion, _editVersion + 1);
     }
 
     private void RebindSelectionAfterHistoryChange()
@@ -10767,8 +10761,7 @@ public sealed partial class MainPage : Page
     private async void OnSearchTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
     {
         if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput) return;
-        _searchDebounce?.Cancel();
-        _searchDebounce = new CancellationTokenSource();
+        var searchDebounce = ReplaceCancellation(ref _searchDebounce);
         var query = sender.Text.Trim();
         if (query.Length == 0)
         {
@@ -10779,7 +10772,7 @@ public sealed partial class MainPage : Page
         }
         try
         {
-            await Task.Delay(100, _searchDebounce.Token);
+            await Task.Delay(100, searchDebounce.Token);
             var searchStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             DiagnosticsLog.Info("search.started", ("query_length", query.Length));
             var normalizedQuery = NormalizeSearchText(query);
@@ -10820,32 +10813,6 @@ public sealed partial class MainPage : Page
         if (normalizedQuery.Length < 4) return 0;
         var fuzzy = FuzzyScore(normalizedQuery, normalizedCandidate);
         return fuzzy >= 560 ? fuzzy : 0;
-    }
-
-    private IEnumerable<SearchResult> BuildFuzzySearchResults(string query)
-    {
-        foreach (var summary in _allDocuments
-                     .Select(item => (Item: item, Score: FuzzyScore(query, item.Title)))
-                     .Where(item => item.Score > 0)
-                     .OrderByDescending(item => item.Score))
-        {
-            yield return new SearchResult(summary.Item.Id, null, summary.Item.Title, "Notebook",
-                "Notebook title", "fuzzy title");
-        }
-
-        foreach (var document in _openDocumentCache.Values)
-        foreach (var page in document.Pages)
-        {
-            var typed = string.Join(' ', page.Objects.OfType<RichTextObject>().Select(item => item.Content.PlainText));
-            var searchableBody = string.Join(' ', new[] { typed, page.RecognizedText }
-                .Where(value => !string.IsNullOrWhiteSpace(value)));
-            var titleScore = FuzzyScore(query, page.Title);
-            var bodyScore = FuzzyScore(query, searchableBody);
-            if (titleScore <= 0 && bodyScore <= 0) continue;
-            yield return new SearchResult(document.Id, page.Id, document.Title, page.Title,
-                bodyScore > 0 ? FuzzySearchSnippet(searchableBody, query) : "Page title",
-                bodyScore > 0 ? "live text" : "fuzzy page title");
-        }
     }
 
     private static int SearchResultRelevance(string query, SearchResult result)
@@ -10952,7 +10919,7 @@ public sealed partial class MainPage : Page
         _pendingSearchFlashQuery = null;
         if (BeginSearchFlash(query)) return;
         PauseBackgroundRecognition();
-        var cancellation = _searchLocateCancellation = new CancellationTokenSource();
+        var cancellation = ReplaceCancellation(ref _searchLocateCancellation);
         try
         {
             await LocateAndFlashSearchMatchAsync(query, cancellation.Token);
@@ -11225,8 +11192,8 @@ public sealed partial class MainPage : Page
     private void PauseBackgroundRecognition()
     {
         _recognitionTimer.Stop();
-        _incrementalRecognitionCancellation?.Cancel();
-        _handwritingIndexCancellation?.Cancel();
+        CancelAndDispose(ref _incrementalRecognitionCancellation);
+        CancelAndDispose(ref _handwritingIndexCancellation);
     }
 
     private void ResumeBackgroundRecognition()
@@ -11269,10 +11236,26 @@ public sealed partial class MainPage : Page
     private static bool IsControlDown() =>
         (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control) & CoreVirtualKeyStates.Down) != 0;
 
+    private static CancellationTokenSource ReplaceCancellation(ref CancellationTokenSource? target)
+    {
+        var replacement = new CancellationTokenSource();
+        var previous = Interlocked.Exchange(ref target, replacement);
+        previous?.Cancel();
+        previous?.Dispose();
+        return replacement;
+    }
+
+    private static void CancelAndDispose(ref CancellationTokenSource? target)
+    {
+        var previous = Interlocked.Exchange(ref target, null);
+        previous?.Cancel();
+        previous?.Dispose();
+    }
+
     private int NextZIndex() => _page?.Objects.Count switch
     {
         null or 0 => 0,
-        _ => _page.Objects[^1].ZIndex + 1
+        _ => _page.Objects.Max(item => item.ZIndex) + 1
     };
 
     private RectD CombinedSelectionBounds()
@@ -11284,11 +11267,22 @@ public sealed partial class MainPage : Page
 
     private static RectD CombinedBounds(IEnumerable<CanvasObject> objects)
     {
-        var bounds = objects.Select(StrokeGeometry.GetWorldBounds).ToArray();
-        if (bounds.Length == 0) return default;
-        return new RectD(bounds.Min(item => item.Left), bounds.Min(item => item.Top),
-            bounds.Max(item => item.Right) - bounds.Min(item => item.Left),
-            bounds.Max(item => item.Bottom) - bounds.Min(item => item.Top));
+        using var iterator = objects.GetEnumerator();
+        if (!iterator.MoveNext()) return default;
+        var first = StrokeGeometry.GetWorldBounds(iterator.Current);
+        var minX = first.Left;
+        var minY = first.Top;
+        var maxX = first.Right;
+        var maxY = first.Bottom;
+        while (iterator.MoveNext())
+        {
+            var bounds = StrokeGeometry.GetWorldBounds(iterator.Current);
+            minX = Math.Min(minX, bounds.Left);
+            minY = Math.Min(minY, bounds.Top);
+            maxX = Math.Max(maxX, bounds.Right);
+            maxY = Math.Max(maxY, bounds.Bottom);
+        }
+        return new RectD(minX, minY, maxX - minX, maxY - minY);
     }
 
     private void SetInkColor(string color, bool rememberForTool = true)
@@ -11331,9 +11325,8 @@ public sealed partial class MainPage : Page
     private void ScheduleUserPreferencesSave()
     {
         if (_userSettingsStore is null) return;
-        _settingsSaveDebounce?.Cancel();
-        _settingsSaveDebounce = new CancellationTokenSource();
-        _ = SaveUserPreferencesAfterPauseAsync(_settingsSaveDebounce.Token);
+        var settingsSave = ReplaceCancellation(ref _settingsSaveDebounce);
+        _ = SaveUserPreferencesAfterPauseAsync(settingsSave.Token);
     }
 
     private async Task SaveUserPreferencesAfterPauseAsync(CancellationToken cancellationToken)
@@ -11564,7 +11557,7 @@ public sealed partial class MainPage : Page
 
     private void ResetInteractionCachesForDocumentSwitch()
     {
-        _spatialIndexBuildCancellation?.Cancel();
+        CancelAndDispose(ref _spatialIndexBuildCancellation);
         _pageSpatialIndexCache.Clear();
         _pageSpatialIndexLru.Clear();
         _spatialIndex = new SpatialIndex();
@@ -11574,10 +11567,7 @@ public sealed partial class MainPage : Page
 
     private void PrepareSpatialIndex(NotePage? page)
     {
-        if (_spatialIndexBuildCancellation is { } previousBuild)
-        {
-            previousBuild.Cancel();
-        }
+        CancelAndDispose(ref _spatialIndexBuildCancellation);
         if (page is null)
         {
             _spatialIndex = new SpatialIndex();
@@ -11595,7 +11585,7 @@ public sealed partial class MainPage : Page
         var pageId = page.Id;
         var updatedAt = page.UpdatedAt;
         var snapshot = page.Objects.ToArray();
-        var cancellation = _spatialIndexBuildCancellation = new CancellationTokenSource();
+        var cancellation = ReplaceCancellation(ref _spatialIndexBuildCancellation);
         _ = Task.Run(() =>
         {
             cancellation.Token.ThrowIfCancellationRequested();
@@ -11673,19 +11663,20 @@ public sealed partial class MainPage : Page
     {
         _preloadedFallbackPageId = null;
         CancelPendingLowZoomPageRasterCore();
-        if (preserveSharpFallback) PreserveNavigationTilesAsFallbackCore();
-        else ClearNavigationTileCacheCore();
         var publishedPage = Volatile.Read(ref _publishedPageRenderState).Page;
         // Append-only ink can live solely in overlay batches while the dense page raster remains
-        // untouched. Fold those completed strokes into the fallback before a move/erase clears
-        // the overlays, so a structural edit cannot temporarily resurrect an older page image.
-        if (publishedPage is not null &&
-            _lowZoomPageRaster is not null &&
-            _lowZoomPageRasterPageId == publishedPage.Id &&
+        // untouched. Fold those completed strokes into every retained fallback before a
+        // structural edit clears the overlays. Native tiles matter here: the first undo after a
+        // drawing session otherwise removes all session strokes until replacement tiles finish.
+        if (preserveSharpFallback && publishedPage is not null &&
             (_pageRenderOverlayBatches.Count > 0 || _pageRenderOverlays.Count > 0))
         {
-            MergeOverlaysIntoLowZoomRaster(publishedPage);
+            MergeOverlaysIntoNavigationTiles(publishedPage);
+            if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == publishedPage.Id)
+                MergeOverlaysIntoLowZoomRaster(publishedPage);
         }
+        if (preserveSharpFallback) PreserveNavigationTilesAsFallbackCore();
+        else ClearNavigationTileCacheCore();
         if (_lowZoomPageRasterPageId is { } invalidatedPageId &&
             _standbyLowZoomPageRasterPageId == invalidatedPageId)
         {
@@ -11983,7 +11974,9 @@ public sealed partial class MainPage : Page
             };
             _styleBrushOriginals[target.Id] = target;
             _multiTransformPreviews[target.Id] = updated;
+            _styleBrushPreviewObjects.Add(updated);
         }
+        CanvasObjectOrdering.SortStable(_styleBrushPreviewObjects);
         if (_styleBrushOriginals.Count > 0)
             StatusText.Text = $"Style brush • {_styleBrushOriginals.Count} object(s)";
     }
@@ -12126,7 +12119,7 @@ public sealed partial class MainPage : Page
         if (sender is not ToolTip toolTip) return;
         CloseOpenToolTip();
         _openToolTip = toolTip;
-        var cancellation = _toolTipCloseCancellation = new CancellationTokenSource();
+        var cancellation = ReplaceCancellation(ref _toolTipCloseCancellation);
         try
         {
             await Task.Delay(1_600, cancellation.Token);
@@ -12144,8 +12137,7 @@ public sealed partial class MainPage : Page
 
     private void CloseOpenToolTip()
     {
-        _toolTipCloseCancellation?.Cancel();
-        _toolTipCloseCancellation = null;
+        CancelAndDispose(ref _toolTipCloseCancellation);
         if (_openToolTip is { } toolTip)
         {
             _openToolTip = null;

@@ -60,50 +60,29 @@ public static class StrokeGeometry
         return result;
     }
 
-    public static IReadOnlyList<InkPoint> Smooth(IReadOnlyList<InkPoint> points, int passes = 2)
-    {
-        if (points.Count < 3 || passes <= 0) return points.ToArray();
-
-        IReadOnlyList<InkPoint> current = points;
-        for (var pass = 0; pass < passes; pass++)
-        {
-            var result = new List<InkPoint>(current.Count * 2) { current[0] };
-            for (var index = 0; index < current.Count - 1; index++)
-            {
-                var left = current[index];
-                var right = current[index + 1];
-                result.Add(Interpolate(left, right, 0.25));
-                result.Add(Interpolate(left, right, 0.75));
-            }
-
-            result.Add(current[^1]);
-            current = result;
-        }
-
-        return current;
-    }
-
     public static RectD GetWorldBounds(CanvasObject canvasObject)
     {
         var local = canvasObject.LocalBounds;
-        var corners = new[]
-        {
-            new PointD(local.Left, local.Top),
-            new PointD(local.Right, local.Top),
-            new PointD(local.Right, local.Bottom),
-            new PointD(local.Left, local.Bottom)
-        }.Select(canvasObject.Transform.Apply);
-        return RectD.FromPoints(corners);
+        var topLeft = canvasObject.Transform.Apply(new PointD(local.Left, local.Top));
+        var topRight = canvasObject.Transform.Apply(new PointD(local.Right, local.Top));
+        var bottomRight = canvasObject.Transform.Apply(new PointD(local.Right, local.Bottom));
+        var bottomLeft = canvasObject.Transform.Apply(new PointD(local.Left, local.Bottom));
+        var minX = Math.Min(Math.Min(topLeft.X, topRight.X), Math.Min(bottomRight.X, bottomLeft.X));
+        var minY = Math.Min(Math.Min(topLeft.Y, topRight.Y), Math.Min(bottomRight.Y, bottomLeft.Y));
+        var maxX = Math.Max(Math.Max(topLeft.X, topRight.X), Math.Max(bottomRight.X, bottomLeft.X));
+        var maxY = Math.Max(Math.Max(topLeft.Y, topRight.Y), Math.Max(bottomRight.Y, bottomLeft.Y));
+        return new RectD(minX, minY, maxX - minX, maxY - minY);
+    }
+
+    public static double LinearScale(Transform2D transform)
+    {
+        var areaScale = Math.Abs(transform.M11 * transform.M22 - transform.M12 * transform.M21);
+        return double.IsFinite(areaScale) && areaScale > 0 ? Math.Sqrt(areaScale) : 1;
     }
 
     public static double EffectiveWorldWidth(InkStrokeObject stroke)
     {
-        var transform = stroke.Transform;
-        var areaScale = Math.Abs(transform.M11 * transform.M22 - transform.M12 * transform.M21);
-        var linearScale = double.IsFinite(areaScale) && areaScale > 0
-            ? Math.Sqrt(areaScale)
-            : 1;
-        return stroke.Style.Normalize().Width * linearScale;
+        return stroke.Style.Normalize().Width * LinearScale(stroke.Transform);
     }
 
     public static bool HitTest(CanvasObject canvasObject, PointD worldPoint, double tolerance = 8)
@@ -111,10 +90,11 @@ public static class StrokeGeometry
         if (!Matrix3x2.Invert(canvasObject.Transform.ToMatrix(), out var inverse)) return false;
         var localVector = Vector2.Transform(worldPoint.ToVector2(), inverse);
         var localPoint = new PointD(localVector.X, localVector.Y);
+        var localTolerance = tolerance / LinearScale(canvasObject.Transform);
 
         if (canvasObject is InkStrokeObject stroke)
         {
-            var radius = tolerance + stroke.Style.Width / 2d;
+            var radius = localTolerance + stroke.Style.Width / 2d;
             for (var index = 1; index < stroke.Points.Count; index++)
             {
                 if (DistanceToSegment(localPoint.ToVector2(), stroke.Points[index - 1].Position.ToVector2(),
@@ -128,7 +108,7 @@ public static class StrokeGeometry
                    Vector2.Distance(localPoint.ToVector2(), stroke.Points[0].Position.ToVector2()) <= radius;
         }
 
-        return canvasObject.LocalBounds.Inflate(tolerance).Contains(localPoint);
+        return canvasObject.LocalBounds.Inflate(localTolerance).Contains(localPoint);
     }
 
     public static double DistanceToSegment(Vector2 point, Vector2 start, Vector2 end)
@@ -160,11 +140,4 @@ public static class StrokeGeometry
         return t is >= 0 and <= 1 && u is >= 0 and <= 1;
     }
 
-    private static InkPoint Interpolate(InkPoint left, InkPoint right, double amount) => new(
-        left.X + (right.X - left.X) * amount,
-        left.Y + (right.Y - left.Y) * amount,
-        (float)(left.Pressure + (right.Pressure - left.Pressure) * amount),
-        (float)(left.TiltX + (right.TiltX - left.TiltX) * amount),
-        (float)(left.TiltY + (right.TiltY - left.TiltY) * amount),
-        (long)(left.TimestampMicroseconds + (right.TimestampMicroseconds - left.TimestampMicroseconds) * amount));
 }

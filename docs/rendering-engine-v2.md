@@ -30,8 +30,9 @@ delivered to the UI thread. Samples are filtered below a sub-pixel distance to a
 that cannot affect the displayed result.
 
 The active stroke uses an incremental viewport-sized mask. Only newly received segments
-are appended. The completed stroke is then stabilized once, stored as vector data, and
-rendered through the dry-ink path. This follows the wet/dry split described by the Windows
+are appended. The completed raw samples remain the vector source of truth; the dry-ink path
+fits and filters its render geometry without destructively rewriting those authored samples.
+This follows the wet/dry split described by the Windows
 Ink architecture while retaining HoomNote's custom vector model.
 
 ### 3. One display-synchronized frame clock
@@ -46,7 +47,8 @@ frames.
 ### 4. Native-resolution navigation snapshot
 
 Normal zooming and panning draw one retained page snapshot. Its resolution is selected
-from a strict 24 MiB budget and is capped at 3 source pixels per page DIP.
+from a strict 24 MiB budget, may fall below one source pixel per DIP for unusually large
+pages, and is capped at 3 source pixels per page DIP.
 
 The renderer accounts for both viewport zoom and monitor DPI before using the snapshot:
 
@@ -77,12 +79,17 @@ content and produced the worst behavior at intermediate zoom levels.
 
 - Current page navigation snapshot: 24 MiB maximum.
 - One warm page snapshot: 24 MiB maximum.
+- Navigation tiles and retained correction fallbacks: 32 MiB working-set budget.
+- Adjacent-page previews: adaptive 24-64 MiB budget based on the OS app-memory limit.
+- Focused PDF preview cache: 24 MiB and at most two pages.
 - Decoded image cache: 24 MiB maximum.
 - Ink geometry cache: 2,048 strokes or 180,000 source points.
 - Open document cache: one inactive document, capped by source-point count.
 
-All native resources are disposed on invalidation, page removal, device reset, and app
-shutdown. No additional renderer runtime is bundled.
+The aggregate worst-case renderer budget is therefore approximately 192 MiB before small
+bookkeeping structures, and it contracts on low-memory systems. All native resources are
+disposed on invalidation, page removal, device reset, and app shutdown. No additional
+renderer runtime is bundled.
 
 ### 7. Instrumentation
 
@@ -128,4 +135,3 @@ The renderer is considered healthy when:
 - the snapshot is never displayed below native screen resolution;
 - pen input never waits for autosave, OCR, thumbnails, or indexing;
 - caches remain within their explicit budgets after repeated page and notebook switches.
-

@@ -25,7 +25,13 @@ public interface IDocumentRepository : IAsyncDisposable
     Task InitializeAsync(CancellationToken cancellationToken = default);
     Task<IReadOnlyList<DocumentSummary>> ListAsync(CancellationToken cancellationToken = default);
     Task<HoomNoteDocument?> LoadAsync(Guid documentId, CancellationToken cancellationToken = default);
+    Task<HoomNoteDocument?> LoadForEditingAsync(Guid documentId, Guid? preferredPageId = null,
+        CancellationToken cancellationToken = default);
+    Task<NotePage?> LoadPageAsync(Guid pageId, CancellationToken cancellationToken = default);
     Task SaveAsync(HoomNoteDocument document, CancellationToken cancellationToken = default);
+    Task SavePagesAsync(HoomNoteDocument document, IReadOnlyCollection<Guid> dirtyPageIds,
+        CancellationToken cancellationToken = default);
+    Task RenameAsync(Guid documentId, string title, CancellationToken cancellationToken = default);
     Task DeleteAsync(Guid documentId, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<SearchResult>> SearchAsync(string query, CancellationToken cancellationToken = default);
 }

@@ -10,7 +10,7 @@ public sealed class RenderScalePolicyTests
         const long budget = 24L * 1024 * 1024;
         var scale = RenderScalePolicy.ComputeSnapshotScale(816, 1056, budget);
 
-        Assert.InRange(scale, 1, 3);
+        Assert.InRange(scale, 1d / 16d, 3);
         Assert.True(RenderScalePolicy.EstimateSnapshotBytes(816, 1056, scale) <=
                     budget + 4 * 2048);
     }
@@ -33,10 +33,20 @@ public sealed class RenderScalePolicyTests
     [Fact]
     public void InvalidInputsFailSafe()
     {
-        Assert.Equal(1, RenderScalePolicy.ComputeSnapshotScale(double.NaN, 100, 1024));
+        Assert.Equal(1d / 16d, RenderScalePolicy.ComputeSnapshotScale(double.NaN, 100, 1024));
         Assert.False(RenderScalePolicy.HasNativeDisplayResolution(2, 1, 0));
         Assert.Equal(0, RenderScalePolicy.EstimateSnapshotBytes(-1, 100, 2));
         Assert.Equal(1, RenderScalePolicy.ComputeNativeTileScale(double.NaN, 96));
+    }
+
+    [Fact]
+    public void OversizedPageCanScaleBelowOneToHonorSnapshotBudget()
+    {
+        const long budget = 24L * 1024 * 1024;
+        var scale = RenderScalePolicy.ComputeSnapshotScale(3000, 3000, budget);
+
+        Assert.True(scale < 1);
+        Assert.True(RenderScalePolicy.EstimateSnapshotBytes(3000, 3000, scale) <= budget + 24_000);
     }
 
     [Theory]

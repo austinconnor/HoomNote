@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using HoomNote.Canvas.Geometry;
 using HoomNote.Canvas.Interaction;
 using HoomNote.Canvas.Rendering;
@@ -10,6 +11,52 @@ namespace HoomNote.Core.Tests;
 
 public sealed class GeometryAndEditingTests
 {
+    [Fact]
+    public void InkPointRemainsCompactForDenseImportedPages() =>
+        Assert.True(Marshal.SizeOf<InkPoint>() <= 24);
+
+    [Fact]
+    public void HitTestingAndErasingCompensateForObjectScale()
+    {
+        var stroke = new InkStrokeObject
+        {
+            Points = [new InkPoint(0, 0), new InkPoint(100, 0)],
+            Style = new InkStyle { Width = 2, PressureEnabled = false },
+            Transform = Transform2D.Scale(2, 2, new PointD(0, 0))
+        };
+
+        Assert.False(StrokeGeometry.HitTest(stroke, new PointD(100, 9), 4));
+        var erased = SegmentEraser.Erase(stroke, [new PointD(100, 9)], 4);
+        Assert.Same(stroke, Assert.Single(erased));
+    }
+
+    [Fact]
+    public void SpatialIndexRejectsNonFiniteBoundsWithoutEnumeratingCells()
+    {
+        var index = new SpatialIndex();
+        index.Add(new ShapeObject { Bounds = new RectD(double.PositiveInfinity, 0, 10, 10) });
+
+        Assert.Equal(0, index.Count);
+        Assert.Empty(index.Query(new RectD(0, 0, 100, 100)));
+        Assert.Empty(index.Query(new RectD(double.NaN, 0, 100, 100)));
+    }
+
+    [Fact]
+    public void EqualZIndexObjectsKeepAuthoredOrderAcrossReplacement()
+    {
+        var document = HoomNoteDocument.Create("Stable order");
+        var page = new NotePage();
+        document.Pages.Add(page);
+        var first = new ShapeObject { ZIndex = 0 };
+        var second = new ShapeObject { ZIndex = 0 };
+        var replacement = new ShapeObject { ZIndex = 0 };
+        page.Objects.AddRange([first, second]);
+
+        new ReplaceObjectsCommand(page.Id, [second], [replacement], "replace").Execute(document);
+
+        Assert.Equal([first.Id, replacement.Id], page.Objects.Select(item => item.Id));
+    }
+
     [Theory]
     [InlineData(false, 0, 0, false)]
     [InlineData(false, 0.5, 0.5, false)]
@@ -350,6 +397,27 @@ public sealed class GeometryAndEditingTests
         history.Redo(document);
         Assert.Single(page.Objects);
         Assert.Equal([page.Id], history.LastAffectedPageIds);
+    }
+
+    [Fact]
+    public void CommandHistory_UndoReportsOnlyTheLastCommandsVisualObjects()
+    {
+        var document = HoomNoteDocument.Create("Visual undo delta");
+        var page = new NotePage();
+        document.Pages.Add(page);
+        document.Sections[0].PageIds.Add(page.Id);
+        var first = new InkStrokeObject { Points = [new InkPoint(0, 0), new InkPoint(10, 10)] };
+        var second = new InkStrokeObject { Points = [new InkPoint(100, 100), new InkPoint(110, 110)] };
+        var history = new CommandHistory();
+        history.Execute(new AddObjectCommand(page.Id, first), document);
+        history.Execute(new AddObjectCommand(page.Id, second), document);
+
+        Assert.True(history.Undo(document));
+
+        var affected = Assert.Single(history.LastAffectedCanvasObjects);
+        Assert.Equal(page.Id, affected.PageId);
+        Assert.Same(second, affected.Object);
+        Assert.Same(first, Assert.Single(page.Objects));
     }
 
     [Fact]

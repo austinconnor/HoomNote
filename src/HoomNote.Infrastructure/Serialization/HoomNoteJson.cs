@@ -5,12 +5,19 @@ namespace HoomNote.Infrastructure.Serialization;
 
 public static class HoomNoteJson
 {
-    public static JsonSerializerOptions Options { get; } = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = false
-    };
-}
+    public static JsonSerializerOptions Options { get; } = CreateOptions();
 
+    private static JsonSerializerOptions CreateOptions()
+    {
+        var options = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            WriteIndented = false
+        };
+        options.Converters.Add(new InkPointJsonConverter());
+        options.TypeInfoResolverChain.Insert(0, new HoomNoteJsonContext(options));
+        return options;
+    }
+}

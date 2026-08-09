@@ -10,18 +10,50 @@ public enum InkToolKind
 // Samples are immutable values, not identity-bearing objects. Keeping them inline in List<T>
 // removes one managed object plus one reference per sample (hundreds of thousands on imported
 // pages), substantially lowering GC pressure and improving sequential geometry traversal.
-public readonly record struct InkPoint(
-    double X,
-    double Y,
-    float Pressure = 0.5f,
-    float TiltX = 0,
-    float TiltY = 0,
-    long TimestampMicroseconds = 0)
+public readonly record struct InkPoint
 {
+    private readonly float _x;
+    private readonly float _y;
+    private readonly uint _timestampMicroseconds;
+
+    public double X
+    {
+        get => _x;
+        init => _x = double.IsFinite(value) ? (float)value : 0;
+    }
+
+    public double Y
+    {
+        get => _y;
+        init => _y = double.IsFinite(value) ? (float)value : 0;
+    }
+
+    public float Pressure { get; init; }
+    public float TiltX { get; init; }
+    public float TiltY { get; init; }
+    public long TimestampMicroseconds
+    {
+        get => _timestampMicroseconds;
+        init => _timestampMicroseconds = (uint)Math.Clamp(value, 0, uint.MaxValue);
+    }
+
+    public InkPoint(double X, double Y, float Pressure = 0.5f, float TiltX = 0, float TiltY = 0,
+        long TimestampMicroseconds = 0)
+    {
+        _x = double.IsFinite(X) ? (float)X : 0;
+        _y = double.IsFinite(Y) ? (float)Y : 0;
+        this.Pressure = Pressure;
+        this.TiltX = TiltX;
+        this.TiltY = TiltY;
+        _timestampMicroseconds = (uint)Math.Clamp(TimestampMicroseconds, 0, uint.MaxValue);
+    }
+
     public PointD Position => new(X, Y);
 
     public InkPoint Normalize() => this with
     {
+        X = double.IsFinite(X) ? X : 0,
+        Y = double.IsFinite(Y) ? Y : 0,
         Pressure = Math.Clamp(float.IsFinite(Pressure) ? Pressure : 0.5f, 0.01f, 1f),
         TiltX = Math.Clamp(float.IsFinite(TiltX) ? TiltX : 0, -90, 90),
         TiltY = Math.Clamp(float.IsFinite(TiltY) ? TiltY : 0, -90, 90)
@@ -31,6 +63,7 @@ public readonly record struct InkPoint(
 public sealed record InkStyle
 {
     public const float DefaultHighlighterOpacity = 0.60f;
+    public const float HighlighterCompositingStrength = 0.76f;
 
     public InkToolKind Tool { get; init; } = InkToolKind.Pen;
     public string Color { get; init; } = "#111111";

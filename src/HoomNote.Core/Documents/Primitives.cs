@@ -16,6 +16,16 @@ public readonly record struct RectD(double X, double Y, double Width, double Hei
     public double Right => X + Width;
     public double Bottom => Y + Height;
     public PointD Center => new(X + Width / 2d, Y + Height / 2d);
+    public bool IsFinite => double.IsFinite(X) && double.IsFinite(Y) &&
+                            double.IsFinite(Width) && double.IsFinite(Height);
+
+    public PointD[] Corners() =>
+    [
+        new(Left, Top),
+        new(Right, Top),
+        new(Right, Bottom),
+        new(Left, Bottom)
+    ];
 
     public bool Contains(PointD point) =>
         point.X >= Left && point.X <= Right && point.Y >= Top && point.Y <= Bottom;
@@ -25,6 +35,17 @@ public readonly record struct RectD(double X, double Y, double Width, double Hei
 
     public RectD Inflate(double amount) =>
         new(X - amount, Y - amount, Width + amount * 2d, Height + amount * 2d);
+
+    public RectD Union(RectD other)
+    {
+        var left = Math.Min(Left, other.Left);
+        var top = Math.Min(Top, other.Top);
+        return new RectD(
+            left,
+            top,
+            Math.Max(Right, other.Right) - left,
+            Math.Max(Bottom, other.Bottom) - top);
+    }
 
     public static RectD FromPoints(IEnumerable<PointD> points)
     {

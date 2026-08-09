@@ -12,6 +12,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 
     private const int AppendJournalCompactionRowLimit = 128;
     private const long AppendJournalCompactionByteLimit = 8L * 1024 * 1024;
+    private const int CurrentDatabaseVersion = 2;
     private static int _providerInitialized;
     private readonly SqliteConnection _connection;
     private bool _ftsEnabled;
@@ -19,14 +20,13 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
     public SqliteDocumentRepository(string databasePath)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(databasePath))!);
-        if (Interlocked.Exchange(ref _providerInitialized, 1) == 0)
-            SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
+        EnsureProviderInitialized();
 
         _connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared,
+            Cache = SqliteCacheMode.Private,
             Pooling = false
         }.ToString());
     }
@@ -58,12 +58,6 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                 updated_utc TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_pages_document_ordinal ON pages(document_id, ordinal);
-            CREATE TABLE IF NOT EXISTS command_journal (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                created_utc TEXT NOT NULL,
-                description TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS ink_append_journal (
                 page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
                 object_id TEXT NOT NULL,
@@ -88,7 +82,15 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             );
             """, cancellationToken);
 
-        await EnsureRecognizedRegionsColumnAsync(cancellationToken);
+        var databaseVersion = await GetDatabaseVersionAsync(cancellationToken);
+        if (databaseVersion > CurrentDatabaseVersion)
+            throw new InvalidDataException(
+                $"This HoomNote library was created by a newer database version ({databaseVersion}).");
+        if (databaseVersion < 1)
+            await EnsureRecognizedRegionsColumnAsync(cancellationToken);
+        if (databaseVersion < 2)
+            await ExecuteAsync("DROP TABLE IF EXISTS command_journal;", cancellationToken);
+        await ExecuteAsync($"PRAGMA user_version={CurrentDatabaseVersion};", cancellationToken);
 
         try
         {
@@ -184,40 +186,19 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         pageCommand.CommandText = "SELECT CAST(page_json AS BLOB), recognized_text, recognized_regions_json, updated_utc FROM pages WHERE document_id = $id ORDER BY ordinal;";
         pageCommand.Parameters.AddWithValue("$id", documentId.ToString("D"));
         await using var pageReader = await pageCommand.ExecuteReaderAsync(cancellationToken);
-        var serializedPages = new List<(byte[] PageJson, string RecognizedText,
-            string RecognizedRegionsJson, string UpdatedAt)>();
+        var pages = new List<NotePage>();
         while (await pageReader.ReadAsync(cancellationToken))
         {
-            serializedPages.Add((
-                pageReader.GetFieldValue<byte[]>(0),
-                pageReader.GetString(1),
-                pageReader.GetString(2),
-                pageReader.GetString(3)));
+            cancellationToken.ThrowIfCancellationRequested();
+            var page = Deserialize<NotePage>(pageReader.GetFieldValue<byte[]>(0));
+            if (page is null) continue;
+            page.RecognizedText = pageReader.GetString(1);
+            page.RecognizedRegions = Deserialize<List<RecognizedTextRegion>>(pageReader.GetString(2)) ?? [];
+            if (DateTimeOffset.TryParse(pageReader.GetString(3), out var pageUpdatedAt))
+                page.UpdatedAt = pageUpdatedAt;
+            pages.Add(page);
         }
         await pageReader.DisposeAsync();
-
-        var pages = await Task.Run(() =>
-        {
-            var results = new NotePage?[serializedPages.Count];
-            Parallel.For(0, serializedPages.Count, new ParallelOptions
-            {
-                CancellationToken = cancellationToken,
-                MaxDegreeOfParallelism = Math.Min(4, Math.Max(1, Environment.ProcessorCount))
-            }, index =>
-            {
-                var serializedPage = serializedPages[index];
-                var page = Deserialize<NotePage>(serializedPage.PageJson);
-                if (page is null) return;
-                page.RecognizedText = serializedPage.RecognizedText;
-                page.RecognizedRegions =
-                    Deserialize<List<RecognizedTextRegion>>(serializedPage.RecognizedRegionsJson) ?? [];
-                if (DateTimeOffset.TryParse(serializedPage.UpdatedAt, out var pageUpdatedAt))
-                    page.UpdatedAt = pageUpdatedAt;
-                results[index] = page;
-            });
-            return results.OfType<NotePage>().ToList();
-        }, cancellationToken);
-        serializedPages.Clear();
         document.Pages.AddRange(pages);
 
         if (document.Pages.Count > 0)
@@ -254,7 +235,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
                         page.Objects.Add(canvasObject);
                 }
                 foreach (var page in document.Pages)
-                    page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+                    CanvasObjectOrdering.SortStable(page.Objects);
             }, cancellationToken);
             serializedAppends.Clear();
         }
@@ -367,7 +348,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             var canvasObject = Deserialize<CanvasObject>(appendReader.GetFieldValue<byte[]>(0));
             if (canvasObject is not null && objectIds.Add(canvasObject.Id)) page.Objects.Add(canvasObject);
         }
-        page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        CanvasObjectOrdering.SortStable(page.Objects);
         return page;
     }
 
@@ -427,7 +408,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             if (canvasObject is not null && page.Objects.All(item => item.Id != canvasObject.Id))
                 page.Objects.Add(canvasObject);
         }
-        page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        CanvasObjectOrdering.SortStable(page.Objects);
         return page;
     }
 
@@ -526,6 +507,14 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
     }
 
     public async Task SaveAsync(HoomNoteDocument document, CancellationToken cancellationToken = default)
+        => await SaveCoreAsync(document, null, cancellationToken);
+
+    public async Task SavePagesAsync(HoomNoteDocument document, IReadOnlyCollection<Guid> dirtyPageIds,
+        CancellationToken cancellationToken = default)
+        => await SaveCoreAsync(document, dirtyPageIds.ToHashSet(), cancellationToken);
+
+    private async Task SaveCoreAsync(HoomNoteDocument document, HashSet<Guid>? dirtyPageIds,
+        CancellationToken cancellationToken)
     {
         document.UpdatedAt = DateTimeOffset.UtcNow;
         var persistedVersions = await LoadPersistedPageVersionsAsync(document.Id, cancellationToken);
@@ -543,6 +532,7 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
         var removedPageIds = persistedVersions.Keys.Where(id => !currentPageIds.Contains(id)).ToArray();
         var changedSnapshots = pages
             .Where(item => item.Page.IsContentLoaded &&
+                           (dirtyPageIds is null || dirtyPageIds.Contains(item.Id) || !persistedVersions.ContainsKey(item.Id)) &&
                            (!persistedVersions.TryGetValue(item.Id, out var persisted) ||
                             persisted != item.UpdatedAt))
             .Select(item => item.Page with { Objects = [.. item.Page.Objects] })
@@ -590,6 +580,8 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             for (var index = 0; index < pages.Length; index++)
             {
                 var page = pages[index];
+                if (dirtyPageIds is not null && !dirtyPageIds.Contains(page.Id) &&
+                    persistedVersions.ContainsKey(page.Id)) continue;
                 if (!serializedPages.TryGetValue(page.Id, out var pageJson))
                 {
                     await using var orderCommand = _connection.CreateCommand();
@@ -655,6 +647,22 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             await transaction.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    public async Task RenameAsync(Guid documentId, string title, CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = "UPDATE documents SET title = $title, updated_utc = $updated WHERE id = $id;";
+        command.Parameters.AddWithValue("$title", title);
+        command.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$id", documentId.ToString("D"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        await using var searchCommand = _connection.CreateCommand();
+        searchCommand.CommandText =
+            $"UPDATE {(_ftsEnabled ? "search_fts" : "search_fallback")} SET document_title = $title WHERE document_id = $id;";
+        searchCommand.Parameters.AddWithValue("$title", title);
+        searchCommand.Parameters.AddWithValue("$id", documentId.ToString("D"));
+        await searchCommand.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private async Task<Dictionary<Guid, DateTimeOffset>> LoadPersistedPageVersionsAsync(Guid documentId,
@@ -778,6 +786,96 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             $"DELETE FROM {(_ftsEnabled ? "search_fts" : "search_fallback")} WHERE document_id = $id;",
             transaction, cancellationToken, ("$id", documentId.ToString("D")));
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlySet<string>> GetReferencedAssetHashesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = "SELECT CAST(page_json AS BLOB) FROM pages;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var page = Deserialize<NotePage>(reader.GetFieldValue<byte[]>(0));
+            if (page?.ImportedLayer is { AssetHash.Length: > 0 } imported) hashes.Add(imported.AssetHash);
+            if (page is null) continue;
+            foreach (var image in page.Objects.OfType<ImageObject>())
+                if (!string.IsNullOrWhiteSpace(image.AssetHash)) hashes.Add(image.AssetHash);
+        }
+        return hashes;
+    }
+
+    public static async Task<IReadOnlySet<string>> GetReferencedAssetHashesFromBackupsAsync(
+        IEnumerable<string> databasePaths, CancellationToken cancellationToken = default)
+    {
+        EnsureProviderInitialized();
+        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var databasePath in databasePaths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!File.Exists(databasePath)) continue;
+            await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Mode = SqliteOpenMode.ReadOnly,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false
+            }.ToString());
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT CAST(page_json AS BLOB) FROM pages;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var page = Deserialize<NotePage>(reader.GetFieldValue<byte[]>(0));
+                if (page?.ImportedLayer is { AssetHash.Length: > 0 } imported)
+                    hashes.Add(imported.AssetHash);
+                if (page is null) continue;
+                foreach (var image in page.Objects.OfType<ImageObject>())
+                    if (!string.IsNullOrWhiteSpace(image.AssetHash)) hashes.Add(image.AssetHash);
+            }
+        }
+        return hashes;
+    }
+
+    public async Task<bool> CheckIntegrityAsync(CancellationToken cancellationToken = default)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = "PRAGMA quick_check;";
+        var result = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken));
+        return string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public async Task<string> CreateBackupAsync(string backupDirectory, int retainedBackups = 7,
+        CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(backupDirectory);
+        var destinationPath = Path.Combine(backupDirectory,
+            $"library-{DateTime.UtcNow:yyyyMMdd-HHmmss}.db");
+        await ExecuteAsync("PRAGMA wal_checkpoint(PASSIVE);", cancellationToken);
+        await using var destination = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = destinationPath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Private,
+            Pooling = false
+        }.ToString());
+        await destination.OpenAsync(cancellationToken);
+        _connection.BackupDatabase(destination);
+        await destination.CloseAsync();
+
+        foreach (var oldBackup in new DirectoryInfo(backupDirectory)
+                     .EnumerateFiles("library-*.db")
+                     .OrderByDescending(file => file.CreationTimeUtc)
+                     .Skip(Math.Max(1, retainedBackups)))
+        {
+            try { oldBackup.Delete(); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return destinationPath;
     }
 
     public async Task<IReadOnlyList<SearchResult>> SearchAsync(string query, CancellationToken cancellationToken = default)
@@ -955,6 +1053,13 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
             cancellationToken);
     }
 
+    private async Task<int> GetDatabaseVersionAsync(CancellationToken cancellationToken)
+    {
+        await using var command = _connection.CreateCommand();
+        command.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
     private async Task ExecuteWithTransactionAsync(string sql, SqliteTransaction transaction,
         CancellationToken cancellationToken, params (string Name, object Value)[] parameters)
     {
@@ -969,6 +1074,12 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
     private static T? Deserialize<T>(string value) => JsonSerializer.Deserialize<T>(value, HoomNoteJson.Options);
     private static T? Deserialize<T>(ReadOnlySpan<byte> value) =>
         JsonSerializer.Deserialize<T>(value, HoomNoteJson.Options);
+
+    private static void EnsureProviderInitialized()
+    {
+        if (Interlocked.Exchange(ref _providerInitialized, 1) == 0)
+            SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
+    }
     private static string BuildFtsPrefixQuery(string query)
     {
         var tokens = query.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

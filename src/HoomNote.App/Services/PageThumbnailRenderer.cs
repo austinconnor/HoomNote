@@ -19,7 +19,7 @@ namespace HoomNote_App.Services;
 /// Produces small, self-contained page previews on Win2D's software device so the
 /// interactive canvas never pays the cost of rendering thumbnail geometry.
 /// </summary>
-public sealed class PageThumbnailRenderer(IAssetStore assetStore)
+public sealed class PageThumbnailRenderer(IAssetStore assetStore, SharedPdfDocumentCache pdfDocuments)
 {
     private const int ImageAssetLongEdge = 512;
     private readonly SemaphoreSlim _renderGate = new(1, 1);
@@ -391,7 +391,7 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         }
     }
 
-    private static async Task<CanvasBitmap?> TryLoadPdfPageAsync(
+    private async Task<CanvasBitmap?> TryLoadPdfPageAsync(
         CanvasDevice device,
         string path,
         int pageIndex,
@@ -402,25 +402,20 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore)
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var file = await StorageFile.GetFileFromPathAsync(path);
-            var document = await PdfDocument.LoadFromFileAsync(file);
-            if (pageIndex < 0 || (uint)pageIndex >= document.PageCount) return null;
-            using var page = document.GetPage((uint)pageIndex);
-            using var stream = new InMemoryRandomAccessStream();
-            // Adjacent notebook pages can occupy nearly the entire viewport. Rendering their
-            // PDF background at the old thumbnail-only 512 px cap made the page visibly blurry
-            // until it became the focused page and switched to PdfPreviewCache. Match the PDF
-            // source raster to the bounded output preview instead, so it is sharp immediately.
-            var requestedLongEdge = Math.Max(1, Math.Max(targetPixelWidth, targetPixelHeight));
-            var scale = requestedLongEdge / Math.Max(1d, Math.Max(page.Size.Width, page.Size.Height));
-            await page.RenderToStreamAsync(stream, new PdfPageRenderOptions
+            return await pdfDocuments.UsePageAsync(path, pageIndex, async page =>
             {
-                DestinationWidth = (uint)Math.Max(1, page.Size.Width * scale),
-                DestinationHeight = (uint)Math.Max(1, page.Size.Height * scale)
-            });
-            cancellationToken.ThrowIfCancellationRequested();
-            stream.Seek(0);
-            return await CanvasBitmap.LoadAsync(device, stream);
+                using var stream = new InMemoryRandomAccessStream();
+                var requestedLongEdge = Math.Max(1, Math.Max(targetPixelWidth, targetPixelHeight));
+                var scale = requestedLongEdge / Math.Max(1d, Math.Max(page.Size.Width, page.Size.Height));
+                await page.RenderToStreamAsync(stream, new PdfPageRenderOptions
+                {
+                    DestinationWidth = (uint)Math.Max(1, page.Size.Width * scale),
+                    DestinationHeight = (uint)Math.Max(1, page.Size.Height * scale)
+                });
+                cancellationToken.ThrowIfCancellationRequested();
+                stream.Seek(0);
+                return await CanvasBitmap.LoadAsync(device, stream);
+            }, cancellationToken);
         }
         catch when (!cancellationToken.IsCancellationRequested)
         {

@@ -18,7 +18,10 @@ public sealed class SlideWorkerConverter(string workerPath, string temporaryRoot
             throw new FileNotFoundException("The HoomNote Slide Import Pack is not installed.", workerPath);
         var outputDirectory = Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(outputDirectory);
-        var process = Process.Start(new ProcessStartInfo
+        var succeeded = false;
+        try
+        {
+        using var process = Process.Start(new ProcessStartInfo
         {
             FileName = workerPath,
             ArgumentList = { "convert", sourcePath, outputDirectory },
@@ -27,12 +30,34 @@ public sealed class SlideWorkerConverter(string workerPath, string temporaryRoot
             RedirectStandardError = true,
             RedirectStandardOutput = true
         }) ?? throw new InvalidOperationException("The slide conversion worker could not be started.");
-        using var registration = cancellationToken.Register(() => process.Kill(entireProcessTree: true));
+        var standardOutput = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var standardError = process.StandardError.ReadToEndAsync(cancellationToken);
+        using var registration = cancellationToken.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException) { }
+        });
         await process.WaitForExitAsync(cancellationToken);
+        var outputText = await standardOutput;
+        var errorText = await standardError;
         if (process.ExitCode != 0)
-            throw new InvalidOperationException((await process.StandardError.ReadToEndAsync(cancellationToken)).Trim());
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(errorText) ? outputText.Trim() : errorText.Trim());
         var output = Directory.EnumerateFiles(outputDirectory, "*.pdf").SingleOrDefault();
+        succeeded = output is not null;
         return output ?? throw new InvalidOperationException("The slide converter did not produce a PDF.");
+        }
+        finally
+        {
+            if (!succeeded)
+            {
+                try { Directory.Delete(outputDirectory, recursive: true); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
     }
 }
 
@@ -48,6 +73,7 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
     public async Task<ImportResult> ImportAsync(ImportRequest request, CancellationToken cancellationToken = default)
     {
         var sourcePath = Path.GetFullPath(request.SourcePath);
+        string? convertedOutputDirectory = null;
         if (!File.Exists(sourcePath)) throw new FileNotFoundException("Import source was not found.", sourcePath);
         var extension = Path.GetExtension(sourcePath).ToLowerInvariant();
         if (extension is ".ppt" or ".pptx")
@@ -55,13 +81,12 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
             if (slideConverter is null)
                 throw new InvalidOperationException("The HoomNote Slide Import Pack is not installed.");
             sourcePath = await slideConverter.ConvertToPdfAsync(sourcePath, cancellationToken);
+            convertedOutputDirectory = Path.GetDirectoryName(sourcePath);
             extension = ".pdf";
         }
 
         if (extension == ".sdocx")
         {
-            await using var samsungStream = File.OpenRead(sourcePath);
-            var samsungAssetHash = await assetStore.AddAsync(samsungStream, extension, cancellationToken);
             var samsung = await SamsungNotesImportParser.ParseAsync(sourcePath, cancellationToken);
             var samsungPages = samsung.Pages.ToArray();
             var warnings = samsung.Warnings.ToList();
@@ -100,20 +125,22 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
                 });
             }
             foreach (var page in samsungPages)
-                page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+                CanvasObjectOrdering.SortStable(page.Objects);
             var selectedSamsungPages = request.PageIndexes?
                 .Where(index => index >= 0 && index < samsungPages.Length)
                 .Distinct()
                 .Select((index, ordinal) => samsungPages[index] with { Title = $"Page {ordinal + 1}" })
                 .ToArray() ?? samsungPages;
             return new ImportResult(
-                samsungAssetHash,
+                string.Empty,
                 Path.GetFileName(request.SourcePath),
                 selectedSamsungPages,
                 warnings);
         }
 
         if (extension != ".pdf") throw new NotSupportedException("HoomNote currently imports PDF, PPT, PPTX, and Samsung Notes SDOCX documents.");
+        try
+        {
         await using var stream = File.OpenRead(sourcePath);
         var assetTask = assetStore.AddAsync(stream, extension, cancellationToken);
         var pageInfoTask = ReadPdfPagesAsync(sourcePath, cancellationToken);
@@ -151,6 +178,16 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
         }).ToArray();
 
         return new ImportResult(assetHash, Path.GetFileName(request.SourcePath), pages, []);
+        }
+        finally
+        {
+            if (convertedOutputDirectory is not null)
+            {
+                try { Directory.Delete(convertedOutputDirectory, recursive: true); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
     }
 
     private static RectD TransformBounds(RectD bounds, Transform2D transform)
@@ -218,6 +255,10 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
                 TryAttachSemanticText(path, pages, cancellationToken);
                 return (IReadOnlyList<PdfPageInfo>)pages;
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception exception)
             {
                 throw new InvalidDataException(
@@ -240,6 +281,10 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
                 using var document = PdfReader.Open(stream, PdfDocumentOpenMode.Import);
                 return document.PageCount;
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception exception)
             {
                 throw new InvalidDataException(
@@ -256,43 +301,12 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
     {
         try
         {
-            using var textDocument = UglyToad.PdfPig.PdfDocument.Open(path);
-            var pageCount = Math.Min(pages.Count, textDocument.NumberOfPages);
-            for (var index = 0; index < pageCount; index++)
+            var extracted = PdfSemanticTextExtractor.ExtractDocument(path,
+                pages.Select(page => new SizeD(page.Width, page.Height)).ToArray(), cancellationToken);
+            for (var index = 0; index < extracted.Count; index++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var textPage = textDocument.GetPage(index + 1);
-                var sourceWidth = Convert.ToDouble(textPage.Width);
-                var sourceHeight = Convert.ToDouble(textPage.Height);
-                if (sourceWidth <= 0 || sourceHeight <= 0) continue;
-
                 var destination = pages[index];
-                var regions = new List<RecognizedTextRegion>();
-                foreach (var word in textPage.GetWords())
-                {
-                    var text = word.Text;
-                    if (string.IsNullOrWhiteSpace(text)) continue;
-                    var box = word.BoundingBox;
-                    var left = Convert.ToDouble(box.Left);
-                    var right = Convert.ToDouble(box.Right);
-                    var top = Convert.ToDouble(box.Top);
-                    var bottom = Convert.ToDouble(box.Bottom);
-                    var bounds = new RectD(
-                        left / sourceWidth * destination.Width,
-                        (sourceHeight - top) / sourceHeight * destination.Height,
-                        (right - left) / sourceWidth * destination.Width,
-                        (top - bottom) / sourceHeight * destination.Height);
-                    if (!double.IsFinite(bounds.X) || !double.IsFinite(bounds.Y) ||
-                        !double.IsFinite(bounds.Width) || !double.IsFinite(bounds.Height) ||
-                        bounds.Width <= 0 || bounds.Height <= 0) continue;
-                    regions.Add(new RecognizedTextRegion
-                    {
-                        Text = text,
-                        Bounds = bounds,
-                        Source = "Pdf"
-                    });
-                }
-
+                var regions = extracted[index];
                 pages[index] = destination with
                 {
                     Text = string.Join(' ', regions.Select(region => region.Text)),

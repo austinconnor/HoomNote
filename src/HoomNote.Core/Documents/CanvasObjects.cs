@@ -20,13 +20,24 @@ public abstract record CanvasObject
 
 public sealed record InkStrokeObject : CanvasObject
 {
+    private RectD? _cachedLocalBounds;
+
     public List<InkPoint> Points { get; init; } = [];
     public InkStyle Style { get; init; } = new();
     public Guid? ParentStrokeId { get; init; }
 
     [JsonIgnore]
-    public override RectD LocalBounds =>
+    public override RectD LocalBounds => _cachedLocalBounds ??=
         RectD.FromPoints(Points.Select(point => point.Position)).Inflate(Style.Normalize().Width / 2d);
+
+    private InkStrokeObject(InkStrokeObject original) : base(original)
+    {
+        Points = original.Points;
+        Style = original.Style;
+        ParentStrokeId = original.ParentStrokeId;
+    }
+
+    public InkStrokeObject() { }
 }
 
 public enum ParagraphKind

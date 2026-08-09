@@ -6,14 +6,19 @@ public interface IDocumentCommand
 {
     string Description { get; }
     IReadOnlyCollection<Guid> AffectedPageIds { get; }
+    IReadOnlyCollection<AffectedCanvasObject> AffectedCanvasObjects => [];
     void Execute(HoomNoteDocument document);
     void Undo(HoomNoteDocument document);
 }
+
+public readonly record struct AffectedCanvasObject(Guid PageId, CanvasObject Object);
 
 public sealed class AddObjectCommand(Guid pageId, CanvasObject canvasObject) : IDocumentCommand
 {
     public string Description => $"Add {canvasObject.GetType().Name}";
     public IReadOnlyCollection<Guid> AffectedPageIds => [pageId];
+    public IReadOnlyCollection<AffectedCanvasObject> AffectedCanvasObjects { get; } =
+        [new(pageId, canvasObject)];
 
     public void Execute(HoomNoteDocument document)
     {
@@ -45,6 +50,8 @@ public sealed class ReplaceObjectsCommand(
 {
     public string Description => description;
     public IReadOnlyCollection<Guid> AffectedPageIds => [pageId];
+    public IReadOnlyCollection<AffectedCanvasObject> AffectedCanvasObjects { get; } =
+        before.Concat(after).Select(item => new AffectedCanvasObject(pageId, item)).ToArray();
 
     public void Execute(HoomNoteDocument document) => Replace(document, before, after);
     public void Undo(HoomNoteDocument document) => Replace(document, after, before);
@@ -59,7 +66,7 @@ public sealed class ReplaceObjectsCommand(
         var ids = remove.Select(item => item.Id).ToHashSet();
         page.Objects.RemoveAll(item => ids.Contains(item.Id));
         page.Objects.AddRange(add);
-        page.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        CanvasObjectOrdering.SortStable(page.Objects);
         page.UpdatedAt = DateTimeOffset.UtcNow;
     }
 }
@@ -74,6 +81,10 @@ public sealed class MoveObjectsBetweenPagesCommand(
     public string Description => description;
     public IReadOnlyCollection<Guid> AffectedPageIds { get; } =
         [sourcePageId, destinationPageId];
+    public IReadOnlyCollection<AffectedCanvasObject> AffectedCanvasObjects { get; } =
+        sourceObjects.Select(item => new AffectedCanvasObject(sourcePageId, item))
+            .Concat(destinationObjects.Select(item => new AffectedCanvasObject(destinationPageId, item)))
+            .ToArray();
 
     public void Execute(HoomNoteDocument document) =>
         Move(document, sourcePageId, destinationPageId, sourceObjects, destinationObjects);
@@ -94,7 +105,7 @@ public sealed class MoveObjectsBetweenPagesCommand(
         removeFrom.Objects.RemoveAll(item => ids.Contains(item.Id));
         addTo.Objects.RemoveAll(item => ids.Contains(item.Id));
         addTo.Objects.AddRange(add);
-        addTo.Objects.Sort((left, right) => left.ZIndex.CompareTo(right.ZIndex));
+        CanvasObjectOrdering.SortStable(addTo.Objects);
         var now = DateTimeOffset.UtcNow;
         removeFrom.UpdatedAt = now;
         addTo.UpdatedAt = now;
@@ -208,12 +219,14 @@ public sealed class CommandHistory(int capacity = 120)
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
     public IReadOnlyCollection<Guid> LastAffectedPageIds { get; private set; } = [];
+    public IReadOnlyCollection<AffectedCanvasObject> LastAffectedCanvasObjects { get; private set; } = [];
     public event EventHandler? Changed;
 
     public void Execute(IDocumentCommand command, HoomNoteDocument document)
     {
         command.Execute(document);
         LastAffectedPageIds = command.AffectedPageIds;
+        LastAffectedCanvasObjects = command.AffectedCanvasObjects;
         _undo.Push(command);
         _redo.Clear();
         TrimToCapacity();
@@ -226,6 +239,7 @@ public sealed class CommandHistory(int capacity = 120)
         if (!_undo.TryPop(out var command)) return false;
         command.Undo(document);
         LastAffectedPageIds = command.AffectedPageIds;
+        LastAffectedCanvasObjects = command.AffectedCanvasObjects;
         _redo.Push(command);
         document.UpdatedAt = DateTimeOffset.UtcNow;
         Changed?.Invoke(this, EventArgs.Empty);
@@ -237,6 +251,7 @@ public sealed class CommandHistory(int capacity = 120)
         if (!_redo.TryPop(out var command)) return false;
         command.Execute(document);
         LastAffectedPageIds = command.AffectedPageIds;
+        LastAffectedCanvasObjects = command.AffectedCanvasObjects;
         _undo.Push(command);
         document.UpdatedAt = DateTimeOffset.UtcNow;
         Changed?.Invoke(this, EventArgs.Empty);

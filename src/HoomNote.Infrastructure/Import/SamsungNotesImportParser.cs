@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
-using HoomNote.Canvas.Rendering;
 using HoomNote.Core.Documents;
 
 namespace HoomNote.Infrastructure.Import;
@@ -17,7 +16,7 @@ internal static class SamsungNotesImportParser
 {
     private static readonly HashSet<byte> SizedObjectTypes = [1, 2, 3, 4, 7, 8, 10, 11, 13, 14, 15, 17, 19, 20, 21, 23];
     private static readonly HashSet<byte> StrokeObjectTypes = [1, 15];
-    private const long MaximumEntryBytes = 256L * 1024 * 1024;
+    private const long MaximumEntryBytes = 128L * 1024 * 1024;
     private const double MaximumPressure = 1400d;
     // Samsung's stored pen width is a nib-size value rather than a page-space diameter.
     // Its renderer converts that value to document pixels at 1 / 2.5 before applying pressure.
@@ -81,7 +80,7 @@ internal static class SamsungNotesImportParser
             using var input = entry.Open();
             using var memory = new MemoryStream((int)Math.Min(entry.Length, int.MaxValue));
             input.CopyTo(memory);
-            pages.Add(ParsePage(memory.ToArray(), pageIndex, documentPaperColor, imagePlacements,
+            pages.Add(ParsePage(memory.GetBuffer().AsSpan(0, checked((int)memory.Length)), pageIndex, documentPaperColor, imagePlacements,
                 ref nextMediaIndex, ref skippedObjects));
         }
 
@@ -108,7 +107,7 @@ internal static class SamsungNotesImportParser
             using var mediaMemory = new MemoryStream((int)Math.Min(media.Length, int.MaxValue));
             mediaInput.CopyTo(mediaMemory);
             images.Add(new SamsungEmbeddedImage(placement.PageIndex, placement.Bounds, placement.ZIndex,
-                Path.GetFileName(media.FullName), mediaMemory.ToArray()));
+                Path.GetFileName(media.FullName), mediaMemory.GetBuffer()));
         }
 
         var warnings = new List<string>
@@ -125,7 +124,7 @@ internal static class SamsungNotesImportParser
         return new ParsedSamsungNote(pages, images, embeddedPdf, warnings);
     }
 
-    private static NotePage ParsePage(byte[] data, int pageIndex, string? documentPaperColor,
+    private static NotePage ParsePage(ReadOnlySpan<byte> data, int pageIndex, string? documentPaperColor,
         List<SamsungImagePlacement> imagePlacements, ref int nextMediaIndex, ref int skippedObjects)
     {
         var pageNumber = pageIndex + 1;
@@ -153,7 +152,7 @@ internal static class SamsungNotesImportParser
         };
     }
 
-    private static List<CanvasObject> ReadObjects(byte[] data, int position, double scale, string defaultInkColor,
+    private static List<CanvasObject> ReadObjects(ReadOnlySpan<byte> data, int position, double scale, string defaultInkColor,
         int pageIndex, List<SamsungImagePlacement> imagePlacements, ref int nextMediaIndex, ref int skippedObjects)
     {
         var objects = new List<CanvasObject>();
@@ -197,22 +196,22 @@ internal static class SamsungNotesImportParser
                     Ensure(data, position, size);
                     if (StrokeObjectTypes.Contains(type))
                     {
-                        var stroke = ParseStroke(data.AsSpan(position, size), scale, defaultInkColor);
+                        var stroke = ParseStroke(data.Slice(position, size), scale, defaultInkColor);
                         if (stroke is not null) objects.Add(stroke with { ZIndex = checked((int)objectIndex) });
                         else skippedObjects++;
                     }
                     else if (type == 7 &&
-                             ParseShape(data.AsSpan(position, size), scale, defaultInkColor) is { } shape)
+                             ParseShape(data.Slice(position, size), scale, defaultInkColor) is { } shape)
                     {
                         objects.Add(shape with { ZIndex = checked((int)objectIndex) });
                     }
                     else if (type == 8 &&
-                             ParseLine(data.AsSpan(position, size), scale, defaultInkColor) is { } line)
+                             ParseLine(data.Slice(position, size), scale, defaultInkColor) is { } line)
                     {
                         objects.Add(line with { ZIndex = checked((int)objectIndex) });
                     }
                     else if (type == 3 &&
-                             ParseImagePlacement(data.AsSpan(position, size), scale) is { } placement)
+                             ParseImagePlacement(data.Slice(position, size), scale) is { } placement)
                     {
                         imagePlacements.Add(new SamsungImagePlacement(
                             pageIndex,
@@ -610,7 +609,7 @@ internal static class SamsungNotesImportParser
         using var input = entry.Open();
         using var memory = new MemoryStream((int)Math.Min(entry.Length, int.MaxValue));
         input.CopyTo(memory);
-        return new SamsungEmbeddedPdf(Path.GetFileName(entry.FullName), memory.ToArray());
+        return new SamsungEmbeddedPdf(Path.GetFileName(entry.FullName), memory.GetBuffer());
     }
 
     private static ZipArchiveEntry[] OrderedImageEntries(ZipArchive archive)
@@ -658,7 +657,8 @@ internal static class SamsungNotesImportParser
         input.CopyTo(memory);
 
         var result = new Dictionary<uint, ZipArchiveEntry>();
-        foreach (var (bindId, fileName) in ReadMediaBindings(memory.ToArray()))
+        foreach (var (bindId, fileName) in ReadMediaBindings(
+                     memory.GetBuffer().AsSpan(0, checked((int)memory.Length))))
             if (archiveImages.TryGetValue(fileName, out var entry))
                 result.TryAdd(bindId, entry);
         return result;
@@ -865,7 +865,7 @@ internal static class SamsungNotesImportParser
                 // opacity so the stable highlighter compositor reproduces that source strength.
                 var opacity = tool == InkToolKind.Highlighter
                     ? Math.Clamp(
-                        sourceOpacity / CanvasObjectRenderPolicy.HighlighterStrengthScale,
+                        sourceOpacity / InkStyle.HighlighterCompositingStrength,
                         0.02f,
                         1f)
                     : 1f;
@@ -938,7 +938,7 @@ internal static class SamsungNotesImportParser
         using var input = entry.Open();
         using var memory = new MemoryStream((int)entry.Length);
         input.CopyTo(memory);
-        var data = memory.ToArray();
+        var data = memory.GetBuffer();
         ReadOnlySpan<byte> marker = [0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
         for (var offset = 0; offset + 12 <= data.Length; offset++)
         {

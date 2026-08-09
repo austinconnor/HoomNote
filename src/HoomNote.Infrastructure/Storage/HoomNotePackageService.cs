@@ -10,6 +10,11 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
 {
     public async Task ExportAsync(HoomNoteDocument document, string destinationPath, CancellationToken cancellationToken = default)
     {
+        var unloadedPageCount = document.Pages.Count(page => !page.IsContentLoaded);
+        if (unloadedPageCount > 0)
+            throw new InvalidOperationException(
+                $"Cannot export a partially loaded notebook. Load all pages first ({unloadedPageCount} page(s) are not loaded)." );
+
         var fullDestination = Path.GetFullPath(destinationPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullDestination)!);
         var temporary = fullDestination + $".{Guid.NewGuid():N}.tmp";
@@ -24,7 +29,9 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
                 // size matter more here than minimizing a few seconds of export CPU time.
                 var manifest = archive.CreateEntry("manifest.json", CompressionLevel.SmallestSize);
                 await using (var output = manifest.Open())
-                    await JsonSerializer.SerializeAsync(output, document, HoomNoteJson.Options, cancellationToken);
+                    await JsonSerializer.SerializeAsync(output,
+                        document with { SchemaVersion = HoomNoteDocument.CurrentSchemaVersion },
+                        HoomNoteJson.Options, cancellationToken);
 
                 foreach (var asset in ReferencedAssets(document).Distinct(StringComparer.OrdinalIgnoreCase))
                 {
@@ -58,17 +65,75 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
         if (document.SchemaVersion > HoomNoteDocument.CurrentSchemaVersion)
             throw new InvalidDataException("This package was created by a newer HoomNote version.");
 
+        var referencedAssets = ReferencedAssets(document).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in archive.Entries.Where(entry => entry.FullName.StartsWith("assets/", StringComparison.Ordinal)))
         {
-            if (entry.Name.Length == 0) continue;
+            if (entry.Name.Length == 0 || !referencedAssets.Contains(entry.Name)) continue;
             await using var source = entry.Open();
             await assetStore.AddAsync(source, Path.GetExtension(entry.Name), cancellationToken);
         }
 
+        return RemapIdentity(document);
+    }
+
+    private static HoomNoteDocument RemapIdentity(HoomNoteDocument document)
+    {
+        var pageIds = document.Pages.ToDictionary(page => page.Id, _ => Guid.NewGuid());
+        var objectIds = document.Pages
+            .SelectMany(page => page.Objects)
+            .Select(canvasObject => canvasObject.Id)
+            .Distinct()
+            .ToDictionary(id => id, _ => Guid.NewGuid());
+
+        CanvasObject RemapObject(CanvasObject canvasObject)
+        {
+            var id = objectIds[canvasObject.Id];
+            return canvasObject switch
+            {
+                InkStrokeObject stroke => stroke with
+                {
+                    Id = id,
+                    ParentStrokeId = stroke.ParentStrokeId is { } parentId && objectIds.TryGetValue(parentId, out var remappedParent)
+                        ? remappedParent
+                        : null,
+                    Points = [.. stroke.Points]
+                },
+                GroupObject group => group with
+                {
+                    Id = id,
+                    ChildIds = group.ChildIds
+                        .Where(objectIds.ContainsKey)
+                        .Select(childId => objectIds[childId])
+                        .ToList()
+                },
+                _ => canvasObject with { Id = id }
+            };
+        }
+
+        var pages = document.Pages.Select(page => page with
+        {
+            Id = pageIds[page.Id],
+            Objects = page.Objects.Select(RemapObject).ToList(),
+            RecognizedRegions = [.. page.RecognizedRegions],
+            IsContentLoaded = true
+        }).ToList();
+        var sections = document.Sections.Select(section => section with
+        {
+            Id = Guid.NewGuid(),
+            PageIds = section.PageIds
+                .Where(pageIds.ContainsKey)
+                .Select(pageId => pageIds[pageId])
+                .ToList()
+        }).ToList();
+
         return document with
         {
             Id = Guid.NewGuid(),
-            Title = LibraryNamePolicy.Normalize(document.Title + " (Imported)") ?? "Imported notebook"
+            Title = LibraryNamePolicy.Normalize(document.Title + " (Imported)") ?? "Imported notebook",
+            Tags = [.. document.Tags],
+            Sections = sections,
+            Pages = pages,
+            Settings = document.Settings with { }
         };
     }
 

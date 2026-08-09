@@ -21,14 +21,28 @@ public sealed class PdfPreviewCache : IDisposable
 
     public event EventHandler? PreviewAvailable;
 
-    public CanvasBitmap? TryGet(string path, int pageIndex)
+    public bool Contains(string path, int pageIndex)
     {
         lock (_gate)
         {
+            return !_disposed && _cache.ContainsKey((path, pageIndex));
+        }
+    }
+
+    /// <summary>
+    /// Uses a bitmap while holding its cache lease so eviction cannot dispose it mid-draw.
+    /// </summary>
+    public bool TryUse(string path, int pageIndex, Action<CanvasBitmap> use)
+    {
+        ArgumentNullException.ThrowIfNull(use);
+        lock (_gate)
+        {
+            if (_disposed) return false;
             var key = (path, pageIndex);
-            if (!_cache.TryGetValue(key, out var entry)) return null;
+            if (!_cache.TryGetValue(key, out var entry)) return false;
             Touch(key);
-            return entry.Bitmap;
+            use(entry.Bitmap);
+            return true;
         }
     }
 

@@ -1,13 +1,13 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Text;
+using System.Threading.Channels;
 
 namespace HoomNote_App.Services;
 
 /// <summary>
-/// Small, local-only, bounded diagnostics journal. Events deliberately contain operational
-/// metadata only: never note text, recognized text, search terms, or imported document content.
+/// Local-only, bounded diagnostics journal. Producers only format and enqueue; filesystem I/O is
+/// serialized on one background consumer so input and rendering threads never open or flush files.
 /// </summary>
 public static class DiagnosticsLog
 {
@@ -16,6 +16,8 @@ public static class DiagnosticsLog
     private const int MaxFiles = 8;
     private static readonly object Gate = new();
     private static readonly string SessionId = Guid.NewGuid().ToString("N")[..12];
+    private static Channel<string>? _channel;
+    private static Task? _writerTask;
     private static string? _logPath;
     private static string? _activeSessionPath;
     private static bool _initialized;
@@ -40,8 +42,15 @@ public static class DiagnosticsLog
                     : null;
                 File.WriteAllText(_activeSessionPath,
                     $"pid={Environment.ProcessId} session={SessionId} started_utc={DateTimeOffset.UtcNow:O}");
+                _channel = Channel.CreateBounded<string>(new BoundedChannelOptions(4096)
+                {
+                    FullMode = BoundedChannelFullMode.DropOldest,
+                    SingleReader = true,
+                    SingleWriter = false
+                });
                 _initialized = true;
-                Append("info", "diagnostics.started",
+                _writerTask = Task.Run(() => WriterLoopAsync(_channel.Reader));
+                Enqueue("info", "diagnostics.started",
                     ("version", Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown"),
                     ("os", Environment.OSVersion.VersionString),
                     ("arch", System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture),
@@ -50,50 +59,52 @@ public static class DiagnosticsLog
             }
             catch
             {
-                // Diagnostics must never prevent the application from starting.
                 _initialized = false;
             }
         }
     }
 
     public static void Info(string eventName, params (string Key, object? Value)[] fields) =>
-        Write("info", eventName, fields);
+        Enqueue("info", eventName, fields);
 
     public static void Warning(string eventName, params (string Key, object? Value)[] fields) =>
-        Write("warning", eventName, fields);
+        Enqueue("warning", eventName, fields);
 
     public static void Error(string eventName, Exception exception,
-        params (string Key, object? Value)[] fields) => WriteException("error", eventName, exception, fields);
+        params (string Key, object? Value)[] fields) => EnqueueException("error", eventName, exception, fields);
 
     public static void Critical(string eventName, Exception exception,
-        params (string Key, object? Value)[] fields) => WriteException("critical", eventName, exception, fields);
+        params (string Key, object? Value)[] fields) => EnqueueException("critical", eventName, exception, fields);
 
     public static void Shutdown(string reason = "process_exit")
     {
+        Task? writerTask;
         lock (Gate)
         {
             if (!_initialized || _shutdown) return;
-            Append("info", "diagnostics.stopped", ("reason", reason));
+            Enqueue("info", "diagnostics.stopped", ("reason", reason));
             _shutdown = true;
-            try
-            {
-                if (_activeSessionPath is not null) File.Delete(_activeSessionPath);
-            }
-            catch { }
+            _channel?.Writer.TryComplete();
+            writerTask = _writerTask;
         }
-    }
-
-    private static void Write(string level, string eventName, params (string Key, object? Value)[] fields)
-    {
-        lock (Gate)
+        try { writerTask?.Wait(TimeSpan.FromSeconds(2)); }
+        catch { }
+        try
         {
-            if (!_initialized || _shutdown) return;
-            try { Append(level, eventName, fields); }
-            catch { }
+            if (_activeSessionPath is not null) File.Delete(_activeSessionPath);
         }
+        catch { }
     }
 
-    private static void WriteException(string level, string eventName, Exception exception,
+    private static void Enqueue(string level, string eventName, params (string Key, object? Value)[] fields)
+    {
+        var channel = _channel;
+        if (!_initialized || _shutdown || channel is null) return;
+        try { channel.Writer.TryWrite(Format(level, eventName, fields)); }
+        catch { }
+    }
+
+    private static void EnqueueException(string level, string eventName, Exception exception,
         IReadOnlyList<(string Key, object? Value)> fields)
     {
         var combined = fields.Concat(new (string Key, object? Value)[]
@@ -102,13 +113,11 @@ public static class DiagnosticsLog
             ("exception_message", exception.Message),
             ("stack", exception.ToString())
         }).ToArray();
-        Write(level, eventName, combined);
+        Enqueue(level, eventName, combined);
     }
 
-    private static void Append(string level, string eventName, params (string Key, object? Value)[] fields)
+    private static string Format(string level, string eventName, IReadOnlyList<(string Key, object? Value)> fields)
     {
-        if (_logPath is null) return;
-        RotateIfNeeded();
         var builder = new StringBuilder(256);
         builder.Append(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture))
             .Append(" level=").Append(Sanitize(level))
@@ -119,7 +128,60 @@ public static class DiagnosticsLog
             .Append(" managed_mb=").Append(GC.GetTotalMemory(false) / (1024 * 1024));
         foreach (var (key, value) in fields)
             builder.Append(' ').Append(Sanitize(key)).Append("=\"").Append(Sanitize(value)).Append('"');
-        File.AppendAllText(_logPath, builder.AppendLine().ToString(), Encoding.UTF8);
+        return builder.AppendLine().ToString();
+    }
+
+    private static async Task WriterLoopAsync(ChannelReader<string> reader)
+    {
+        StreamWriter? writer = null;
+        try
+        {
+            while (await reader.WaitToReadAsync())
+            {
+                writer ??= OpenWriter();
+                while (reader.TryRead(out var line))
+                {
+                    if (writer.BaseStream.Length + Encoding.UTF8.GetByteCount(line) >= MaxFileBytes)
+                    {
+                        await writer.FlushAsync();
+                        writer.Dispose();
+                        RotateLog();
+                        writer = OpenWriter();
+                    }
+                    await writer.WriteAsync(line);
+                }
+                await writer.FlushAsync();
+            }
+        }
+        catch
+        {
+            // Logging must never bring down the application.
+        }
+        finally
+        {
+            if (writer is not null)
+            {
+                try { await writer.FlushAsync(); }
+                catch { }
+                writer.Dispose();
+            }
+        }
+    }
+
+    private static StreamWriter OpenWriter()
+    {
+        var stream = new FileStream(_logPath!, FileMode.Append, FileAccess.Write, FileShare.Read,
+            32 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return new StreamWriter(stream, new UTF8Encoding(false), 32 * 1024, leaveOpen: false);
+    }
+
+    private static void RotateLog()
+    {
+        if (_logPath is null || !File.Exists(_logPath)) return;
+        var rotated = Path.Combine(LogDirectory,
+            $"hoomnote-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{SessionId}.log");
+        File.Move(_logPath, rotated, overwrite: true);
+        PruneLogs();
     }
 
     private static string Sanitize(object? value)
@@ -129,15 +191,6 @@ public static class DiagnosticsLog
             .Replace("\"", "\\\"", StringComparison.Ordinal)
             .Replace("\r", " ", StringComparison.Ordinal)
             .Replace("\n", " ", StringComparison.Ordinal);
-    }
-
-    private static void RotateIfNeeded()
-    {
-        if (_logPath is null || !File.Exists(_logPath) || new FileInfo(_logPath).Length < MaxFileBytes) return;
-        var rotated = Path.Combine(LogDirectory,
-            $"hoomnote-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{SessionId}.log");
-        File.Move(_logPath, rotated, overwrite: true);
-        PruneLogs();
     }
 
     private static void PruneLogs()

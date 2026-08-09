@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using HoomNote.Canvas.Rendering;
 using HoomNote.Core.Documents;
@@ -460,6 +461,88 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.NotEqual(document.Id, imported.Id);
         Assert.Equal("Portable notes (Imported)", imported.Title);
         Assert.Equal(hash, imported.Pages[0].ImportedLayer?.AssetHash);
+    }
+
+    [Fact]
+    public async Task Package_ReimportRemapsEveryIdentityAndCannotStealPersistedPages()
+    {
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "assets"));
+        var service = new HoomNotePackageService(store);
+        var original = HoomNoteDocument.Create("Identity graph");
+        var page = AddPage(original);
+        var parent = new InkStrokeObject { Points = [new InkPoint(0, 0), new InkPoint(10, 10)] };
+        var child = new InkStrokeObject
+        {
+            ParentStrokeId = parent.Id,
+            Points = [new InkPoint(20, 20), new InkPoint(30, 30)]
+        };
+        var group = new GroupObject { ChildIds = [parent.Id, child.Id] };
+        page.Objects.AddRange([parent, child, group]);
+        var path = Path.Combine(_root, "identity.hoomnote");
+        await service.ExportAsync(original, path);
+
+        var first = await service.ImportAsync(path);
+        var second = await service.ImportAsync(path);
+        Assert.NotEqual(first.Id, second.Id);
+        Assert.NotEqual(first.Pages[0].Id, second.Pages[0].Id);
+        Assert.Empty(first.Pages.SelectMany(item => item.Objects).Select(item => item.Id)
+            .Intersect(second.Pages.SelectMany(item => item.Objects).Select(item => item.Id)));
+        var firstObjects = first.Pages[0].Objects.ToDictionary(item => item.Id);
+        var firstChild = Assert.Single(firstObjects.Values.OfType<InkStrokeObject>(), item => item.ParentStrokeId is not null);
+        Assert.True(firstObjects.ContainsKey(firstChild.ParentStrokeId!.Value));
+        Assert.All(Assert.Single(firstObjects.Values.OfType<GroupObject>()).ChildIds,
+            id => Assert.True(firstObjects.ContainsKey(id)));
+        Assert.Equal(first.Pages[0].Id, Assert.Single(first.Sections[0].PageIds));
+
+        await using var repository = new SqliteDocumentRepository(Path.Combine(_root, "identity.db"));
+        await repository.InitializeAsync();
+        await repository.SaveAsync(original);
+        await repository.SaveAsync(first);
+        await repository.SaveAsync(second);
+        Assert.Single((await repository.LoadAsync(original.Id))!.Pages);
+        Assert.Single((await repository.LoadAsync(first.Id))!.Pages);
+        Assert.Single((await repository.LoadAsync(second.Id))!.Pages);
+    }
+
+    [Fact]
+    public async Task Package_RejectsPartiallyLoadedDocuments()
+    {
+        var service = new HoomNotePackageService(
+            new ContentAddressedAssetStore(Path.Combine(_root, "assets")));
+        var document = HoomNoteDocument.Create("Lazy");
+        AddPage(document).IsContentLoaded = false;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.ExportAsync(document, Path.Combine(_root, "lazy.hoomnote")));
+    }
+
+    [Fact]
+    public void InkPointSerializationIsCompactAndReadsLegacyObjectShape()
+    {
+        var compact = JsonSerializer.Serialize(new InkPoint(12.5, 20.25), HoomNoteJson.Options);
+        Assert.Equal("[12.5,20.25]", compact);
+
+        var legacy = JsonSerializer.Deserialize<InkPoint>(
+            "{\"x\":3,\"y\":4,\"pressure\":0.75,\"tiltX\":2,\"tiltY\":-1,\"timestampMicroseconds\":9}",
+            HoomNoteJson.Options);
+        Assert.Equal(new InkPoint(3, 4, 0.75f, 2, -1, 9), legacy);
+    }
+
+    [Fact]
+    public async Task Repository_UsesVersionedSchemaAndDropsDeadCommandJournal()
+    {
+        var path = Path.Combine(_root, "versioned.db");
+        await using (var repository = new SqliteDocumentRepository(path))
+            await repository.InitializeAsync();
+
+        await using var connection = new SqliteConnection($"Data Source={path};Pooling=False");
+        await connection.OpenAsync();
+        await using var version = connection.CreateCommand();
+        version.CommandText = "PRAGMA user_version;";
+        Assert.Equal(2L, (long)(await version.ExecuteScalarAsync())!);
+        await using var table = connection.CreateCommand();
+        table.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='command_journal';";
+        Assert.Equal(0L, (long)(await table.ExecuteScalarAsync())!);
     }
 
     [Fact]

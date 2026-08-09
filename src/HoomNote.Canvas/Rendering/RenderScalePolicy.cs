@@ -14,7 +14,7 @@ public static class RenderScalePolicy
         double pageWidth,
         double pageHeight,
         long byteBudget,
-        double minimumScale = 1d,
+        double minimumScale = 1d / 16d,
         double maximumScale = 3d)
     {
         if (!double.IsFinite(pageWidth) || !double.IsFinite(pageHeight) ||
@@ -41,7 +41,7 @@ public static class RenderScalePolicy
         double snapshotScale,
         double zoom,
         double displayDpi,
-        double tolerance = 1.02d)
+        double tolerance = 1d)
     {
         if (!double.IsFinite(snapshotScale) || !double.IsFinite(zoom) ||
             !double.IsFinite(displayDpi) || snapshotScale <= 0 || zoom <= 0 || displayDpi <= 0)

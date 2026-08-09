@@ -160,6 +160,11 @@ public static class StrokeOutlineBuilder
     public static float EffectiveWidth(InkPoint point, InkStyle requestedStyle)
     {
         var style = requestedStyle.Normalize();
+        return EffectiveWidthNormalized(point, style);
+    }
+
+    private static float EffectiveWidthNormalized(InkPoint point, InkStyle style)
+    {
         if (!style.PressureEnabled) return style.Width;
         var pressure = Math.Clamp(point.Pressure, 0.01f, 1f);
         var curved = 0.12f + 0.88f * MathF.Pow(pressure, 0.72f);
@@ -214,7 +219,9 @@ public static class StrokeOutlineBuilder
 
     private static float[] SmoothWidths(IReadOnlyList<InkPoint> centerline, InkStyle style)
     {
-        var widths = centerline.Select(point => EffectiveWidth(point, style)).ToArray();
+        var widths = new float[centerline.Count];
+        for (var index = 0; index < centerline.Count; index++)
+            widths[index] = EffectiveWidthNormalized(centerline[index], style);
         if (widths.Length < 3) return widths;
         var forward = widths[0];
         for (var index = 1; index < widths.Length; index++)

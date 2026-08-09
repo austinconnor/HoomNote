@@ -61,6 +61,8 @@ internal static class SlideImportWorker
         }
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var standardOutputTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        var standardErrorTask = process.StandardError.ReadToEndAsync(timeout.Token);
         try
         {
             await process.WaitForExitAsync(timeout.Token);
@@ -72,8 +74,8 @@ internal static class SlideImportWorker
             return 6;
         }
 
-        var standardOutput = await process.StandardOutput.ReadToEndAsync();
-        var standardError = await process.StandardError.ReadToEndAsync();
+        var standardOutput = await standardOutputTask;
+        var standardError = await standardErrorTask;
         if (process.ExitCode != 0)
         {
             Console.Error.WriteLine(string.IsNullOrWhiteSpace(standardError) ? standardOutput : standardError);
@@ -81,6 +83,9 @@ internal static class SlideImportWorker
         }
 
         Console.WriteLine(standardOutput.Trim());
+        try { Directory.Delete(profileDirectory, recursive: true); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
         return 0;
     }
 
@@ -97,4 +102,3 @@ internal static class SlideImportWorker
         return candidates.FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
     }
 }
-

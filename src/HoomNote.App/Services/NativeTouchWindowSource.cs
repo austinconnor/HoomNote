@@ -28,6 +28,7 @@ internal sealed class NativeTouchFrameEventArgs(IReadOnlyList<NativeTouchContact
 internal sealed class NativeTouchWindowSource : IDisposable
 {
     private const uint WmTouch = 0x0240;
+    private const uint WmDpiChanged = 0x02E0;
     private const uint TouchEventMove = 0x0001;
     private const uint TouchEventDown = 0x0002;
     private const uint TouchEventUp = 0x0004;
@@ -35,7 +36,12 @@ internal sealed class NativeTouchWindowSource : IDisposable
 
     private readonly nint _windowHandle;
     private readonly SubclassProcedure _subclassProcedure;
+    private readonly List<NativeTouchContact> _contacts = [];
+    private readonly NativeTouchFrameEventArgs _frameArgs;
+    private TouchInput[] _nativeInputs = [];
+    private uint _dpi;
     private bool _disposed;
+    private static readonly int TouchInputSize = Marshal.SizeOf<TouchInput>();
 
     public event EventHandler<NativeTouchFrameEventArgs>? Frame;
 
@@ -43,6 +49,8 @@ internal sealed class NativeTouchWindowSource : IDisposable
     {
         _windowHandle = windowHandle;
         _subclassProcedure = WindowProcedure;
+        _dpi = Math.Max(96u, GetDpiForWindow(windowHandle));
+        _frameArgs = new NativeTouchFrameEventArgs(_contacts);
     }
 
     public static NativeTouchWindowSource? TryCreate(nint windowHandle)
@@ -77,6 +85,11 @@ internal sealed class NativeTouchWindowSource : IDisposable
     {
         _ = subclassId;
         _ = referenceData;
+        if (message == WmDpiChanged)
+        {
+            _dpi = Math.Max(96u, GetDpiForWindow(windowHandle));
+            return DefSubclassProc(windowHandle, message, wParam, lParam);
+        }
         if (message != WmTouch)
             return DefSubclassProc(windowHandle, message, wParam, lParam);
 
@@ -89,18 +102,19 @@ internal sealed class NativeTouchWindowSource : IDisposable
 
         try
         {
-            var native = new TouchInput[count];
-            if (!GetTouchInputInfo(lParam, count, native, Marshal.SizeOf<TouchInput>()))
+            if (_nativeInputs.Length < count)
+                Array.Resize(ref _nativeInputs, Math.Max(count, Math.Max(4, _nativeInputs.Length * 2)));
+            if (!GetTouchInputInfo(lParam, count, _nativeInputs, TouchInputSize))
             {
                 DiagnosticsLog.Warning("input.native_touch_read_failed",
                     ("error", Marshal.GetLastWin32Error()));
                 return 0;
             }
 
-            var dpi = Math.Max(96u, GetDpiForWindow(windowHandle));
-            var contacts = new List<NativeTouchContact>(count);
-            foreach (var item in native)
+            _contacts.Clear();
+            for (var index = 0; index < count; index++)
             {
+                var item = _nativeInputs[index];
                 var point = new NativePoint
                 {
                     X = (int)Math.Round(item.X / 100d),
@@ -112,15 +126,15 @@ internal sealed class NativeTouchWindowSource : IDisposable
                     : (item.Flags & TouchEventUp) != 0
                         ? NativeTouchAction.Up
                         : NativeTouchAction.Move;
-                contacts.Add(new NativeTouchContact(
+                _contacts.Add(new NativeTouchContact(
                     item.Id,
-                    point.X * 96d / dpi,
-                    point.Y * 96d / dpi,
+                    point.X * 96d / _dpi,
+                    point.Y * 96d / _dpi,
                     action));
             }
 
-            if (contacts.Count > 0)
-                Frame?.Invoke(this, new NativeTouchFrameEventArgs(contacts));
+            if (_contacts.Count > 0)
+                Frame?.Invoke(this, _frameArgs);
         }
         catch (Exception exception)
         {

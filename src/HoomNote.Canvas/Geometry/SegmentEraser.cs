@@ -20,16 +20,38 @@ public static class SegmentEraser
             return [stroke];
         }
 
-        var localEraser = eraserPath
-            .Select(point => Vector2.Transform(point.ToVector2(), inverse))
-            .ToArray();
+        var localEraser = new Vector2[eraserPath.Count];
+        var minEraserX = float.PositiveInfinity;
+        var minEraserY = float.PositiveInfinity;
+        var maxEraserX = float.NegativeInfinity;
+        var maxEraserY = float.NegativeInfinity;
+        for (var eraserPointIndex = 0; eraserPointIndex < eraserPath.Count; eraserPointIndex++)
+        {
+            var transformed = Vector2.Transform(eraserPath[eraserPointIndex].ToVector2(), inverse);
+            localEraser[eraserPointIndex] = transformed;
+            minEraserX = MathF.Min(minEraserX, transformed.X);
+            minEraserY = MathF.Min(minEraserY, transformed.Y);
+            maxEraserX = MathF.Max(maxEraserX, transformed.X);
+            maxEraserY = MathF.Max(maxEraserY, transformed.Y);
+        }
+        var localEraserRadius = eraserRadius / StrokeGeometry.LinearScale(stroke.Transform);
+        var eraserInflation = localEraserRadius + stroke.Style.Width / 2d;
+        var eraserLeft = minEraserX - eraserInflation;
+        var eraserTop = minEraserY - eraserInflation;
+        var eraserRight = maxEraserX + eraserInflation;
+        var eraserBottom = maxEraserY + eraserInflation;
+        var eraserSegments = new EraserSegmentBounds[Math.Max(0, localEraser.Length - 1)];
+        for (var eraserSegmentIndex = 1; eraserSegmentIndex < localEraser.Length; eraserSegmentIndex++)
+            eraserSegments[eraserSegmentIndex - 1] = new EraserSegmentBounds(
+                localEraser[eraserSegmentIndex - 1], localEraser[eraserSegmentIndex]);
         var removed = new bool[stroke.Points.Count];
 
         if (stroke.Points.Count == 1)
         {
-            removed[0] = localEraser.Any(point =>
-                Vector2.Distance(point, stroke.Points[0].Position.ToVector2()) <=
-                eraserRadius + stroke.Style.Width / 2d);
+            var point = stroke.Points[0].Position.ToVector2();
+            var threshold = localEraserRadius + stroke.Style.Width / 2d;
+            for (var eraserPointIndex = 0; eraserPointIndex < localEraser.Length && !removed[0]; eraserPointIndex++)
+                removed[0] = Vector2.Distance(localEraser[eraserPointIndex], point) <= threshold;
         }
         else
         {
@@ -38,12 +60,25 @@ public static class SegmentEraser
                 var start = stroke.Points[strokeIndex - 1].Position.ToVector2();
                 var end = stroke.Points[strokeIndex].Position.ToVector2();
                 var pressure = Math.Max(stroke.Points[strokeIndex - 1].Pressure, stroke.Points[strokeIndex].Pressure);
-                var threshold = eraserRadius + stroke.Style.Width * pressure / 2d;
+                var threshold = localEraserRadius + stroke.Style.Width * pressure / 2d;
+                var strokeLeft = Math.Min(start.X, end.X) - threshold;
+                var strokeTop = Math.Min(start.Y, end.Y) - threshold;
+                var strokeRight = Math.Max(start.X, end.X) + threshold;
+                var strokeBottom = Math.Max(start.Y, end.Y) + threshold;
+                if (strokeRight < eraserLeft || strokeLeft > eraserRight ||
+                    strokeBottom < eraserTop || strokeTop > eraserBottom) continue;
                 var hit = localEraser.Length == 1 &&
                           StrokeGeometry.DistanceToSegment(localEraser[0], start, end) <= threshold;
-                for (var eraserIndex = 1; !hit && eraserIndex < localEraser.Length; eraserIndex++)
-                    hit = StrokeGeometry.SegmentDistance(start, end,
-                        localEraser[eraserIndex - 1], localEraser[eraserIndex]) <= threshold;
+                for (var eraserIndex = 0; !hit && eraserIndex < eraserSegments.Length; eraserIndex++)
+                {
+                    var eraserSegment = eraserSegments[eraserIndex];
+                    if (eraserSegment.MaxX + threshold < strokeLeft ||
+                        eraserSegment.MinX - threshold > strokeRight ||
+                        eraserSegment.MaxY + threshold < strokeTop ||
+                        eraserSegment.MinY - threshold > strokeBottom) continue;
+                    hit = StrokeGeometry.SegmentDistance(
+                        start, end, eraserSegment.Start, eraserSegment.End) <= threshold;
+                }
 
                 if (hit)
                 {
@@ -86,6 +121,25 @@ public static class SegmentEraser
                 // than copying every surviving value into a second large allocation.
                 Points = points
             });
+        }
+    }
+
+    private readonly record struct EraserSegmentBounds(
+        Vector2 Start,
+        Vector2 End,
+        float MinX,
+        float MinY,
+        float MaxX,
+        float MaxY)
+    {
+        public EraserSegmentBounds(Vector2 start, Vector2 end) : this(
+            start,
+            end,
+            MathF.Min(start.X, end.X),
+            MathF.Min(start.Y, end.Y),
+            MathF.Max(start.X, end.X),
+            MathF.Max(start.Y, end.Y))
+        {
         }
     }
 }
