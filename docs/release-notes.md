@@ -1,5 +1,5 @@
-# HoomNote 0.7.48
+# HoomNote 0.7.49
 
-- Moving ink, shapes, images, and multi-object selections now records the clean source region and selected content once, then reuses those GPU commands throughout the drag instead of rebuilding dense geometry on every pointer frame.
-- Move completion now uses the final pointer position and commits the last valid preview if pointer capture is lost, preventing fast moves from jumping backward, being discarded, or briefly showing the original object after release.
-- The committed-page correction remains visible until the renderer confirms the matching edit version, preventing stale originals from flashing during the page-cache replacement.
+- Moving ink, shapes, images, and multi-object selections now keeps the fast GPU move cache active through pointer release and the committed-page handoff, avoiding an expensive UI-thread redraw at the end of a drag.
+- Retained, pending, and standby page textures are now matched against the exact page revision, preventing a pre-move texture from being accepted as current and briefly restoring the original object.
+- A valid selection preview is now committed when Windows cancels a captured pointer, preventing completed moves from snapping back or being silently discarded on affected input devices.

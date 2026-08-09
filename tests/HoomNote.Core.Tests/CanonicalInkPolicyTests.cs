@@ -106,6 +106,22 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Fact]
+    public void RetainedFrameMustMatchTheExactPageRevision()
+    {
+        var pageId = Guid.NewGuid();
+        var revision = DateTimeOffset.UtcNow;
+
+        Assert.True(NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            pageId, revision, pageId, revision));
+        Assert.False(NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            pageId, revision, pageId, revision.AddTicks(-1)));
+        Assert.False(NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            pageId, revision, Guid.NewGuid(), revision));
+        Assert.False(NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            pageId, revision, pageId, revision, invalidated: true));
+    }
+
+    [Fact]
     public void DenseRasterSamplesAreReducedWithoutLosingEndpoints()
     {
         var points = Enumerable.Range(0, 2_001)

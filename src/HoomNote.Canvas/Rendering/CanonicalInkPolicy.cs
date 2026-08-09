@@ -63,6 +63,18 @@ public static class NavigationRefinementPolicy
         bool interactionActive,
         bool retainedFrameCurrent) =>
         interactionActive && !retainedFrameCurrent;
+
+    /// <summary>
+    /// A retained texture is current only when it was composed from this exact page revision.
+    /// Object ids alone are insufficient because moves preserve identity while changing transforms.
+    /// </summary>
+    public static bool IsRetainedFrameCurrent(
+        Guid pageId,
+        DateTimeOffset pageUpdatedAt,
+        Guid? retainedPageId,
+        DateTimeOffset? retainedUpdatedAt,
+        bool invalidated = false) =>
+        !invalidated && retainedPageId == pageId && retainedUpdatedAt == pageUpdatedAt;
 }
 
 public readonly record struct NavigationTileMetrics(

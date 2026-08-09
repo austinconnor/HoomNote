@@ -275,7 +275,10 @@ public sealed partial class MainPage : Page
         float Dpi,
         bool InteractionActive,
         int EditVersion);
-    private sealed record PageRenderSwitch(NotePage? SourcePage, Guid? TargetPageId);
+    private sealed record PageRenderSwitch(
+        NotePage? SourcePage,
+        Guid? TargetPageId,
+        DateTimeOffset? TargetPageUpdatedAt);
     private sealed record AdjacentPagePreview(
         Guid PageId,
         SizeD PageSize,
@@ -326,6 +329,7 @@ public sealed partial class MainPage : Page
     private RectD? _selectionTransformSourceBounds;
     private CanvasCommandList? _selectionTransformSourceCache;
     private CanvasCommandList? _selectionTransformObjectCache;
+    private bool _selectionTransformUsesMoveCache;
     private Transform2D _selectionTransformPreviewDelta = Transform2D.Identity;
     private readonly Dictionary<Guid, CanvasObject> _styleBrushOriginals = [];
     // The committed page is rendered by CanvasAnimatedControl on its dedicated game-loop
@@ -361,17 +365,21 @@ public sealed partial class MainPage : Page
     private PointD? _canvasContextPastePoint;
     private Point? _lastCanvasPointerPosition;
     private CanvasCommandList? _pageRenderCache;
+    private DateTimeOffset? _pageRenderCacheUpdatedAt;
     private CanvasRenderTarget? _lowZoomPageRaster;
     private Guid? _lowZoomPageRasterPageId;
+    private DateTimeOffset? _lowZoomPageRasterUpdatedAt;
     private bool _lowZoomPageRasterInvalidated;
     private CanvasRenderTarget? _pendingLowZoomPageRaster;
     private Guid? _pendingLowZoomPageRasterPageId;
+    private DateTimeOffset? _pendingLowZoomPageRasterUpdatedAt;
     private int _pendingLowZoomPageRasterObjectIndex;
     private double _pendingLowZoomPageRasterScale;
     // Keep the previous composed page alive so switching between two dense tabs is a texture
     // swap rather than another synchronous replay of millions of ink samples.
     private CanvasRenderTarget? _standbyLowZoomPageRaster;
     private Guid? _standbyLowZoomPageRasterPageId;
+    private DateTimeOffset? _standbyLowZoomPageRasterUpdatedAt;
     private readonly Dictionary<Guid, AdjacentPagePreview> _notebookPagePreviews = [];
     private readonly LinkedList<Guid> _notebookPagePreviewLru = [];
     private readonly Dictionary<Guid, LinkedListNode<Guid>> _notebookPagePreviewLruNodes = [];
@@ -3384,7 +3392,7 @@ public sealed partial class MainPage : Page
             ApplyPendingPageRenderInvalidations();
             var state = Volatile.Read(ref _publishedPageRenderState);
             if (state.Page is not { } page) return;
-            DrainPageRenderAppends(page.Id);
+            DrainPageRenderAppends(page);
             var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             _frameStrokeGeometryBuilds = 0;
             _frameNavigationTileBuilds = 0;
@@ -3559,20 +3567,24 @@ public sealed partial class MainPage : Page
         if (sourcePage is not null)
         {
             // Pull any just-finished strokes into the retained overlay before preserving it.
-            DrainPageRenderAppends(sourcePage.Id);
+            DrainPageRenderAppends(sourcePage);
             if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == sourcePage.Id &&
                 (_pageRenderOverlayBatches.Count > 0 || _pageRenderOverlays.Count > 0))
                 MergeOverlaysIntoLowZoomRaster(sourcePage);
         }
 
         CanvasRenderTarget? restoredRaster = null;
+        DateTimeOffset? restoredRasterUpdatedAt = null;
         if (pageSwitch.TargetPageId is { } targetPageId &&
             _standbyLowZoomPageRaster is not null &&
-            _standbyLowZoomPageRasterPageId == targetPageId)
+            _standbyLowZoomPageRasterPageId == targetPageId &&
+            _standbyLowZoomPageRasterUpdatedAt == pageSwitch.TargetPageUpdatedAt)
         {
             restoredRaster = _standbyLowZoomPageRaster;
+            restoredRasterUpdatedAt = _standbyLowZoomPageRasterUpdatedAt;
             _standbyLowZoomPageRaster = null;
             _standbyLowZoomPageRasterPageId = null;
+            _standbyLowZoomPageRasterUpdatedAt = null;
         }
 
         if (_lowZoomPageRaster is not null && !_lowZoomPageRasterInvalidated)
@@ -3580,6 +3592,7 @@ public sealed partial class MainPage : Page
             _standbyLowZoomPageRaster?.Dispose();
             _standbyLowZoomPageRaster = _lowZoomPageRaster;
             _standbyLowZoomPageRasterPageId = _lowZoomPageRasterPageId;
+            _standbyLowZoomPageRasterUpdatedAt = _lowZoomPageRasterUpdatedAt;
         }
         else
         {
@@ -3588,23 +3601,25 @@ public sealed partial class MainPage : Page
 
         _lowZoomPageRaster = restoredRaster;
         _lowZoomPageRasterPageId = restoredRaster is null ? null : pageSwitch.TargetPageId;
+        _lowZoomPageRasterUpdatedAt = restoredRasterUpdatedAt;
         _lowZoomPageRasterInvalidated = false;
         _preloadedFallbackPageId = null;
         ClearNavigationTileCacheCore();
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
         _pageRenderCachePageId = pageSwitch.TargetPageId;
+        _pageRenderCacheUpdatedAt = null;
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
         _pageRenderOverlays.Clear();
         _pageRenderCacheObjectIds.Clear();
     }
 
-    private void DrainPageRenderAppends(Guid pageId)
+    private void DrainPageRenderAppends(NotePage page)
     {
         while (_pendingPageRenderAppends.TryDequeue(out var pending))
         {
-            if (pageId != pending.PageId) continue;
+            if (page.Id != pending.PageId) continue;
             var canKeepCache =
                 ((_pageRenderCache is not null && _pageRenderCachePageId == pending.PageId) ||
                  (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == pending.PageId) ||
@@ -3613,6 +3628,10 @@ public sealed partial class MainPage : Page
             if (canKeepCache)
             {
                 _pageRenderOverlays.Add(pending.Object);
+                if (_lowZoomPageRasterPageId == page.Id)
+                    _lowZoomPageRasterUpdatedAt = page.UpdatedAt;
+                if (_pageRenderCachePageId == page.Id)
+                    _pageRenderCacheUpdatedAt = page.UpdatedAt;
                 continue;
             }
 
@@ -3761,7 +3780,7 @@ public sealed partial class MainPage : Page
         // Move gestures never change local geometry. Replay the clean source patch and selected
         // objects recorded at pointer-down, then apply only the current translation. This keeps
         // pointer frames O(1) even when the selection contains dense imported handwriting.
-        if (_transformHandle == TransformHandle.Move &&
+        if (_selectionTransformUsesMoveCache &&
             _selectionTransformSourceCache is not null &&
             _selectionTransformObjectCache is not null)
         {
@@ -3992,9 +4011,11 @@ public sealed partial class MainPage : Page
     }
 
     private bool HasCurrentRetainedFrame(NotePage page) =>
-        (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id &&
-         !_lowZoomPageRasterInvalidated) ||
-        (_pageRenderCache is not null && _pageRenderCachePageId == page.Id);
+        (_lowZoomPageRaster is not null && NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            page.Id, page.UpdatedAt, _lowZoomPageRasterPageId,
+            _lowZoomPageRasterUpdatedAt, _lowZoomPageRasterInvalidated)) ||
+        (_pageRenderCache is not null && NavigationRefinementPolicy.IsRetainedFrameCurrent(
+            page.Id, page.UpdatedAt, _pageRenderCachePageId, _pageRenderCacheUpdatedAt));
 
     private static bool CanUseNavigationSnapshot(NotePage page, PageRenderState state)
     {
@@ -4122,6 +4143,7 @@ public sealed partial class MainPage : Page
         _navigationTileScale = scale;
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
+        _pageRenderCacheUpdatedAt = null;
         if (_pageRenderCachePageId != page.Id || _pageRenderCacheObjectIds.Count == 0)
         {
             _pageRenderCacheObjectIds.Clear();
@@ -4310,29 +4332,41 @@ public sealed partial class MainPage : Page
 
     private bool EnsureLowZoomPageRaster(CanvasDevice device, NotePage page)
     {
-        if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == page.Id &&
-            !_lowZoomPageRasterInvalidated)
+        if (_lowZoomPageRaster is not null && NavigationRefinementPolicy.IsRetainedFrameCurrent(
+                page.Id, page.UpdatedAt, _lowZoomPageRasterPageId,
+                _lowZoomPageRasterUpdatedAt, _lowZoomPageRasterInvalidated))
         {
             if (_pageRenderCacheObjectIds.Count == 0)
                 _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
             return true;
         }
-        if (_standbyLowZoomPageRaster is not null && _standbyLowZoomPageRasterPageId == page.Id)
+        if (_standbyLowZoomPageRaster is not null && _standbyLowZoomPageRasterPageId == page.Id &&
+            _standbyLowZoomPageRasterUpdatedAt == page.UpdatedAt)
         {
             _lowZoomPageRaster?.Dispose();
             _lowZoomPageRaster = _standbyLowZoomPageRaster;
             _lowZoomPageRasterPageId = page.Id;
+            _lowZoomPageRasterUpdatedAt = _standbyLowZoomPageRasterUpdatedAt;
             _lowZoomPageRasterInvalidated = false;
             _standbyLowZoomPageRaster = null;
             _standbyLowZoomPageRasterPageId = null;
+            _standbyLowZoomPageRasterUpdatedAt = null;
             _pageRenderCacheObjectIds.Clear();
             _pageRenderCacheObjectIds.UnionWith(page.Objects.Select(item => item.Id));
             return true;
+        }
+        if (_standbyLowZoomPageRasterPageId == page.Id)
+        {
+            _standbyLowZoomPageRaster?.Dispose();
+            _standbyLowZoomPageRaster = null;
+            _standbyLowZoomPageRasterPageId = null;
+            _standbyLowZoomPageRasterUpdatedAt = null;
         }
         if (Volatile.Read(ref _renderInteractionPauseRequested) != 0) return false;
         ClearNavigationTileCacheCore();
         var rasterScale = NavigationSnapshotScale(page);
         if (_pendingLowZoomPageRaster is null || _pendingLowZoomPageRasterPageId != page.Id ||
+            _pendingLowZoomPageRasterUpdatedAt != page.UpdatedAt ||
             Math.Abs(_pendingLowZoomPageRasterScale - rasterScale) > 0.0001)
         {
             CancelPendingLowZoomPageRasterCore();
@@ -4341,6 +4375,7 @@ public sealed partial class MainPage : Page
             _pendingLowZoomPageRaster = new CanvasRenderTarget(
                 device, (float)width, (float)height, 96);
             _pendingLowZoomPageRasterPageId = page.Id;
+            _pendingLowZoomPageRasterUpdatedAt = page.UpdatedAt;
             _pendingLowZoomPageRasterScale = rasterScale;
             _pendingLowZoomPageRasterObjectIndex = 0;
             var cancellation = new CancellationTokenSource();
@@ -4383,6 +4418,7 @@ public sealed partial class MainPage : Page
         var raster = _pendingLowZoomPageRaster;
         _pendingLowZoomPageRaster = null;
         _pendingLowZoomPageRasterPageId = null;
+        _pendingLowZoomPageRasterUpdatedAt = null;
         _pendingLowZoomPageRasterObjectIndex = 0;
         _pendingLowZoomPageRasterScale = 0;
         if (Interlocked.CompareExchange(ref _pageRasterBuildCancellation, null, buildCancellation) ==
@@ -4391,10 +4427,12 @@ public sealed partial class MainPage : Page
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = raster;
         _lowZoomPageRasterPageId = page.Id;
+        _lowZoomPageRasterUpdatedAt = page.UpdatedAt;
         _lowZoomPageRasterInvalidated = false;
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
         _pageRenderCachePageId = page.Id;
+        _pageRenderCacheUpdatedAt = null;
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
         _pageRenderOverlays.Clear();
@@ -4415,6 +4453,7 @@ public sealed partial class MainPage : Page
         _pendingLowZoomPageRaster?.Dispose();
         _pendingLowZoomPageRaster = null;
         _pendingLowZoomPageRasterPageId = null;
+        _pendingLowZoomPageRasterUpdatedAt = null;
         _pendingLowZoomPageRasterObjectIndex = 0;
         _pendingLowZoomPageRasterScale = 0;
     }
@@ -4430,9 +4469,11 @@ public sealed partial class MainPage : Page
         _pageRenderCache?.Dispose();
         _pageRenderCache = cache;
         _pageRenderCachePageId = page.Id;
+        _pageRenderCacheUpdatedAt = page.UpdatedAt;
         _lowZoomPageRaster?.Dispose();
         _lowZoomPageRaster = null;
         _lowZoomPageRasterPageId = null;
+        _lowZoomPageRasterUpdatedAt = null;
         _lowZoomPageRasterInvalidated = false;
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
@@ -4456,11 +4497,13 @@ public sealed partial class MainPage : Page
         _pageRenderOverlayBatches.Clear();
         _pageRenderCacheObjectIds.UnionWith(_pageRenderOverlays.Select(item => item.Id));
         _pageRenderOverlays.Clear();
+        _lowZoomPageRasterUpdatedAt = page.UpdatedAt;
         // A vector command list recorded before these overlays were merged no longer contains
         // the complete page. Rebuild it lazily only after interaction returns to detail mode.
         _pageRenderCache?.Dispose();
         _pageRenderCache = null;
         _pageRenderCachePageId = null;
+        _pageRenderCacheUpdatedAt = null;
     }
 
     private static double NavigationSnapshotScale(NotePage page) =>
@@ -5701,6 +5744,13 @@ public sealed partial class MainPage : Page
         if (current.PointerDeviceType == PointerDeviceType.Pen || _gestureTool != EditorTool.Pan)
             _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         RestoreEraseSnapshot();
+        // Windows can cancel a captured pointer when the device or window changes capture even
+        // though the drag itself completed normally. Preserve the last valid selection preview
+        // instead of silently snapping the object back and dropping the user's move.
+        if (_gestureTool == EditorTool.Select && _page is not null && _document is not null &&
+            _textSelectionAnchor is null &&
+            (_transformPreview is not null || _multiTransformPreviews.Count > 0))
+            CommitSelectionTransform(current.Position);
         _textSelectionAnchor = null;
         _textSelectionDragBounds = null;
         EndPointer(e);
@@ -5766,6 +5816,7 @@ public sealed partial class MainPage : Page
         _multiTransformPreviews.Clear();
         _selectionTransformOriginalIds.Clear();
         _selectionTransformSourceBounds = null;
+        _selectionTransformUsesMoveCache = false;
         _selectionTransformPreviewDelta = Transform2D.Identity;
         DisposeSelectionTransformCaches();
     }
@@ -6679,6 +6730,7 @@ public sealed partial class MainPage : Page
         _selectionTransformSourceBounds = originals.Count == 0
             ? null
             : CombinedBounds(originals).Inflate(Math.Max(2, 3 / Math.Max(_zoom, 0.08)));
+        _selectionTransformUsesMoveCache = _transformHandle == TransformHandle.Move;
         _selectionTransformPreviewDelta = Transform2D.Identity;
         BuildSelectionMoveCaches(originals);
     }
@@ -6686,7 +6738,7 @@ public sealed partial class MainPage : Page
     private void BuildSelectionMoveCaches(IReadOnlyCollection<CanvasObject> originals)
     {
         DisposeSelectionTransformCaches();
-        if (_transformHandle != TransformHandle.Move || _page is not { } page ||
+        if (!_selectionTransformUsesMoveCache || _page is not { } page ||
             _selectionTransformSourceBounds is not { } sourceBounds || originals.Count == 0)
             return;
 
@@ -11488,7 +11540,7 @@ public sealed partial class MainPage : Page
     private void RequestPageRenderSwitch(NotePage? targetPage)
     {
         Interlocked.Exchange(ref _pendingPageRenderSwitch,
-            new PageRenderSwitch(_publishedPageSnapshot, targetPage?.Id));
+            new PageRenderSwitch(_publishedPageSnapshot, targetPage?.Id, targetPage?.UpdatedAt));
     }
 
     private void InvalidatePageRenderCacheCore(bool preserveSharpFallback = true)
@@ -11513,6 +11565,7 @@ public sealed partial class MainPage : Page
             _standbyLowZoomPageRaster?.Dispose();
             _standbyLowZoomPageRaster = null;
             _standbyLowZoomPageRasterPageId = null;
+            _standbyLowZoomPageRasterUpdatedAt = null;
         }
         // Undo/redo and other same-page edits must never fall through to the lower-resolution
         // notebook preview. Keep the last complete raster on screen while its replacement is
@@ -11530,6 +11583,7 @@ public sealed partial class MainPage : Page
             _lowZoomPageRaster?.Dispose();
             _lowZoomPageRaster = null;
             _lowZoomPageRasterPageId = null;
+            _lowZoomPageRasterUpdatedAt = null;
             _lowZoomPageRasterInvalidated = false;
         }
         _pageRenderCache?.Dispose();
@@ -11537,6 +11591,7 @@ public sealed partial class MainPage : Page
         _pageRenderOverlayBatches.Clear();
         _pageRenderCache = null;
         _pageRenderCachePageId = null;
+        _pageRenderCacheUpdatedAt = null;
         _pageRenderCacheObjectIds.Clear();
         _pageRenderOverlays.Clear();
     }
@@ -11551,6 +11606,7 @@ public sealed partial class MainPage : Page
         _standbyLowZoomPageRaster?.Dispose();
         _standbyLowZoomPageRaster = null;
         _standbyLowZoomPageRasterPageId = null;
+        _standbyLowZoomPageRasterUpdatedAt = null;
         InvalidatePageRenderCacheCore(preserveSharpFallback: false);
     }
 
