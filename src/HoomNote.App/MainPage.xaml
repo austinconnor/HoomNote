@@ -325,7 +325,13 @@
                               IsHorizontalRailEnabled="True" IsVerticalRailEnabled="False" ZoomMode="Disabled">
                     <StackPanel x:Name="PresetToolButtons" Orientation="Horizontal" Spacing="3"
                                 HorizontalAlignment="Left" AllowDrop="True"
-                                DragOver="OnPresetToolbarDragOver" Drop="OnPresetToolbarDrop" />
+                                DragOver="OnPresetToolbarDragOver" Drop="OnPresetToolbarDrop">
+                        <StackPanel.ChildrenTransitions>
+                            <TransitionCollection>
+                                <RepositionThemeTransition />
+                            </TransitionCollection>
+                        </StackPanel.ChildrenTransitions>
+                    </StackPanel>
                 </ScrollViewer>
                 <Button x:Name="ToolbarOverflowActionsButton" Grid.Column="3"
                         Style="{StaticResource HoomNoteToolbarButtonStyle}" ToolTipService.ToolTip="Workspace actions">

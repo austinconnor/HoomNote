@@ -6,7 +6,7 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 12;
+    public const int CurrentVersion = 13;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
@@ -41,6 +41,33 @@ public sealed record ToolbarPresetPreference
     public double Opacity { get; init; } = 1;
     public double Smoothing { get; init; } = 0.78;
     public bool StraightLine { get; init; }
+    public string? ShapeKind { get; init; }
+}
+
+public static class ToolbarPresetDefaults
+{
+    public static readonly string[] ShapeKinds = ["Rectangle", "Star", "Line", "Circle"];
+
+    public static bool EnsureShapePresets(List<ToolbarPresetPreference> presets)
+    {
+        var changed = false;
+        foreach (var shapeKind in ShapeKinds)
+        {
+            if (presets.Any(preset =>
+                    string.Equals(preset.Tool, "Shape", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(preset.ShapeKind, shapeKind, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            presets.Add(new ToolbarPresetPreference
+            {
+                Tool = "Shape",
+                ShapeKind = shapeKind,
+                PressureSensitivity = 0,
+                Smoothing = 0.9
+            });
+            changed = true;
+        }
+        return changed;
+    }
 }
 
 public sealed record NotebookFolderPreference

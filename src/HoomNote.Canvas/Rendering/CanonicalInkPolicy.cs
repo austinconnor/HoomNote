@@ -25,6 +25,21 @@ public static class CanonicalInkPolicy
 /// </summary>
 public static class NavigationRefinementPolicy
 {
+    public static bool IsViewportNavigationActive(
+        bool pointerDown,
+        bool pointerPans,
+        bool touchActive,
+        bool touchInertiaActive,
+        bool wheelZoomAnimating,
+        bool wheelScrollAnimating,
+        bool zoomNavigationActive) =>
+        (pointerDown && pointerPans) ||
+        touchActive ||
+        touchInertiaActive ||
+        wheelZoomAnimating ||
+        wheelScrollAnimating ||
+        zoomNavigationActive;
+
     public static int TileBuildBudget(bool interactionActive) => interactionActive ? 0 : 1;
 
     public static bool CanBuildTile(

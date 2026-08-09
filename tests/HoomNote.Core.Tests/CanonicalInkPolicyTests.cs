@@ -25,6 +25,27 @@ public sealed class CanonicalInkPolicyTests
         Assert.Equal(expected, NavigationRefinementPolicy.TileBuildBudget(interactionActive));
     }
 
+    [Fact]
+    public void EditingPointerDoesNotEnterViewportNavigationMode()
+    {
+        Assert.False(NavigationRefinementPolicy.IsViewportNavigationActive(
+            pointerDown: true,
+            pointerPans: false,
+            touchActive: false,
+            touchInertiaActive: false,
+            wheelZoomAnimating: false,
+            wheelScrollAnimating: false,
+            zoomNavigationActive: false));
+        Assert.True(NavigationRefinementPolicy.IsViewportNavigationActive(
+            pointerDown: true,
+            pointerPans: true,
+            touchActive: false,
+            touchInertiaActive: false,
+            wheelZoomAnimating: false,
+            wheelScrollAnimating: false,
+            zoomNavigationActive: false));
+    }
+
     [Theory]
     [InlineData(false, false, true)]
     [InlineData(true, false, false)]

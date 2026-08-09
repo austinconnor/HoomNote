@@ -565,6 +565,9 @@ public sealed partial class MainPage : Page
     private CancellationTokenSource? _toolTipCloseCancellation;
     private long _lastPasteTimestamp;
     private Guid? _draggedPresetId;
+    private int _draggedPresetOriginalIndex = -1;
+    private bool _presetOrderChangedDuringDrag;
+    private bool _presetDropAccepted;
     private readonly SemaphoreSlim _pasteGate = new(1, 1);
     private readonly Dictionary<ColumnDefinition, CancellationTokenSource> _sidebarAnimations = [];
     private readonly HashSet<Guid> _pageOcrIndexedThisSession = [];
@@ -775,6 +778,7 @@ public sealed partial class MainPage : Page
             {
                 var preset = _userPreferences.ToolbarPresets[index];
                 if (string.Equals(preset.Tool, nameof(EditorTool.Highlighter), StringComparison.OrdinalIgnoreCase)) continue;
+                if (TryGetPresetShape(preset, out _)) continue;
                 if (string.Equals(preset.Tool, nameof(EditorTool.Pen), StringComparison.OrdinalIgnoreCase) &&
                     preset.PressureSensitivity == 0 && preset.Smoothing >= 0.9) continue;
                 _userPreferences.ToolbarPresets[index] = preset with
@@ -785,6 +789,7 @@ public sealed partial class MainPage : Page
                 };
                 migratedInkPresets = true;
             }
+            migratedInkPresets |= ToolbarPresetDefaults.EnsureShapePresets(_userPreferences.ToolbarPresets);
             if (migratedInkPresets)
                 await App.SaveSharedUserPreferencesAsync(_userSettingsStore, _userPreferences);
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
@@ -3323,10 +3328,14 @@ public sealed partial class MainPage : Page
         // Ink, eraser, selection, and style gestures render exclusively on the
         // interaction overlay. Only actual viewport navigation may select the
         // low-memory navigation snapshot for the committed page.
-        var interactionActive = _isPointerDown ||
-                                _touchPoints.Count > 0 ||
-                                _touchInertiaActive || _wheelZoomAnimating || _wheelScrollAnimating ||
-                                _zoomNavigationActive;
+        var interactionActive = NavigationRefinementPolicy.IsViewportNavigationActive(
+            _isPointerDown,
+            _gestureTool == EditorTool.Pan,
+            _touchPoints.Count > 0,
+            _touchInertiaActive,
+            _wheelZoomAnimating,
+            _wheelScrollAnimating,
+            _zoomNavigationActive);
         Volatile.Write(ref _publishedPageRenderState, new PageRenderState(
             _publishedPageSnapshot,
             _zoom,
@@ -3945,8 +3954,13 @@ public sealed partial class MainPage : Page
 
     private bool ShouldDrawInteractiveViewport(NotePage page, PageRenderState state)
     {
+        // Editing pauses refinement without entering the low-resolution navigation path. If no
+        // current retained frame exists, use the source scene until input ends rather than showing
+        // an obsolete frame or waiting for an idle raster build.
+        var immediateInputRequested = Volatile.Read(ref _renderInteractionPauseRequested) != 0;
         if (NavigationRefinementPolicy.ShouldUseSourceVectorsForInteraction(
-                state.InteractionActive, HasCurrentRetainedFrame(page)))
+                state.InteractionActive || immediateInputRequested,
+                HasCurrentRetainedFrame(page)))
             return true;
         // When a current retained frame exists, interaction stays a single textured page plus
         // transient overlays. Native tiles refine only after the viewport settles.
@@ -9101,7 +9115,9 @@ public sealed partial class MainPage : Page
 
     private async Task AddToolbarPresetAsync(EditorTool tool)
     {
-        if (_userPreferences.ToolbarPresets.Count >= ToolbarPresetLimit)
+        var editablePresetCount = _userPreferences.ToolbarPresets.Count(preset =>
+            !TryGetPresetShape(preset, out _));
+        if (editablePresetCount >= ToolbarPresetLimit)
         {
             ImportInfo.Title = "Toolbar is full";
             ImportInfo.Message =
@@ -9151,7 +9167,9 @@ public sealed partial class MainPage : Page
         PresetToolButtons.Children.Clear();
         foreach (var preset in _userPreferences.ToolbarPresets)
         {
-            FrameworkElement swatch = preset.Tool == nameof(EditorTool.Highlighter)
+            FrameworkElement swatch = TryGetPresetShape(preset, out var shape)
+                ? CreateShapePresetSwatch(shape)
+                : preset.Tool == nameof(EditorTool.Highlighter)
                 ? new Border
                 {
                     Width = 20, Height = 10, CornerRadius = new CornerRadius(3),
@@ -9166,29 +9184,12 @@ public sealed partial class MainPage : Page
                     Stroke = new SolidColorBrush(Color.FromArgb(140, 255, 255, 255)),
                     StrokeThickness = 1
                 };
-            var content = new Grid();
-            var grip = new Border
-            {
-                Tag = preset.Id,
-                CanDrag = true,
-                Width = 7,
-                Height = 26,
-                HorizontalAlignment = HorizontalAlignment.Left,
-                CornerRadius = new CornerRadius(4),
-                Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0))
-            };
-            SetTransientToolTip(grip, "Drag to reorder");
-            grip.Tapped += OnPresetGripTapped;
-            grip.DragStarting += OnPresetDragStarting;
-            grip.DropCompleted += OnPresetDropCompleted;
-            content.Children.Add(swatch);
-            content.Children.Add(grip);
 
             var tile = new Border
             {
                 Tag = preset.Id,
-                Child = content,
-                CanDrag = false,
+                Child = swatch,
+                CanDrag = true,
                 Width = 28,
                 Height = 32,
                 Padding = new Thickness(2),
@@ -9197,19 +9198,72 @@ public sealed partial class MainPage : Page
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            var mode = preset.Tool == nameof(EditorTool.Highlighter)
+            var mode = TryGetPresetShape(preset, out shape)
+                ? ShapeDisplayName(shape)
+                : preset.Tool == nameof(EditorTool.Highlighter)
                 ? preset.StraightLine ? "straight" : "freeform"
                 : "constant width";
-            SetTransientToolTip(tile, $"{preset.Tool} • {preset.Color} • {preset.Width:0.#} • {mode}");
+            var description = TryGetPresetShape(preset, out _)
+                ? $"{mode} shortcut • hold and drag to reorder"
+                : $"{preset.Tool} • {preset.Color} • {preset.Width:0.#} • {mode} • hold and drag to reorder";
+            SetTransientToolTip(tile, description);
             tile.Tapped += OnToolbarPresetTapped;
-            var flyout = new MenuFlyout();
-            var remove = new MenuFlyoutItem { Text = "Remove preset", Tag = preset.Id };
-            remove.Click += OnRemoveToolbarPresetClick;
-            flyout.Items.Add(remove);
-            tile.ContextFlyout = flyout;
+            tile.DragStarting += OnPresetDragStarting;
+            tile.DropCompleted += OnPresetDropCompleted;
+            if (!TryGetPresetShape(preset, out _))
+            {
+                var flyout = new MenuFlyout();
+                var remove = new MenuFlyoutItem { Text = "Remove preset", Tag = preset.Id };
+                remove.Click += OnRemoveToolbarPresetClick;
+                flyout.Items.Add(remove);
+                tile.ContextFlyout = flyout;
+            }
             PresetToolButtons.Children.Add(tile);
         }
         RebuildStylePresetPicker();
+    }
+
+    private static bool TryGetPresetShape(ToolbarPresetPreference preset, out ShapeKind shape)
+    {
+        shape = default;
+        return string.Equals(preset.Tool, nameof(EditorTool.Shape), StringComparison.OrdinalIgnoreCase) &&
+               Enum.TryParse(preset.ShapeKind, ignoreCase: true, out shape);
+    }
+
+    private static FrameworkElement CreateShapePresetSwatch(ShapeKind shape)
+    {
+        var stroke = new SolidColorBrush(Color.FromArgb(255, 74, 178, 255));
+        return shape switch
+        {
+            ShapeKind.Rectangle => new Microsoft.UI.Xaml.Shapes.Rectangle
+            {
+                Width = 19, Height = 14, RadiusX = 1.5, RadiusY = 1.5,
+                Stroke = stroke, StrokeThickness = 2
+            },
+            ShapeKind.Circle => new Microsoft.UI.Xaml.Shapes.Ellipse
+            {
+                Width = 17, Height = 17, Stroke = stroke, StrokeThickness = 2
+            },
+            ShapeKind.Line => new Microsoft.UI.Xaml.Shapes.Line
+            {
+                Width = 20, Height = 20, X1 = 2, Y1 = 17, X2 = 18, Y2 = 3,
+                Stroke = stroke, StrokeThickness = 2
+            },
+            ShapeKind.Star => new Microsoft.UI.Xaml.Shapes.Polygon
+            {
+                Width = 19,
+                Height = 19,
+                Stretch = Stretch.Fill,
+                Stroke = stroke,
+                StrokeThickness = 1.8,
+                Points = new PointCollection
+                {
+                    new(10, 1), new(12.7, 6.8), new(19, 7.4), new(14.3, 11.6), new(15.8, 18),
+                    new(10, 14.7), new(4.2, 18), new(5.7, 11.6), new(1, 7.4), new(7.3, 6.8)
+                }
+            },
+            _ => new FontIcon { Glyph = "□", FontSize = 18, Foreground = stroke }
+        };
     }
 
     private void SetActiveToolbarPreset(Guid? presetId)
@@ -9242,12 +9296,14 @@ public sealed partial class MainPage : Page
         e.Handled = true;
     }
 
-    private static void OnPresetGripTapped(object sender, TappedRoutedEventArgs e) => e.Handled = true;
-
     private void OnPresetDragStarting(UIElement sender, DragStartingEventArgs args)
     {
         if (sender is not FrameworkElement { Tag: Guid id }) return;
         _draggedPresetId = id;
+        _draggedPresetOriginalIndex = _userPreferences.ToolbarPresets.FindIndex(item => item.Id == id);
+        _presetOrderChangedDuringDrag = false;
+        _presetDropAccepted = false;
+        sender.Opacity = 0.45;
         args.AllowedOperations = DataPackageOperation.Move;
         args.Data.SetText($"hoomnote-preset:{id:D}");
     }
@@ -9257,45 +9313,94 @@ public sealed partial class MainPage : Page
         if (_draggedPresetId is null) return;
         e.AcceptedOperation = DataPackageOperation.Move;
         e.DragUIOverride.IsCaptionVisible = false;
+        ReorderDraggedPreset(e.GetPosition(PresetToolButtons).X);
         e.Handled = true;
     }
 
     private async void OnPresetToolbarDrop(object sender, DragEventArgs e)
     {
-        if (_draggedPresetId is not { } sourceId) return;
+        if (_draggedPresetId is null) return;
+        ReorderDraggedPreset(e.GetPosition(PresetToolButtons).X);
+        _presetDropAccepted = true;
+        if (_presetOrderChangedDuringDrag)
+        {
+            await PersistUserPreferencesAsync("Reordered toolbar presets");
+            DiagnosticsLog.Info("preset.reordered");
+        }
+        e.Handled = true;
+    }
+
+    private void ReorderDraggedPreset(double pointerX)
+    {
+        if (_draggedPresetId is not { } sourceId || PresetToolButtons.Children.Count < 2) return;
         var sourceIndex = _userPreferences.ToolbarPresets.FindIndex(item => item.Id == sourceId);
         if (sourceIndex < 0) return;
-        var pointerX = e.GetPosition(PresetToolButtons).X;
-        var targetIndex = _userPreferences.ToolbarPresets.Count;
+        var targetIndex = sourceIndex;
+        var closestDistance = double.MaxValue;
         for (var index = 0; index < PresetToolButtons.Children.Count; index++)
         {
             if (PresetToolButtons.Children[index] is not FrameworkElement child) continue;
             var left = child.TransformToVisual(PresetToolButtons).TransformPoint(new Point(0, 0)).X;
-            if (pointerX < left + child.ActualWidth / 2)
-            {
-                targetIndex = index;
-                break;
-            }
+            var distance = Math.Abs(pointerX - (left + child.ActualWidth / 2));
+            if (distance >= closestDistance) continue;
+            closestDistance = distance;
+            targetIndex = index;
         }
-        var moved = _userPreferences.ToolbarPresets[sourceIndex];
+        if (targetIndex == sourceIndex) return;
+        var movedPreset = _userPreferences.ToolbarPresets[sourceIndex];
         _userPreferences.ToolbarPresets.RemoveAt(sourceIndex);
-        if (sourceIndex < targetIndex) targetIndex--;
-        _userPreferences.ToolbarPresets.Insert(Math.Clamp(targetIndex, 0,
-            _userPreferences.ToolbarPresets.Count), moved);
-        _draggedPresetId = null;
-        RebuildPresetToolbar();
-        await PersistUserPreferencesAsync("Reordered toolbar presets");
-        DiagnosticsLog.Info("preset.reordered");
-        e.Handled = true;
+        _userPreferences.ToolbarPresets.Insert(targetIndex, movedPreset);
+        var movedTile = PresetToolButtons.Children[sourceIndex];
+        PresetToolButtons.Children.RemoveAt(sourceIndex);
+        PresetToolButtons.Children.Insert(targetIndex, movedTile);
+        _presetOrderChangedDuringDrag = true;
     }
 
-    private void OnPresetDropCompleted(UIElement sender, DropCompletedEventArgs args) => _draggedPresetId = null;
+    private void OnPresetDropCompleted(UIElement sender, DropCompletedEventArgs args)
+    {
+        sender.Opacity = 1;
+        if (!_presetDropAccepted && _draggedPresetId is { } sourceId && _draggedPresetOriginalIndex >= 0)
+        {
+            var currentIndex = _userPreferences.ToolbarPresets.FindIndex(item => item.Id == sourceId);
+            var restoreIndex = Math.Clamp(_draggedPresetOriginalIndex, 0,
+                Math.Max(0, _userPreferences.ToolbarPresets.Count - 1));
+            if (currentIndex >= 0 && currentIndex != restoreIndex)
+            {
+                var movedPreset = _userPreferences.ToolbarPresets[currentIndex];
+                _userPreferences.ToolbarPresets.RemoveAt(currentIndex);
+                _userPreferences.ToolbarPresets.Insert(restoreIndex, movedPreset);
+                var movedTile = PresetToolButtons.Children[currentIndex];
+                PresetToolButtons.Children.RemoveAt(currentIndex);
+                PresetToolButtons.Children.Insert(restoreIndex, movedTile);
+            }
+        }
+        _draggedPresetId = null;
+        _draggedPresetOriginalIndex = -1;
+        _presetOrderChangedDuringDrag = false;
+        _presetDropAccepted = false;
+    }
 
     private void OnToolbarPresetTapped(object sender, TappedRoutedEventArgs e)
     {
         if (sender is not FrameworkElement { Tag: Guid id }) return;
         var preset = _userPreferences.ToolbarPresets.FirstOrDefault(item => item.Id == id);
         if (preset is null) return;
+        if (TryGetPresetShape(preset, out var shape))
+        {
+            _applyingToolbarPreset = true;
+            try
+            {
+                ActivateTool(EditorTool.Shape);
+                SetSelectedShapeKind(shape, syncInspector: true);
+            }
+            finally
+            {
+                _applyingToolbarPreset = false;
+            }
+            SetActiveToolbarPreset(null);
+            StatusText.Text = $"{ShapeDisplayName(shape)} shape selected";
+            return;
+        }
         var presetTool = string.Equals(preset.Tool, "Pencil", StringComparison.OrdinalIgnoreCase)
             ? nameof(EditorTool.Pen)
             : preset.Tool;
@@ -11276,6 +11381,17 @@ public sealed partial class MainPage : Page
         _preloadedFallbackPageId = null;
         CancelPendingLowZoomPageRasterCore();
         ClearNavigationTileCacheCore();
+        var publishedPage = Volatile.Read(ref _publishedPageRenderState).Page;
+        // Append-only ink can live solely in overlay batches while the dense page raster remains
+        // untouched. Fold those completed strokes into the fallback before a move/erase clears
+        // the overlays, so a structural edit cannot temporarily resurrect an older page image.
+        if (publishedPage is not null &&
+            _lowZoomPageRaster is not null &&
+            _lowZoomPageRasterPageId == publishedPage.Id &&
+            (_pageRenderOverlayBatches.Count > 0 || _pageRenderOverlays.Count > 0))
+        {
+            MergeOverlaysIntoLowZoomRaster(publishedPage);
+        }
         if (_lowZoomPageRasterPageId is { } invalidatedPageId &&
             _standbyLowZoomPageRasterPageId == invalidatedPageId)
         {

@@ -910,6 +910,41 @@ public sealed class PersistenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public void ToolbarPresetDefaults_AppendsShapesOnceInRequestedOrder()
+    {
+        var pen = new ToolbarPresetPreference { Tool = "Pen", Color = "#2E86DE" };
+        var presets = new List<ToolbarPresetPreference> { pen };
+
+        Assert.True(ToolbarPresetDefaults.EnsureShapePresets(presets));
+        Assert.Equal(pen.Id, presets[0].Id);
+        Assert.Equal(
+            new[] { "Rectangle", "Star", "Line", "Circle" },
+            presets.Skip(1).Select(preset => preset.ShapeKind));
+        Assert.All(presets.Skip(1), preset => Assert.Equal("Shape", preset.Tool));
+        Assert.False(ToolbarPresetDefaults.EnsureShapePresets(presets));
+        Assert.Equal(5, presets.Count);
+    }
+
+    [Fact]
+    public async Task UserSettings_PersistsShapePresetKindAndOrder()
+    {
+        var path = Path.Combine(_root, "shape-presets.json");
+        var preferences = new UserPreferences();
+        ToolbarPresetDefaults.EnsureShapePresets(preferences.ToolbarPresets);
+        var star = preferences.ToolbarPresets[1];
+        preferences.ToolbarPresets.RemoveAt(1);
+        preferences.ToolbarPresets.Insert(0, star);
+
+        await new LocalUserSettingsStore(path).SaveAsync(preferences);
+        var loaded = await new LocalUserSettingsStore(path).LoadAsync();
+
+        Assert.Equal("Star", loaded.ToolbarPresets[0].ShapeKind);
+        Assert.Equal(
+            new[] { "Star", "Rectangle", "Line", "Circle" },
+            loaded.ToolbarPresets.Select(preset => preset.ShapeKind));
+    }
+
+    [Fact]
     public async Task UserSettings_MigratesOnlyLegacyBuiltInHighlighterYellow()
     {
         var legacyPath = Path.Combine(_root, "legacy-highlighter.json");
