@@ -344,6 +344,7 @@ public sealed partial class MainPage : Page
     private PageRenderSwitch? _pendingPageRenderSwitch;
     private int _strokeGeometryClearRequested;
     private int _navigationTileClearRequested;
+    private int _staleNavigationTileClearRequested;
     private int _erasePreviewCommitVersion = -1;
     private int _erasePreviewRetireQueued;
     private int _transformPreviewCommitVersion = -1;
@@ -400,6 +401,12 @@ public sealed partial class MainPage : Page
     private Guid? _navigationTilePageId;
     private double _navigationTileScale;
     private long _navigationTileBytes;
+    // Structural edits keep the last sharp tiles under their move/erase correction overlay.
+    // Current-revision tiles replace them progressively without exposing the low-res snapshot.
+    private readonly Dictionary<(int X, int Y), CanvasRenderTarget> _staleNavigationTiles = [];
+    private Guid? _staleNavigationTilePageId;
+    private double _staleNavigationTileScale;
+    private long _staleNavigationTileBytes;
     private Guid? _pageRenderCachePageId;
     private readonly HashSet<Guid> _pageRenderCacheObjectIds = [];
     private readonly List<CanvasObject> _pageRenderOverlays = [];
@@ -3550,6 +3557,8 @@ public sealed partial class MainPage : Page
 
     private void ApplyPendingPageRenderInvalidations()
     {
+        if (Interlocked.Exchange(ref _staleNavigationTileClearRequested, 0) != 0)
+            ClearStaleNavigationTilesCore();
         var clearedAllPages = Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 0) != 0;
         var clearedPage = Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0) != 0;
         if (clearedAllPages)
@@ -3879,7 +3888,8 @@ public sealed partial class MainPage : Page
         var navigationTiles = _navigationTiles.Count;
         var navigationTileBuilds = _frameNavigationTileBuilds;
         var navigationTileAborts = _frameNavigationTileAborts;
-        var navigationTileMb = Math.Round(_navigationTileBytes / 1024d / 1024d, 1);
+        var navigationTileMb = Math.Round(
+            (_navigationTileBytes + _staleNavigationTileBytes) / 1024d / 1024d, 1);
         var renderPauseRequested = Volatile.Read(ref _renderInteractionPauseRequested) != 0;
         // Synchronous file I/O from CanvasControl.Draw turns a slow frame into a larger hitch.
         // The logger is bounded to one event every two seconds, so queueing it is inexpensive.
@@ -3958,6 +3968,7 @@ public sealed partial class MainPage : Page
             {
                 drawingSession.DrawImage(_lowZoomPageRaster,
                     new Rect(0, 0, page.Size.Width, page.Size.Height));
+                DrawStaleNavigationTiles(drawingSession, page, state);
                 _frameRenderMode = "retained-edit-fallback";
             }
             else if (_pageRenderCache is not null && _pageRenderCachePageId == page.Id)
@@ -3979,13 +3990,14 @@ public sealed partial class MainPage : Page
             return false;
         }
         var useLowZoomRaster = CanUseNavigationSnapshot(page, state);
+        var presentedCurrentEdit = true;
         if (useLowZoomRaster)
         {
             _frameRenderMode = "page-raster";
         }
         else
         {
-            DrawNavigationTiles(device, drawingSession, page, state);
+            presentedCurrentEdit = DrawNavigationTiles(device, drawingSession, page, state);
             _frameRenderMode = "native-tiles";
         }
         while (!state.InteractionActive && _pageRenderOverlays.Count >= OverlayBatchSize)
@@ -4021,7 +4033,7 @@ public sealed partial class MainPage : Page
             if (appended.IsHidden) continue;
             DrawObject(drawingSession, appended, cacheInkGeometry: true);
         }
-        return true;
+        return presentedCurrentEdit;
     }
 
     private bool IsImportedPdfPreviewPending(NotePage page)
@@ -4068,13 +4080,13 @@ public sealed partial class MainPage : Page
     private static bool CanUseNativeNavigationTiles(NotePage page, PageRenderState state) =>
         page.Objects.Count >= NavigationTileObjectThreshold && !state.InteractionActive;
 
-    private void DrawNavigationTiles(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
+    private bool DrawNavigationTiles(CanvasDevice device, CanvasDrawingSession drawingSession, NotePage page,
         PageRenderState state)
     {
         var scale = RenderScalePolicy.ComputeNativeTileScale(state.Zoom, state.Dpi);
         EnsureNavigationTileSet(page, scale);
         var visibleBounds = VisiblePageBounds(page, 0, state);
-        if (visibleBounds.Width <= 0 || visibleBounds.Height <= 0) return;
+        if (visibleBounds.Width <= 0 || visibleBounds.Height <= 0) return false;
 
         // Always present the last complete page immediately. Native-resolution tiles replace
         // this progressively, so pan/zoom never waits for a batch of raster builds and never
@@ -4084,6 +4096,7 @@ public sealed partial class MainPage : Page
                 new Rect(0, 0, page.Size.Width, page.Size.Height));
         else if (_pageRenderCache is not null && _pageRenderCachePageId == page.Id)
             drawingSession.DrawImage(_pageRenderCache);
+        DrawStaleNavigationTiles(drawingSession, page, state);
 
         var fullPixelWidth = Math.Max(1, (int)Math.Ceiling(page.Size.Width * scale));
         var fullPixelHeight = Math.Max(1, (int)Math.Ceiling(page.Size.Height * scale));
@@ -4139,7 +4152,31 @@ public sealed partial class MainPage : Page
                     DrawNavigationTile(drawingSession, tile, key,
                         fullPixelWidth, fullPixelHeight, scale);
         }
+        var replacingStructuralFallback = _staleNavigationTiles.Count > 0;
+        var visibleTilesCurrent = NavigationRefinementPolicy.IsVisibleTileSetCurrent(
+            _visibleNavigationTileKeys.Count, readyTileCount);
+        if (visibleTilesCurrent)
+            Interlocked.Exchange(ref _staleNavigationTileClearRequested, 1);
         TrimNavigationTiles();
+        return !replacingStructuralFallback || visibleTilesCurrent;
+    }
+
+    private void DrawStaleNavigationTiles(
+        CanvasDrawingSession drawingSession,
+        NotePage page,
+        PageRenderState state)
+    {
+        if (_staleNavigationTiles.Count == 0 || _staleNavigationTilePageId != page.Id ||
+            Math.Abs(_staleNavigationTileScale -
+                     RenderScalePolicy.ComputeNativeTileScale(state.Zoom, state.Dpi)) >= 0.0001)
+            return;
+        var fullPixelWidth = Math.Max(1,
+            (int)Math.Ceiling(page.Size.Width * _staleNavigationTileScale));
+        var fullPixelHeight = Math.Max(1,
+            (int)Math.Ceiling(page.Size.Height * _staleNavigationTileScale));
+        foreach (var (key, tile) in _staleNavigationTiles)
+            DrawNavigationTile(drawingSession, tile, key,
+                fullPixelWidth, fullPixelHeight, _staleNavigationTileScale);
     }
 
     private static void DrawNavigationTile(
@@ -4394,7 +4431,6 @@ public sealed partial class MainPage : Page
             _standbyLowZoomPageRasterUpdatedAt = null;
         }
         if (Volatile.Read(ref _renderInteractionPauseRequested) != 0) return false;
-        ClearNavigationTileCacheCore();
         var rasterScale = NavigationSnapshotScale(page);
         if (_pendingLowZoomPageRaster is null || _pendingLowZoomPageRasterPageId != page.Id ||
             _pendingLowZoomPageRasterUpdatedAt != page.UpdatedAt ||
@@ -5542,10 +5578,9 @@ public sealed partial class MainPage : Page
         if (_gestureTool == EditorTool.Pan) InvalidateCanvas();
         else
         {
-            // Publish pointer-down immediately. Without this, the committed-page renderer keeps
-            // refining dense tiles under the ink overlay and can block the first visible stroke.
-            PublishPageRenderState();
-            PageSurface.Invalidate();
+            // The volatile pause flag and cancellation tokens stop committed-page refinement.
+            // Do not invalidate that surface at pointer-down: the live overlay owns the gesture,
+            // and redrawing the background here briefly exposed its low-resolution fallback.
             InvalidateInteractionOverlay();
         }
     }
@@ -11638,7 +11673,8 @@ public sealed partial class MainPage : Page
     {
         _preloadedFallbackPageId = null;
         CancelPendingLowZoomPageRasterCore();
-        ClearNavigationTileCacheCore();
+        if (preserveSharpFallback) PreserveNavigationTilesAsFallbackCore();
+        else ClearNavigationTileCacheCore();
         var publishedPage = Volatile.Read(ref _publishedPageRenderState).Page;
         // Append-only ink can live solely in overlay batches while the dense page raster remains
         // untouched. Fold those completed strokes into the fallback before a move/erase clears
@@ -11708,6 +11744,7 @@ public sealed partial class MainPage : Page
 
     private void ClearNavigationTileCacheCore()
     {
+        Interlocked.Exchange(ref _staleNavigationTileClearRequested, 0);
         foreach (var tile in _navigationTiles.Values) tile.Dispose();
         _navigationTiles.Clear();
         _navigationTileLru.Clear();
@@ -11716,6 +11753,47 @@ public sealed partial class MainPage : Page
         _navigationTilePageId = null;
         _navigationTileScale = 0;
         _navigationTileBytes = 0;
+        ClearStaleNavigationTilesCore();
+    }
+
+    private void PreserveNavigationTilesAsFallbackCore()
+    {
+        Interlocked.Exchange(ref _staleNavigationTileClearRequested, 0);
+        if (_navigationTiles.Count == 0) return;
+        if (_staleNavigationTilePageId != _navigationTilePageId ||
+            Math.Abs(_staleNavigationTileScale - _navigationTileScale) >= 0.0001)
+            ClearStaleNavigationTilesCore();
+        foreach (var (key, tile) in _navigationTiles)
+        {
+            if (_staleNavigationTiles.Remove(key, out var replaced))
+            {
+                _staleNavigationTileBytes = Math.Max(0,
+                    _staleNavigationTileBytes - NavigationTileBytes(replaced));
+                replaced.Dispose();
+            }
+            _staleNavigationTiles[key] = tile;
+            _staleNavigationTileBytes += NavigationTileBytes(tile);
+        }
+        _staleNavigationTilePageId = _navigationTilePageId;
+        _staleNavigationTileScale = _navigationTileScale;
+        _navigationTiles.Clear();
+        _navigationTileLru.Clear();
+        _navigationTileLruNodes.Clear();
+        _visibleNavigationTileKeys.Clear();
+        _navigationTileBytes = 0;
+    }
+
+    private static long NavigationTileBytes(CanvasRenderTarget tile) =>
+        (long)tile.SizeInPixels.Width * tile.SizeInPixels.Height *
+        RenderScalePolicy.BytesPerPixel;
+
+    private void ClearStaleNavigationTilesCore()
+    {
+        foreach (var tile in _staleNavigationTiles.Values) tile.Dispose();
+        _staleNavigationTiles.Clear();
+        _staleNavigationTilePageId = null;
+        _staleNavigationTileScale = 0;
+        _staleNavigationTileBytes = 0;
     }
 
     private Matrix3x2 PageTransform()

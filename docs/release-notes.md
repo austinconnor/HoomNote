@@ -1,7 +1,5 @@
-# HoomNote 0.7.50
+# HoomNote 0.7.51
 
-- Writing, erasing, and dragging no longer trigger full source-vector page replays on the shared graphics device while the pointer is down.
-- Zoomed pages progressively retain every completed high-resolution tile without redrawing the entire visible scene after each tile.
-- Switching away from a dense notebook now releases its inactive document, undo, spatial-index, and stroke-geometry caches before editing another notebook.
-- Smart-shape recognition and pointer classification perform less work in the per-sample writing path.
-- Diagnostics now report slow live interaction frames and expensive selection move-cache preparation separately from committed-page rendering.
+- Writing and erasing no longer redraw the committed page at pointer-down, preventing the temporary grid and page background from flashing.
+- Structural edits retain the previous sharp page tiles beneath their correction overlay instead of exposing a blurred fallback.
+- Move and erase correction overlays remain visible until every replacement tile in the visible viewport is current.

@@ -50,6 +50,9 @@ public static class NavigationRefinementPolicy
 
     public static bool ShouldPresentAvailableTiles(int readyTileCount) => readyTileCount > 0;
 
+    public static bool IsVisibleTileSetCurrent(int visibleTileCount, int readyTileCount) =>
+        visibleTileCount > 0 && readyTileCount >= visibleTileCount;
+
     /// <summary>
     /// Direct input must never start a source-vector replay on the shared Win2D device. The
     /// interaction overlay masks stale regions until the corrected retained frame is ready.

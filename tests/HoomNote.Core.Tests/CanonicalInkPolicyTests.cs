@@ -82,6 +82,21 @@ public sealed class CanonicalInkPolicyTests
     }
 
     [Theory]
+    [InlineData(0, 0, false)]
+    [InlineData(6, 0, false)]
+    [InlineData(6, 5, false)]
+    [InlineData(6, 6, true)]
+    public void StructuralEditRetainsItsCorrectionUntilVisibleTilesAreCurrent(
+        int visibleTileCount,
+        int readyTileCount,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            NavigationRefinementPolicy.IsVisibleTileSetCurrent(
+                visibleTileCount, readyTileCount));
+    }
+
+    [Theory]
     [InlineData(true, true)]
     [InlineData(false, false)]
     public void DirectInteractionDefersSourceVectorReplay(
