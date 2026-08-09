@@ -10,6 +10,21 @@ namespace HoomNote.Core.Tests;
 
 public sealed class GeometryAndEditingTests
 {
+    [Theory]
+    [InlineData(false, 0, 0, false)]
+    [InlineData(false, 0.5, 0.5, false)]
+    [InlineData(false, 1, 0, true)]
+    [InlineData(true, 0, 0, true)]
+    public void SelectionTransformCommitRefreshesFinalDragSampleWithoutTurningClicksIntoMoves(
+        bool hasPreview,
+        double deltaX,
+        double deltaY,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            SelectionTransformInputPolicy.ShouldRefreshForCommit(hasPreview, deltaX, deltaY));
+    }
+
     [Fact]
     public void EffectiveWorldWidth_TracksUniformAndNonUniformStrokeTransforms()
     {

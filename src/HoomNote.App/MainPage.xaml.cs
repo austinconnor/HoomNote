@@ -324,6 +324,9 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<Guid, CanvasObject> _multiTransformPreviews = [];
     private readonly HashSet<Guid> _selectionTransformOriginalIds = [];
     private RectD? _selectionTransformSourceBounds;
+    private CanvasCommandList? _selectionTransformSourceCache;
+    private CanvasCommandList? _selectionTransformObjectCache;
+    private Transform2D _selectionTransformPreviewDelta = Transform2D.Identity;
     private readonly Dictionary<Guid, CanvasObject> _styleBrushOriginals = [];
     // The committed page is rendered by CanvasAnimatedControl on its dedicated game-loop
     // thread. UI/input mutations publish immutable page/viewport state through InvalidateCanvas.
@@ -3352,6 +3355,7 @@ public sealed partial class MainPage : Page
         // Both surfaces share one device. The overlay owns only ephemeral interaction resources;
         // committed page resources are rebuilt by the dedicated game-loop surface.
         ClearLiveInkGeometryCache();
+        DisposeSelectionTransformCaches();
     }
 
     private void OnPageSurfaceCreateResources(
@@ -3753,6 +3757,21 @@ public sealed partial class MainPage : Page
         if (_selectionTransformSourceBounds is not { } sourceBounds ||
             _selectionTransformOriginalIds.Count == 0 ||
             (_multiTransformPreviews.Count == 0 && _transformPreview is null)) return;
+
+        // Move gestures never change local geometry. Replay the clean source patch and selected
+        // objects recorded at pointer-down, then apply only the current translation. This keeps
+        // pointer frames O(1) even when the selection contains dense imported handwriting.
+        if (_transformHandle == TransformHandle.Move &&
+            _selectionTransformSourceCache is not null &&
+            _selectionTransformObjectCache is not null)
+        {
+            drawingSession.DrawImage(_selectionTransformSourceCache);
+            var previous = drawingSession.Transform;
+            drawingSession.Transform = _selectionTransformPreviewDelta.ToMatrix() * previous;
+            drawingSession.DrawImage(_selectionTransformObjectCache);
+            drawingSession.Transform = previous;
+            return;
+        }
 
         // DrawingSurface sits above the retained PageSurface, so first reconstruct the source
         // region without the objects being transformed. This removes the stale retained copy
@@ -5513,20 +5532,7 @@ public sealed partial class MainPage : Page
                 redraw = true;
                 break;
             case EditorTool.Select when _multiTransformOriginals is { Count: > 1 } && _transformHandle != TransformHandle.None:
-                var multiCurrent = ScreenToPage(current.Position);
-                var multiPreserveAspect = IsCornerHandle(_transformHandle) && !IsShiftDown();
-                var multiDelta = CreateSelectionTransform(
-                    _transformHandle,
-                    CombinedBounds(_multiTransformOriginals),
-                    _gestureStart,
-                    multiCurrent,
-                    multiPreserveAspect,
-                    baseRotation: 0);
-                _multiTransformPreviews.Clear();
-                foreach (var original in _multiTransformOriginals)
-                    _multiTransformPreviews[original.Id] =
-                        ApplySelectionTransform(original, multiDelta);
-                redraw = true;
+                redraw = UpdateSelectionTransformPreview(current.Position);
                 break;
             case EditorTool.Select when _textSelectionAnchor is { } textAnchor:
                 var textCurrent = ScreenToPage(current.Position);
@@ -5535,17 +5541,7 @@ public sealed partial class MainPage : Page
                 redraw = true;
                 break;
             case EditorTool.Select when _transformOriginal is not null && _transformHandle != TransformHandle.None:
-                var currentPage = ScreenToPage(current.Position);
-                var singlePreserveAspect = IsCornerHandle(_transformHandle) && !IsShiftDown();
-                var delta = CreateSelectionTransform(
-                    _transformHandle,
-                    StrokeGeometry.GetWorldBounds(_transformOriginal),
-                    _gestureStart,
-                    currentPage,
-                    singlePreserveAspect,
-                    TransformRotation(_transformOriginal.Transform));
-                _transformPreview = ApplySelectionTransform(_transformOriginal, delta);
-                redraw = true;
+                redraw = UpdateSelectionTransformPreview(current.Position);
                 break;
         }
 
@@ -5576,6 +5572,8 @@ public sealed partial class MainPage : Page
         {
             AddPointerSample(current, _gestureScreenToPage, force: true);
         }
+        if (_gestureTool == EditorTool.Select && _textSelectionAnchor is null)
+            RefreshSelectionTransformPreviewForCommit(current.Position);
         switch (_gestureTool)
         {
             case EditorTool.Pen:
@@ -5607,34 +5605,89 @@ public sealed partial class MainPage : Page
                     : $"Selected {_selectedTextRegions.Count} text region(s) • Ctrl+C to copy";
                 UpdateSelectionUi();
                 break;
-            case EditorTool.Select when _multiTransformOriginals is { Count: > 1 } && _multiTransformPreviews.Count > 0:
-                var after = _multiTransformOriginals.Select(item => _multiTransformPreviews[item.Id]).ToArray();
-                if (TryMoveSelectionToVisiblePage(
-                        current.Position, _multiTransformOriginals, after,
-                        after.Any(item => item is InkStrokeObject)))
-                    break;
-                _history.Execute(new ReplaceObjectsCommand(_page.Id, _multiTransformOriginals, after,
-                    "Transform selection"), _document);
-                _selectedObjects.Clear();
-                _selectedObjects.AddRange(after);
-                OnDocumentChanged(recognizeInk: after.Any(item => item is InkStrokeObject));
-                Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
-                break;
-            case EditorTool.Select when _transformOriginal is not null && _transformPreview is not null:
-                if (TryMoveSelectionToVisiblePage(
-                        current.Position, [_transformOriginal], [_transformPreview],
-                        _transformPreview is InkStrokeObject))
-                    break;
-                _history.Execute(new ReplaceObjectsCommand(_page.Id, [_transformOriginal], [_transformPreview], "Transform object"), _document);
-                _selectedObject = _transformPreview;
-                _selectedObjects.Clear();
-                _selectedObjects.Add(_transformPreview);
-                OnDocumentChanged(recognizeInk: false);
-                Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
+            case EditorTool.Select:
+                CommitSelectionTransform(current.Position);
                 break;
         }
 
         EndPointer(e);
+    }
+
+    private bool CommitSelectionTransform(Point releasePoint)
+    {
+        if (_page is null || _document is null) return false;
+        if (_multiTransformOriginals is { Count: > 1 } originals &&
+            _multiTransformPreviews.Count > 0)
+        {
+            var after = originals.Select(item => _multiTransformPreviews[item.Id]).ToArray();
+            if (TryMoveSelectionToVisiblePage(
+                    releasePoint, originals, after,
+                    after.Any(item => item is InkStrokeObject)))
+                return true;
+            _history.Execute(new ReplaceObjectsCommand(_page.Id, originals, after,
+                "Transform selection"), _document);
+            _selectedObjects.Clear();
+            _selectedObjects.AddRange(after);
+            _selectedObject = after.Length == 1 ? after[0] : null;
+            OnDocumentChanged(recognizeInk: after.Any(item => item is InkStrokeObject));
+            Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
+            return true;
+        }
+        if (_transformOriginal is null || _transformPreview is null) return false;
+        if (TryMoveSelectionToVisiblePage(
+                releasePoint, [_transformOriginal], [_transformPreview],
+                _transformPreview is InkStrokeObject))
+            return true;
+        _history.Execute(new ReplaceObjectsCommand(
+            _page.Id, [_transformOriginal], [_transformPreview], "Transform object"), _document);
+        _selectedObject = _transformPreview;
+        _selectedObjects.Clear();
+        _selectedObjects.Add(_transformPreview);
+        OnDocumentChanged(recognizeInk: _transformPreview is InkStrokeObject);
+        Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
+        return true;
+    }
+
+    private bool UpdateSelectionTransformPreview(Point screenPoint)
+    {
+        if (_transformHandle == TransformHandle.None) return false;
+        var currentPage = ScreenToPage(screenPoint);
+        var preserveAspect = IsCornerHandle(_transformHandle) && !IsShiftDown();
+        if (_multiTransformOriginals is { Count: > 1 } originals)
+        {
+            var delta = CreateSelectionTransform(
+                _transformHandle,
+                CombinedBounds(originals),
+                _gestureStart,
+                currentPage,
+                preserveAspect,
+                baseRotation: 0);
+            _selectionTransformPreviewDelta = delta;
+            _multiTransformPreviews.Clear();
+            foreach (var original in originals)
+                _multiTransformPreviews[original.Id] = ApplySelectionTransform(original, delta);
+            return true;
+        }
+        if (_transformOriginal is null) return false;
+        var singleDelta = CreateSelectionTransform(
+            _transformHandle,
+            StrokeGeometry.GetWorldBounds(_transformOriginal),
+            _gestureStart,
+            currentPage,
+            preserveAspect,
+            TransformRotation(_transformOriginal.Transform));
+        _selectionTransformPreviewDelta = singleDelta;
+        _transformPreview = ApplySelectionTransform(_transformOriginal, singleDelta);
+        return true;
+    }
+
+    private void RefreshSelectionTransformPreviewForCommit(Point screenPoint)
+    {
+        var hasPreview = _transformPreview is not null || _multiTransformPreviews.Count > 0;
+        var deltaX = screenPoint.X - _screenStart.X;
+        var deltaY = screenPoint.Y - _screenStart.Y;
+        if (!SelectionTransformInputPolicy.ShouldRefreshForCommit(hasPreview, deltaX, deltaY)) return;
+        UpdateSelectionTransformPreview(screenPoint);
     }
 
     private void OnCanvasPointerCanceled(object sender, PointerRoutedEventArgs e)
@@ -5665,6 +5718,12 @@ public sealed partial class MainPage : Page
         if (current.PointerDeviceType == PointerDeviceType.Pen)
             _lastDirectInteractionTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         RestoreEraseSnapshot();
+        if (_gestureTool == EditorTool.Select && _page is not null && _document is not null)
+        {
+            if (_textSelectionAnchor is null)
+                RefreshSelectionTransformPreviewForCommit(current.Position);
+            CommitSelectionTransform(current.Position);
+        }
         EndPointer(e, releaseCapture: false);
     }
 
@@ -5707,6 +5766,8 @@ public sealed partial class MainPage : Page
         _multiTransformPreviews.Clear();
         _selectionTransformOriginalIds.Clear();
         _selectionTransformSourceBounds = null;
+        _selectionTransformPreviewDelta = Transform2D.Identity;
+        DisposeSelectionTransformCaches();
     }
 
     private void OnTouchPointerPressed(PointerRoutedEventArgs e, PointerPoint point)
@@ -6618,6 +6679,60 @@ public sealed partial class MainPage : Page
         _selectionTransformSourceBounds = originals.Count == 0
             ? null
             : CombinedBounds(originals).Inflate(Math.Max(2, 3 / Math.Max(_zoom, 0.08)));
+        _selectionTransformPreviewDelta = Transform2D.Identity;
+        BuildSelectionMoveCaches(originals);
+    }
+
+    private void BuildSelectionMoveCaches(IReadOnlyCollection<CanvasObject> originals)
+    {
+        DisposeSelectionTransformCaches();
+        if (_transformHandle != TransformHandle.Move || _page is not { } page ||
+            _selectionTransformSourceBounds is not { } sourceBounds || originals.Count == 0)
+            return;
+
+        CanvasCommandList? sourceCache = null;
+        CanvasCommandList? objectCache = null;
+        try
+        {
+            sourceCache = new CanvasCommandList(DrawingSurface.Device);
+            using (var session = sourceCache.CreateDrawingSession())
+            using (session.CreateLayer(1f,
+                       new Rect(sourceBounds.X, sourceBounds.Y, sourceBounds.Width, sourceBounds.Height)))
+            {
+                DrawPageBackground(session, page, sourceBounds);
+                DrawImportedLayer(session, page);
+                if (_temporaryGridVisible) DrawTemporaryGrid(session, page, sourceBounds);
+                foreach (var canvasObject in _spatialIndex.Query(sourceBounds)
+                             .Where(item => !_selectionTransformOriginalIds.Contains(item.Id))
+                             .OrderBy(item => item.ZIndex))
+                {
+                    if (!canvasObject.IsHidden) DrawObject(session, canvasObject);
+                }
+            }
+
+            objectCache = new CanvasCommandList(DrawingSurface.Device);
+            using (var session = objectCache.CreateDrawingSession())
+                foreach (var original in originals.OrderBy(item => item.ZIndex))
+                    if (!original.IsHidden) DrawObject(session, original);
+
+            _selectionTransformSourceCache = sourceCache;
+            _selectionTransformObjectCache = objectCache;
+            sourceCache = null;
+            objectCache = null;
+        }
+        finally
+        {
+            sourceCache?.Dispose();
+            objectCache?.Dispose();
+        }
+    }
+
+    private void DisposeSelectionTransformCaches()
+    {
+        _selectionTransformSourceCache?.Dispose();
+        _selectionTransformSourceCache = null;
+        _selectionTransformObjectCache?.Dispose();
+        _selectionTransformObjectCache = null;
     }
 
     private static Transform2D CreateSelectionTransform(
