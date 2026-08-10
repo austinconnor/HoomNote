@@ -234,6 +234,8 @@ public sealed partial class MainPage : Page
     private readonly List<InkPoint> _activeInk = [];
     private readonly List<PointD> _eraserPath = [];
     private readonly List<RectD> _eraseDirtyRegions = [];
+    private readonly List<RectD> _eraseDirtyRegionsBeforeGesture = [];
+    private int _erasePreviewVersionBeforeGesture = -1;
     private readonly List<InkStrokeObject> _pendingRecognitionStrokes = [];
     private readonly List<(Guid PageId, InkStrokeObject Stroke)> _pendingInkAppends = [];
     private readonly HashSet<Guid> _pendingSavePageIds = [];
@@ -419,11 +421,10 @@ public sealed partial class MainPage : Page
     private readonly HashSet<Guid> _pageRenderCacheObjectIds = [];
     private readonly List<CanvasObject> _pageRenderOverlays = [];
     private readonly List<CanvasCommandList> _pageRenderOverlayBatches = [];
-    private readonly ConcurrentQueue<(Guid PageId, CanvasObject Object)> _pendingPageRenderAppends = new();
-    // Keep recent strokes as cached geometry while the user writes. Compiling every pen-up into
-    // a command list created a visible hitch between letters; batching amortizes that work.
-    private const int OverlayBatchSize = 8;
-    private const int OverlayBatchCompactionThreshold = 8;
+    private readonly ConcurrentQueue<(Guid PageId, CanvasObject Object, DateTimeOffset PageUpdatedAt)>
+        _pendingPageRenderAppends = new();
+    // Keep recent strokes as cached geometry while the user writes. Incremental compositing
+    // avoids compiling or merging a growing overlay collection at fixed stroke intervals.
     private const int NavigationTilePixels = 320;
     private const int NavigationTileGutterPixels = 2;
     private const long NavigationTileByteBudget = 32L * 1024 * 1024;
@@ -3491,7 +3492,8 @@ public sealed partial class MainPage : Page
             ApplyPendingPageRenderInvalidations();
             var state = Volatile.Read(ref _publishedPageRenderState);
             if (state.Page is not { } page) return;
-            DrainPageRenderAppends(page);
+            if (Volatile.Read(ref _renderInteractionPauseRequested) == 0)
+                DrainPageRenderAppends(page);
             var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             _frameStrokeGeometryBuilds = 0;
             _frameNavigationTileBuilds = 0;
@@ -3718,7 +3720,8 @@ public sealed partial class MainPage : Page
 
     private void DrainPageRenderAppends(NotePage page)
     {
-        while (_pendingPageRenderAppends.TryDequeue(out var pending))
+        while (Volatile.Read(ref _renderInteractionPauseRequested) == 0 &&
+               _pendingPageRenderAppends.TryDequeue(out var pending))
         {
             if (page.Id != pending.PageId) continue;
             var canKeepCache =
@@ -3728,11 +3731,9 @@ public sealed partial class MainPage : Page
                 !_pageRenderCacheObjectIds.Contains(pending.Object.Id);
             if (canKeepCache)
             {
-                _pageRenderOverlays.Add(pending.Object);
-                if (_lowZoomPageRasterPageId == page.Id)
-                    _lowZoomPageRasterUpdatedAt = page.UpdatedAt;
-                if (_pageRenderCachePageId == page.Id)
-                    _pageRenderCacheUpdatedAt = page.UpdatedAt;
+                if (!TryCompositeAppendIntoRetainedRaster(
+                        page, pending.Object, pending.PageUpdatedAt))
+                    _pageRenderOverlays.Add(pending.Object);
                 continue;
             }
 
@@ -4080,23 +4081,6 @@ public sealed partial class MainPage : Page
             presentedCurrentEdit = DrawNavigationTiles(device, drawingSession, page, state);
             _frameRenderMode = "native-tiles";
         }
-        while (!state.InteractionActive && _pageRenderOverlays.Count >= OverlayBatchSize)
-        {
-            var batch = new CanvasCommandList(device);
-            using (var batchSession = batch.CreateDrawingSession())
-            {
-                for (var index = 0; index < OverlayBatchSize; index++)
-                    DrawObject(
-                        batchSession, _pageRenderOverlays[index], cacheInkGeometry: true);
-            }
-            _pageRenderOverlayBatches.Add(batch);
-            _pageRenderOverlays.RemoveRange(0, OverlayBatchSize);
-            CompactOverlayBatches(device);
-        }
-        if (useLowZoomRaster &&
-            _pageRenderOverlayBatches.Count * OverlayBatchSize + _pageRenderOverlays.Count >= 12)
-            MergeOverlaysIntoLowZoomRaster(page);
-
         if (useLowZoomRaster)
         {
             if (_lowZoomPageRaster is not null)
@@ -4471,19 +4455,6 @@ public sealed partial class MainPage : Page
         return new RectD(left, top, Math.Max(0, right - left), Math.Max(0, bottom - top));
     }
 
-    private void CompactOverlayBatches(CanvasDevice device)
-    {
-        if (_pageRenderOverlayBatches.Count < OverlayBatchCompactionThreshold) return;
-        var merged = new CanvasCommandList(device);
-        using (var session = merged.CreateDrawingSession())
-        {
-            foreach (var batch in _pageRenderOverlayBatches) session.DrawImage(batch);
-        }
-        foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
-        _pageRenderOverlayBatches.Clear();
-        _pageRenderOverlayBatches.Add(merged);
-    }
-
     private bool EnsureLowZoomPageRaster(CanvasDevice device, NotePage page)
     {
         if (_lowZoomPageRaster is not null && NavigationRefinementPolicy.IsRetainedFrameCurrent(
@@ -4659,6 +4630,61 @@ public sealed partial class MainPage : Page
         _pageRenderCache = null;
         _pageRenderCachePageId = null;
         _pageRenderCacheUpdatedAt = null;
+    }
+
+    private bool TryCompositeAppendIntoRetainedRaster(
+        NotePage page,
+        CanvasObject appended,
+        DateTimeOffset pageUpdatedAt)
+    {
+        if (_lowZoomPageRaster is null || _lowZoomPageRasterPageId != page.Id ||
+            _lowZoomPageRasterInvalidated) return false;
+
+        using (var session = _lowZoomPageRaster.CreateDrawingSession())
+        {
+            session.Transform = Matrix3x2.CreateScale((float)NavigationSnapshotScale(page));
+            if (!appended.IsHidden) DrawObject(session, appended, cacheInkGeometry: true);
+        }
+        // Advance only to the edit represented by this queue entry. A new pointer gesture may
+        // pause draining between entries; claiming the page's latest timestamp here would make
+        // a partially updated raster appear complete and could temporarily hide later strokes.
+        _lowZoomPageRasterUpdatedAt = pageUpdatedAt;
+        _pageRenderCacheObjectIds.Add(appended.Id);
+
+        // Keep already-built detail tiles coherent without rebuilding a full visible tile for
+        // each pen-up. Only tiles intersecting this stroke receive the small incremental draw.
+        if (_navigationTilePageId == page.Id && _navigationTileScale > 0 &&
+            _navigationTiles.Count > 0)
+        {
+            var objectBounds = StrokeGeometry.GetWorldBounds(appended).Inflate(2);
+            var fullPixelWidth = Math.Max(1, (int)Math.Ceiling(page.Size.Width * _navigationTileScale));
+            var fullPixelHeight = Math.Max(1, (int)Math.Ceiling(page.Size.Height * _navigationTileScale));
+            foreach (var (key, tile) in _navigationTiles)
+            {
+                var metrics = NavigationTileMetrics.Create(
+                    key.X, key.Y, NavigationTilePixels, fullPixelWidth, fullPixelHeight,
+                    NavigationTileGutterPixels);
+                var tileBounds = new RectD(
+                    metrics.RenderPixelLeft / _navigationTileScale,
+                    metrics.RenderPixelTop / _navigationTileScale,
+                    metrics.RenderPixelWidth / _navigationTileScale,
+                    metrics.RenderPixelHeight / _navigationTileScale);
+                if (!tileBounds.Intersects(objectBounds)) continue;
+                using var tileSession = tile.CreateDrawingSession();
+                tileSession.Transform = Matrix3x2.CreateTranslation(
+                                            (float)-tileBounds.X, (float)-tileBounds.Y) *
+                                        Matrix3x2.CreateScale((float)_navigationTileScale);
+                if (!appended.IsHidden) DrawObject(tileSession, appended, cacheInkGeometry: true);
+            }
+        }
+
+        // A vector command list recorded before this append is incomplete. The retained raster
+        // is now authoritative and the vector cache can be rebuilt lazily if detail mode needs it.
+        _pageRenderCache?.Dispose();
+        _pageRenderCache = null;
+        _pageRenderCachePageId = null;
+        _pageRenderCacheUpdatedAt = null;
+        return true;
     }
 
     private void MergeOverlaysIntoNavigationTiles(NotePage page)
@@ -5608,8 +5634,12 @@ public sealed partial class MainPage : Page
         _lastInkMovementTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         ClearLiveInkGeometryCache();
         _eraserPath.Clear();
-        _eraseDirtyRegions.Clear();
-        Volatile.Write(ref _erasePreviewCommitVersion, -1);
+        _eraseDirtyRegionsBeforeGesture.Clear();
+        _erasePreviewVersionBeforeGesture = Volatile.Read(ref _erasePreviewCommitVersion);
+        if (_erasePreviewVersionBeforeGesture >= 0)
+            _eraseDirtyRegionsBeforeGesture.AddRange(_eraseDirtyRegions);
+        else
+            _eraseDirtyRegions.Clear();
         _eraseSnapshot = _gestureTool is EditorTool.SegmentEraser or EditorTool.StrokeEraser
             ? [.. _page.Objects]
             : null;
@@ -7383,7 +7413,8 @@ public sealed partial class MainPage : Page
         _page.Objects.AddRange(_eraseSnapshot);
         _spatialIndex.Rebuild(_page.Objects);
         _eraseDirtyRegions.Clear();
-        Volatile.Write(ref _erasePreviewCommitVersion, -1);
+        _eraseDirtyRegions.AddRange(_eraseDirtyRegionsBeforeGesture);
+        Volatile.Write(ref _erasePreviewCommitVersion, _erasePreviewVersionBeforeGesture);
         InvalidatePageRenderCache();
         InvalidateCanvas();
     }
@@ -7587,7 +7618,7 @@ public sealed partial class MainPage : Page
         }
         var appendOnly = appendedObject is not null && _page is not null;
         if (appendOnly)
-            _pendingPageRenderAppends.Enqueue((_page!.Id, appendedObject!));
+            _pendingPageRenderAppends.Enqueue((_page!.Id, appendedObject!, _page.UpdatedAt));
         else
             InvalidatePageRenderCache();
         if (_page is not null)
