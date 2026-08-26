@@ -212,6 +212,32 @@ public sealed class GeometryAndEditingTests
     }
 
     [Fact]
+    public void ImageLayout_PreservesAspectRatioAndCentersInsideBounds()
+    {
+        var destination = ImageLayout.Destination(
+            new RectD(10, 20, 300, 300),
+            sourceWidth: 400,
+            sourceHeight: 200,
+            preserveAspectRatio: true);
+
+        Assert.Equal(new RectD(10, 95, 300, 150), destination);
+    }
+
+    [Fact]
+    public void ImageLayout_UsesFullBoundsWhenStretchingIsRequested()
+    {
+        var bounds = new RectD(10, 20, 300, 300);
+
+        var destination = ImageLayout.Destination(
+            bounds,
+            sourceWidth: 400,
+            sourceHeight: 200,
+            preserveAspectRatio: false);
+
+        Assert.Equal(bounds, destination);
+    }
+
+    [Fact]
     public void TwoFingerPinch_IgnoresCentroidTranslationWhenSpreadIsUnchanged()
     {
         var stationary = TouchViewportMath.PinchOnly(

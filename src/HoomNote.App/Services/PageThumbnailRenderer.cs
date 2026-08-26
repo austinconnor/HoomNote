@@ -183,8 +183,13 @@ public sealed class PageThumbnailRenderer(IAssetStore assetStore, SharedPdfDocum
                 DrawShape(session, shape, roundStyle);
                 break;
             case ImageObject image when images.TryGetValue(image.AssetHash, out var bitmap):
-                session.DrawImage(bitmap, new Rect(image.Bounds.X, image.Bounds.Y,
-                    image.Bounds.Width, image.Bounds.Height));
+                var destination = ImageLayout.Destination(
+                    image.Bounds,
+                    bitmap.SizeInPixels.Width,
+                    bitmap.SizeInPixels.Height,
+                    image.PreserveAspectRatio);
+                session.DrawImage(bitmap, new Rect(
+                    destination.X, destination.Y, destination.Width, destination.Height));
                 break;
         }
         session.Transform = previous;

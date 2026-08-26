@@ -517,7 +517,7 @@ public sealed partial class MainPage : Page
     private Point _wheelZoomAnchorScreen;
     private PointD _wheelZoomAnchorPage;
     private long _wheelZoomAnimationStarted;
-    private float _wheelScrollVelocity;
+    private Vector2 _wheelScrollVelocity;
     private long _wheelScrollTimestamp;
     private long _lastDirectInteractionTimestamp;
     private long _lastNativeTouchTimestamp;
@@ -555,6 +555,7 @@ public sealed partial class MainPage : Page
     private bool _hasUnsavedChanges;
     private int _editVersion;
     private string? _internalClipboard;
+    private string? _internalTextClipboard;
     private bool _temporaryGridVisible;
     private bool _readMode;
     private bool _libraryWasVisible;
@@ -2061,7 +2062,8 @@ public sealed partial class MainPage : Page
 
     private bool ClipboardMayContainPasteData()
     {
-        if (!string.IsNullOrWhiteSpace(_internalClipboard)) return true;
+        if (!string.IsNullOrWhiteSpace(_internalClipboard) ||
+            !string.IsNullOrWhiteSpace(_internalTextClipboard)) return true;
         try
         {
             var view = Clipboard.GetContent();
@@ -2148,25 +2150,90 @@ public sealed partial class MainPage : Page
     private async void OnDeleteNotebookContextClick(object sender, RoutedEventArgs e)
     {
         if (_notebookContextTarget is not { } target || _repository is null) return;
-        var dialog = new ContentDialog
+        try
         {
-            XamlRoot = XamlRoot,
-            Title = "Delete this notebook?",
-            Content = $"Delete \u201c{target.Title}\u201d and its {target.PageCount} page(s)? This cannot be undone.",
-            PrimaryButtonText = "Delete notebook",
-            CloseButtonText = "Cancel",
-            DefaultButton = ContentDialogButton.Close
-        };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+            var dialog = new ContentDialog
+            {
+                XamlRoot = XamlRoot,
+                Title = "Delete this notebook?",
+                Content = $"Delete \u201c{target.Title}\u201d and its {target.PageCount} page(s)? This cannot be undone.",
+                PrimaryButtonText = "Delete notebook",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+            await DeleteNotebookAsync(target);
+        }
+        catch (Exception exception)
+        {
+            ShowError("The notebook could not be deleted.", exception);
+        }
+    }
 
+    private async Task DeleteNotebookAsync(DocumentSummary target)
+    {
         var deletingCurrent = _document?.Id == target.Id;
-        _saveTimer.Stop();
-        _recognitionTimer.Stop();
+        var nextTab = deletingCurrent
+            ? NotebookTabs.TabItems.OfType<TabViewItem>()
+                .FirstOrDefault(item => item.Tag is Guid id && id != target.Id)
+            : null;
+        if (deletingCurrent)
+        {
+            _saveTimer.Stop();
+            _recognitionTimer.Stop();
+        }
+
         await _saveGate.WaitAsync();
         try
         {
-            if (deletingCurrent) _document = null;
+            // Keep the live document intact until the transaction commits. Clearing it before
+            // DeleteAsync completed left the UI half-bound when SQLite reported an error.
             await RunRepositoryAsync(repository => repository.DeleteAsync(target.Id));
+        }
+        catch
+        {
+            if (deletingCurrent && _hasUnsavedChanges) _saveTimer.Start();
+            throw;
+        }
+        finally
+        {
+            _saveGate.Release();
+        }
+
+        _documentHistories.Remove(target.Id);
+        RemoveCachedDocument(target.Id);
+        _tabPageSelections.Remove(target.Id);
+        _userPreferences.DocumentFolders.Remove(target.Id.ToString("D"));
+        _userPreferences.DocumentColors.Remove(target.Id.ToString("D"));
+        _userPreferences.NotebookOrder.RemoveAll(id => id.Equals(target.Id.ToString("D"), StringComparison.OrdinalIgnoreCase));
+        _updatingTabs = true;
+        var tab = NotebookTabs.TabItems.OfType<TabViewItem>()
+            .FirstOrDefault(item => item.Tag is Guid id && id == target.Id);
+        if (tab is not null) NotebookTabs.TabItems.Remove(tab);
+        if (nextTab is not null) NotebookTabs.SelectedItem = nextTab;
+        _updatingTabs = false;
+        if (deletingCurrent)
+        {
+            ClearCurrentNotebook(target.Id);
+            if (nextTab?.Tag is Guid nextDocumentId)
+            {
+                await LoadDocumentAsync(
+                    nextDocumentId,
+                    _tabPageSelections.GetValueOrDefault(nextDocumentId) is { } pageId && pageId != Guid.Empty
+                        ? pageId
+                        : null);
+                SelectLibraryDocument(nextDocumentId);
+            }
+            else
+            {
+                StatusText.Text = "No notebook open";
+            }
+        }
+
+        // Asset cleanup is maintenance after the notebook transaction. A locked backup or
+        // transient file error must not turn a successful delete into an application crash.
+        try
+        {
             if (_assetStore is not null)
             {
                 var referencedAssets = new HashSet<string>(await RunRepositoryAsync(
@@ -2181,25 +2248,10 @@ public sealed partial class MainPage : Page
                 await _assetStore.CollectGarbageAsync(referencedAssets);
             }
         }
-        finally { _saveGate.Release(); }
-
-        _documentHistories.Remove(target.Id);
-        RemoveCachedDocument(target.Id);
-        _tabPageSelections.Remove(target.Id);
-        _userPreferences.DocumentFolders.Remove(target.Id.ToString("D"));
-        _userPreferences.DocumentColors.Remove(target.Id.ToString("D"));
-        _userPreferences.NotebookOrder.RemoveAll(id => id.Equals(target.Id.ToString("D"), StringComparison.OrdinalIgnoreCase));
-        _updatingTabs = true;
-        var tab = NotebookTabs.TabItems.OfType<TabViewItem>()
-            .FirstOrDefault(item => item.Tag is Guid id && id == target.Id);
-        if (tab is not null) NotebookTabs.TabItems.Remove(tab);
-        _updatingTabs = false;
-        if (deletingCurrent)
+        catch (Exception exception)
         {
-            _page = null;
-            _pages.Clear();
-            NotebookTitle.Text = "No notebook";
-            SelectPage(null);
+            DiagnosticsLog.Warning("assets.garbage_collection_failed_after_delete",
+                ("document_id", target.Id), ("error", exception.Message));
         }
         await PersistUserPreferencesAsync("Deleted notebook");
         await RefreshLibraryAsync();
@@ -4976,8 +5028,13 @@ public sealed partial class MainPage : Page
         if (_imageBitmapCache.TryGetValue(image.AssetHash, out var bitmap))
         {
             TouchImageBitmap(image.AssetHash);
-            drawingSession.DrawImage(bitmap, new Rect(image.Bounds.X, image.Bounds.Y,
-                image.Bounds.Width, image.Bounds.Height));
+            var destination = ImageLayout.Destination(
+                image.Bounds,
+                bitmap.SizeInPixels.Width,
+                bitmap.SizeInPixels.Height,
+                image.PreserveAspectRatio);
+            drawingSession.DrawImage(bitmap, new Rect(
+                destination.X, destination.Y, destination.Width, destination.Height));
             return;
         }
 
@@ -5092,7 +5149,11 @@ public sealed partial class MainPage : Page
                 ExifOrientationMode.RespectExifOrientation,
                 ColorManagementMode.ColorManageToSRgb);
             var bitmap = CanvasBitmap.CreateFromSoftwareBitmap(DrawingSurface, softwareBitmap);
-            return (bitmap, sourceWidth, sourceHeight);
+            // PixelWidth/PixelHeight above describe the encoded orientation. Use the decoded
+            // dimensions after EXIF rotation so portrait photos are placed with the right aspect.
+            var orientedWidth = Math.Max(1, (int)Math.Round(softwareBitmap.PixelWidth / scale));
+            var orientedHeight = Math.Max(1, (int)Math.Round(softwareBitmap.PixelHeight / scale));
+            return (bitmap, orientedWidth, orientedHeight);
         }
         finally
         {
@@ -6680,10 +6741,11 @@ public sealed partial class MainPage : Page
             0.001,
             0.05);
         _wheelScrollTimestamp = now;
-        _pan.Y += _wheelScrollVelocity * (float)elapsedSeconds;
-        TryContinueToAdjacentPage();
+        _pan += _wheelScrollVelocity * (float)elapsedSeconds;
+        ClampHorizontalPan();
+        if (Math.Abs(_wheelScrollVelocity.Y) > 0.01f) TryContinueToAdjacentPage();
         _wheelScrollVelocity *= (float)Math.Exp(-11 * elapsedSeconds);
-        if (Math.Abs(_wheelScrollVelocity) < 18)
+        if (_wheelScrollVelocity.Length() < 18)
             StopWheelScrollAnimation(resumeBackgroundWork: true);
         return true;
     }
@@ -6719,11 +6781,11 @@ public sealed partial class MainPage : Page
     {
         if (!_wheelScrollAnimating)
         {
-            _wheelScrollVelocity = 0;
+            _wheelScrollVelocity = Vector2.Zero;
             return;
         }
         _wheelScrollAnimating = false;
-        _wheelScrollVelocity = 0;
+        _wheelScrollVelocity = Vector2.Zero;
         BeginNavigationSettle();
         StopViewportFramePumpIfIdle();
         if (!resumeBackgroundWork) return;
@@ -6763,23 +6825,36 @@ public sealed partial class MainPage : Page
         var pointer = e.GetCurrentPoint(DrawingSurface);
         var delta = pointer.Properties.MouseWheelDelta;
         if (delta == 0) return;
-        if (_readMode || !IsControlDown())
+        var horizontal = pointer.Properties.IsHorizontalMouseWheel;
+        if (horizontal || _readMode || !IsControlDown())
         {
             StopWheelZoomAnimation(resumeBackgroundWork: false);
             PauseBackgroundRecognition();
             PauseThumbnailRefresh();
             BeginNavigationSettle();
-            _pan.Y += delta * 0.13f;
+            if (horizontal)
+            {
+                _pan.X += delta * 0.13f;
+                ClampHorizontalPan();
+            }
+            else
+            {
+                _pan.Y += delta * 0.13f;
+            }
             if (!_wheelScrollAnimating)
             {
                 _wheelScrollAnimating = true;
                 _wheelScrollTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
                 EnsureViewportFramePump();
             }
-            _wheelScrollVelocity = Math.Clamp(
-                _wheelScrollVelocity + delta * 5.7f, -5_000, 5_000);
+            if (horizontal)
+                _wheelScrollVelocity.X = Math.Clamp(
+                    _wheelScrollVelocity.X + delta * 5.7f, -5_000, 5_000);
+            else
+                _wheelScrollVelocity.Y = Math.Clamp(
+                    _wheelScrollVelocity.Y + delta * 5.7f, -5_000, 5_000);
             _fitPending = false;
-            TryContinueToAdjacentPage();
+            if (!horizontal) TryContinueToAdjacentPage();
             e.Handled = true;
             InvalidateCanvas();
             return;
@@ -9947,30 +10022,58 @@ public sealed partial class MainPage : Page
         ? _selectedObjects
         : _selectedObject is null ? [] : [_selectedObject];
 
-    private void CopySelectionToClipboard()
+    private bool CopySelectionToClipboard()
     {
         if (_selectedTextRegions.Count > 0)
         {
             var text = SelectedRegionText();
-            if (string.IsNullOrWhiteSpace(text)) return;
-            var textPackage = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-            textPackage.SetText(text);
-            Clipboard.SetContent(textPackage);
-            StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s)";
-            return;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            _internalClipboard = null;
+            _internalTextClipboard = text;
+            try
+            {
+                var textPackage = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+                textPackage.SetText(text);
+                Clipboard.SetContent(textPackage);
+                StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s)";
+            }
+            catch (Exception exception)
+            {
+                DiagnosticsLog.Warning("clipboard.copy_failed", ("error", exception.Message));
+                StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s) inside HoomNote";
+            }
+            return true;
         }
         var selected = SelectedCanvasObjects();
-        if (selected.Count == 0) return;
-        _internalClipboard = JsonSerializer.Serialize(selected, HoomNoteJson.Options);
-        var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-        package.SetData(CanvasClipboardFormat, _internalClipboard);
-        var plainText = string.Join(Environment.NewLine,
-            selected.OfType<RichTextObject>()
-                .Select(item => item.Content.PlainText)
-                .Where(item => !string.IsNullOrWhiteSpace(item)));
-        if (!string.IsNullOrWhiteSpace(plainText)) package.SetText(plainText);
-        Clipboard.SetContent(package);
-        StatusText.Text = $"Copied {selected.Count} object(s)";
+        if (selected.Count == 0) return false;
+        try
+        {
+            _internalClipboard = JsonSerializer.Serialize(selected, HoomNoteJson.Options);
+            var plainText = string.Join(Environment.NewLine,
+                selected.OfType<RichTextObject>()
+                    .Select(item => item.Content.PlainText)
+                    .Where(item => !string.IsNullOrWhiteSpace(item)));
+            _internalTextClipboard = string.IsNullOrWhiteSpace(plainText) ? null : plainText;
+            try
+            {
+                var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+                package.SetData(CanvasClipboardFormat, _internalClipboard);
+                if (_internalTextClipboard is not null) package.SetText(_internalTextClipboard);
+                Clipboard.SetContent(package);
+                StatusText.Text = $"Copied {selected.Count} object(s)";
+            }
+            catch (Exception exception)
+            {
+                DiagnosticsLog.Warning("clipboard.copy_failed", ("error", exception.Message));
+                StatusText.Text = $"Copied {selected.Count} object(s) inside HoomNote";
+            }
+            return true;
+        }
+        catch (Exception exception)
+        {
+            ShowError("The selection could not be copied.", exception);
+            return false;
+        }
     }
 
     private string SelectedRegionText() => SelectedRegionText(_selectedTextRegions);
@@ -10010,12 +10113,12 @@ public sealed partial class MainPage : Page
     {
         if (_selectedTextRegions.Count > 0)
         {
-            CopySelectionToClipboard();
+            if (!CopySelectionToClipboard()) return;
             StatusText.Text = "Copied source text • imported PDF text is read-only";
             return;
         }
         if (SelectedCanvasObjects().Count == 0) return;
-        CopySelectionToClipboard();
+        if (!CopySelectionToClipboard()) return;
         OnDeleteClick(sender, e);
     }
 
@@ -10032,6 +10135,10 @@ public sealed partial class MainPage : Page
         {
             await PasteSelectionCoreAsync(targetPoint);
         }
+        catch (Exception exception)
+        {
+            ShowError("The clipboard contents could not be pasted.", exception);
+        }
         finally
         {
             _pasteGate.Release();
@@ -10043,10 +10150,26 @@ public sealed partial class MainPage : Page
         if (_document is null || _page is null || _assetStore is null) return;
         var pasteTarget = ResolvePasteTarget(targetPoint);
         string? json = null;
+        DataPackageView? view = null;
         try
         {
-            var view = Clipboard.GetContent();
-            if (view.Contains(CanvasClipboardFormat) && await view.GetDataAsync(CanvasClipboardFormat) is string clipboardJson)
+            view = Clipboard.GetContent();
+        }
+        catch (Exception exception)
+        {
+            // The in-process copy remains available if another app owns a delayed clipboard item.
+            DiagnosticsLog.Warning("clipboard.read_failed", ("error", exception.Message));
+            json = _internalClipboard;
+            if (string.IsNullOrWhiteSpace(json) && !string.IsNullOrWhiteSpace(_internalTextClipboard))
+            {
+                PasteTextAt(_internalTextClipboard, pasteTarget);
+                return;
+            }
+        }
+        if (json is null && view is not null)
+        {
+            if (view.Contains(CanvasClipboardFormat) &&
+                await view.GetDataAsync(CanvasClipboardFormat) is string clipboardJson)
                 json = clipboardJson;
             else if (await TryPasteImageAsync(view, pasteTarget)) return;
             else if (view.Contains(StandardDataFormats.Text))
@@ -10055,11 +10178,6 @@ public sealed partial class MainPage : Page
                 if (!string.IsNullOrWhiteSpace(text)) PasteTextAt(text, pasteTarget);
                 return;
             }
-        }
-        catch
-        {
-            // The in-process copy remains available if another app owns a delayed clipboard item.
-            json = _internalClipboard;
         }
         if (string.IsNullOrWhiteSpace(json)) return;
         List<CanvasObject>? source;

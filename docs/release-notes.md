@@ -1,5 +1,6 @@
-# HoomNote 0.8.1
+# HoomNote 0.8.2
 
-- Writing no longer pauses at a fixed stroke interval. Completed strokes are composited incrementally into the retained page and only the detail tiles they intersect, avoiding periodic full overlay compaction work.
-- Rapid back-to-back strokes remain visible while the renderer catches up, and partially drained render queues can no longer be mistaken for a fully current page frame.
-- Erasing preserves the previous committed correction until its replacement frame is ready, preventing erased content from flashing or briefly returning when a new erase gesture begins or is cancelled.
+- Copy, cut, and paste no longer crash when Windows clipboard access fails. HoomNote keeps an in-process object or text copy as a fallback and reports paste failures in the app.
+- Images now use their decoded EXIF orientation and preserve their aspect ratio on the canvas and in page thumbnails, fixing stretched and mismatched-looking image boxes.
+- Deleting a notebook now waits for the SQLite transaction to finish before clearing tabs and page state. A failed delete leaves the open notebook intact, and post-delete asset cleanup failures no longer crash the app.
+- Precision touchpads and horizontal mouse wheels can now pan left and right with momentum without triggering vertical page navigation.
