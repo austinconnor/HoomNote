@@ -390,7 +390,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         var document = HoomNoteDocument.Create("Bounded journal");
         var page = AddPage(document);
         await repository.SaveAsync(document);
-        var strokes = Enumerable.Range(0, 128).Select(index => new InkStrokeObject
+        var strokes = Enumerable.Range(0, 1_024).Select(index => new InkStrokeObject
         {
             ZIndex = index,
             Points = [new InkPoint(index, index), new InkPoint(index + 1, index + 1)]
@@ -526,6 +526,21 @@ public sealed class PersistenceTests : IAsyncLifetime
             "{\"x\":3,\"y\":4,\"pressure\":0.75,\"tiltX\":2,\"tiltY\":-1,\"timestampMicroseconds\":9}",
             HoomNoteJson.Options);
         Assert.Equal(new InkPoint(3, 4, 0.75f, 2, -1, 9), legacy);
+    }
+
+    [Fact]
+    public void CanvasObjectSerializationReadsLegacyRustOutOfOrderDiscriminator()
+    {
+        var id = Guid.NewGuid();
+        var json = $"{{\"id\":\"{id}\",\"zIndex\":0,\"isLocked\":false,\"isHidden\":false,"
+            + "\"transform\":{\"m11\":1,\"m12\":0,\"m21\":0,\"m22\":1,\"m31\":0,\"m32\":0},"
+            + "\"$type\":\"ink\",\"points\":[[1,2]],\"style\":{}}";
+
+        var canvasObject = JsonSerializer.Deserialize<CanvasObject>(json, HoomNoteJson.Options);
+
+        var ink = Assert.IsType<InkStrokeObject>(canvasObject);
+        Assert.Equal(id, ink.Id);
+        Assert.Single(ink.Points);
     }
 
     [Fact]
@@ -918,6 +933,7 @@ public sealed class PersistenceTests : IAsyncLifetime
             PenColor = "#2E86DE",
             HighlighterColor = "#FFCE56",
             HighlighterStraightLine = true,
+            SmartShapes = false,
             TemporaryGridSize = 47.5,
             StyleBrushSize = 64,
             EraserSize = 28,
@@ -955,6 +971,7 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal("#2E86DE", loaded.PenColor);
         Assert.Equal("#FFCE56", loaded.HighlighterColor);
         Assert.True(loaded.HighlighterStraightLine);
+        Assert.False(loaded.SmartShapes);
         Assert.Equal(47.5, loaded.TemporaryGridSize);
         Assert.Equal(64, loaded.StyleBrushSize);
         Assert.Equal(28, loaded.EraserSize);

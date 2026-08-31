@@ -211,6 +211,99 @@ public sealed class GeometryAndEditingTests
         Assert.Equal(expectedPan, result, 4);
     }
 
+    [Theory]
+    [InlineData(120, true, -120)]
+    [InlineData(-120, true, 120)]
+    [InlineData(120, false, 120)]
+    public void TrackpadPanPolicy_UsesNaturalHorizontalDirection(
+        int wheelDelta,
+        bool horizontal,
+        int expected) =>
+        Assert.Equal(expected, TrackpadPanPolicy.WheelDeltaForPan(wheelDelta, horizontal));
+
+    [Fact]
+    public void DirtyRegionPolicy_OnlyInvalidatesIntersectingTiles()
+    {
+        var regions = NavigationDirtyRegionPolicy.Normalize(
+            [new RectD(330, 20, 30, 40)],
+            new SizeD(1_200, 900),
+            padding: 4);
+
+        var keys = NavigationDirtyRegionPolicy.TileKeys(
+            regions,
+            new SizeD(1_200, 900),
+            scale: 1,
+            tilePixels: 320);
+
+        Assert.Equal([(1, 0)], keys);
+    }
+
+    [Fact]
+    public void DirtyRegionPolicy_MergesOverlapsAndClipsToThePage()
+    {
+        var regions = NavigationDirtyRegionPolicy.Normalize(
+            [new RectD(-10, -10, 30, 30), new RectD(15, 15, 20, 20)],
+            new SizeD(100, 100));
+
+        Assert.Equal([new RectD(0, 0, 35, 35)], regions);
+    }
+
+    [Fact]
+    public void DirtyRegionPolicy_MergesTransitiveOverlapsRegardlessOfInputOrder()
+    {
+        var regions = NavigationDirtyRegionPolicy.Normalize(
+            [
+                new RectD(0, 0, 10, 10),
+                new RectD(20, 0, 10, 10),
+                new RectD(8, 0, 14, 10)
+            ],
+            new SizeD(100, 100));
+
+        Assert.Equal([new RectD(0, 0, 30, 10)], regions);
+    }
+
+    [Fact]
+    public void InkBatchPolicy_BatchesOnlyCompatibleOpaqueStrokesWithinThePointBudget()
+    {
+        var style = new InkStyle { Tool = InkToolKind.Pen, Color = "#112233", Width = 2 };
+        var first = new InkStrokeObject
+        {
+            Style = style,
+            Points = [new InkPoint(0, 0), new InkPoint(1, 1)]
+        };
+        var second = first with
+        {
+            Id = Guid.NewGuid(),
+            Points = [new InkPoint(2, 2), new InkPoint(3, 3)]
+        };
+        var different = second with
+        {
+            Id = Guid.NewGuid(),
+            Style = style with { Color = "#445566" }
+        };
+
+        Assert.Equal(2, InkBatchPolicy.CompatiblePrefixLength(
+            [first, second, different], 0, maximumStrokes: 128, maximumSourcePoints: 8));
+        Assert.Equal(1, InkBatchPolicy.CompatiblePrefixLength(
+            [first, second], 0, maximumStrokes: 128, maximumSourcePoints: 3));
+    }
+
+    [Fact]
+    public void InkBatchPolicy_NeverCombinesHighlighterStrokes()
+    {
+        var highlighter = new InkStrokeObject
+        {
+            Style = new InkStyle { Tool = InkToolKind.Highlighter },
+            Points = [new InkPoint(0, 0), new InkPoint(1, 1)]
+        };
+
+        Assert.Equal(0, InkBatchPolicy.CompatiblePrefixLength(
+            [highlighter, highlighter with { Id = Guid.NewGuid() }],
+            0,
+            maximumStrokes: 128,
+            maximumSourcePoints: 8));
+    }
+
     [Fact]
     public void ImageLayout_PreservesAspectRatioAndCentersInsideBounds()
     {

@@ -825,7 +825,7 @@
                                 </Flyout>
                             </Button.Flyout>
                         </Button>
-                        <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" />
+                        <ToggleSwitch x:Name="SmartShapesToggle" Header="Hold to shape" OffContent="Off" OnContent="On" IsOn="True" Toggled="OnSmartShapesToggled" />
                         <ComboBox x:Name="ShapePicker" Header="Shape tool" SelectedIndex="0"
                                   HorizontalAlignment="Stretch">
                             <ComboBoxItem Tag="Square" Content="Square" />

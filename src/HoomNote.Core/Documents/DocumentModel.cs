@@ -26,6 +26,7 @@ public sealed record PageTemplate
     public double Spacing { get; init; } = 28;
     public double Margin { get; init; } = 52;
     public double LineWidth { get; init; } = 1;
+    public double OverlayOpacity { get; init; } = 0.55;
 
     public static PageTemplate For(PageTemplateKind kind) => kind switch
     {

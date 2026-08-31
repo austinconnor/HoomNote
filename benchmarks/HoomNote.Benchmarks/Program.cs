@@ -5,6 +5,12 @@ using HoomNote.Canvas.Geometry;
 using HoomNote.Canvas.Spatial;
 using HoomNote.Core.Documents;
 
+if (args.Length >= 2 && string.Equals(args[0], "--real-data", StringComparison.OrdinalIgnoreCase))
+{
+    await RealDataRenderComparison.RunAsync(args[1]);
+    return;
+}
+
 BenchmarkRunner.Run<CanvasBenchmarks>();
 
 [MemoryDiagnoser]

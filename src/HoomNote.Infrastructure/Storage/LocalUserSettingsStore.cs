@@ -6,13 +6,14 @@ namespace HoomNote.Infrastructure.Storage;
 
 public sealed record UserPreferences
 {
-    public const int CurrentVersion = 13;
+    public const int CurrentVersion = 14;
 
     public int Version { get; init; } = CurrentVersion;
     public List<string> SavedInkColors { get; init; } = ["#111111"];
     public string PenColor { get; init; } = "#111111";
     public string HighlighterColor { get; init; } = "#FFFF00";
     public bool HighlighterStraightLine { get; init; }
+    public bool SmartShapes { get; init; } = true;
     public double TemporaryGridSize { get; init; } = 32;
     public double StyleBrushSize { get; init; } = 36;
     public double EraserSize { get; init; } = 12;

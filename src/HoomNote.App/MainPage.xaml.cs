@@ -276,7 +276,8 @@ public sealed partial class MainPage : Page
         Color Color,
         bool IsCenterline,
         float Width,
-        int PointCount);
+        int PointCount,
+        double RenderScale);
     private sealed record PageRenderState(
         NotePage? Page,
         double Zoom,
@@ -313,6 +314,8 @@ public sealed partial class MainPage : Page
     // Creating a retained CanvasGeometry costs the same path construction the raw fallback
     // would perform for that frame, so retain every miss that still fits the memory budget.
     private const int FrameStrokeGeometryBuildLimit = 64;
+    private const int InkGeometryBatchStrokeLimit = 128;
+    private const int InkGeometryBatchSourcePointLimit = 16_384;
     private readonly CanvasStrokeStyle _roundInkStrokeStyle = new()
     {
         StartCap = CanvasCapStyle.Round,
@@ -350,6 +353,8 @@ public sealed partial class MainPage : Page
     // GPU resources are created, drawn, and disposed while holding this renderer-owned gate.
     private readonly object _pageRenderGate = new();
     private int _pageRenderInvalidationRequested;
+    private int _pageRenderFullInvalidationRequested;
+    private readonly ConcurrentQueue<(Guid PageId, RectD Region)> _pendingPageRenderDirtyRegions = new();
     private int _allPageRenderInvalidationRequested;
     private PageRenderSwitch? _pendingPageRenderSwitch;
     private int _strokeGeometryClearRequested;
@@ -889,6 +894,7 @@ public sealed partial class MainPage : Page
             _penColor = IsValidHexColor(_userPreferences.PenColor) ? _userPreferences.PenColor.ToUpperInvariant() : "#111111";
             _highlighterColor = IsValidHexColor(_userPreferences.HighlighterColor) ? _userPreferences.HighlighterColor.ToUpperInvariant() : "#FFFF00";
             HighlighterStraightCheckBox.IsChecked = _userPreferences.HighlighterStraightLine;
+            SmartShapesToggle.IsOn = _userPreferences.SmartShapes;
             _expandedFolderIds.Clear();
             foreach (var value in _userPreferences.ExpandedFolderIds)
                 if (Guid.TryParse(value, out var folderId))
@@ -3525,6 +3531,8 @@ public sealed partial class MainPage : Page
         lock (_pageRenderGate)
         {
             Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0);
+            Interlocked.Exchange(ref _pageRenderFullInvalidationRequested, 0);
+            while (_pendingPageRenderDirtyRegions.TryDequeue(out _)) { }
             Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 0);
             Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
             Interlocked.Exchange(ref _strokeGeometryClearRequested, 0);
@@ -3697,6 +3705,16 @@ public sealed partial class MainPage : Page
             ClearStaleNavigationTilesCore();
         var clearedAllPages = Interlocked.Exchange(ref _allPageRenderInvalidationRequested, 0) != 0;
         var clearedPage = Interlocked.Exchange(ref _pageRenderInvalidationRequested, 0) != 0;
+        var fullPageInvalidation =
+            Interlocked.Exchange(ref _pageRenderFullInvalidationRequested, 0) != 0;
+        List<RectD>? dirtyRegions = null;
+        var currentPageId = Volatile.Read(ref _publishedPageRenderState).Page?.Id;
+        while (_pendingPageRenderDirtyRegions.TryDequeue(out var pendingDirtyRegion))
+        {
+            if (pendingDirtyRegion.PageId != currentPageId) continue;
+            dirtyRegions ??= [];
+            dirtyRegions.Add(pendingDirtyRegion.Region);
+        }
         if (clearedAllPages)
         {
             Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
@@ -3705,7 +3723,8 @@ public sealed partial class MainPage : Page
         else if (clearedPage)
         {
             Interlocked.Exchange(ref _pendingPageRenderSwitch, null);
-            InvalidatePageRenderCacheCore();
+            InvalidatePageRenderCacheCore(
+                dirtyRegions: fullPageInvalidation ? null : dirtyRegions);
         }
         else if (Interlocked.Exchange(ref _pendingPageRenderSwitch, null) is { } pageSwitch)
             SwitchPageRenderCacheCore(pageSwitch);
@@ -4395,18 +4414,14 @@ public sealed partial class MainPage : Page
             if (_temporaryGridVisible) DrawTemporaryGrid(session, page, tileBounds);
             var tileObjects = _visibleObjects.Where(canvasObject =>
                 _pageRenderCacheObjectIds.Contains(canvasObject.Id)).ToArray();
-            foreach (var canvasObject in
-                  CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects))
-            {
-                buildCancellation.Token.ThrowIfCancellationRequested();
-                if (Volatile.Read(ref _renderInteractionPauseRequested) != 0)
-                {
-                    aborted = true;
-                    break;
-                }
-                DrawObject(session, canvasObject, cacheInkGeometry: true,
-                    cancellationToken: buildCancellation.Token);
-            }
+            var renderObjects = CanvasObjectRenderPolicy.VisibleInAuthoredOrder(tileObjects).ToArray();
+            DrawBatchedObjects(
+                session,
+                renderObjects,
+                _navigationTileScale,
+                IsDarkColor(page.Template.PaperColor),
+                buildCancellation.Token,
+                () => Volatile.Read(ref _renderInteractionPauseRequested) != 0);
         }
         catch (OperationCanceledException)
         {
@@ -4576,9 +4591,26 @@ public sealed partial class MainPage : Page
             while (_pendingLowZoomPageRasterObjectIndex < page.Objects.Count)
             {
                 buildCancellation.Token.ThrowIfCancellationRequested();
-                DrawObject(session, page.Objects[_pendingLowZoomPageRasterObjectIndex],
-                    cancellationToken: buildCancellation.Token);
-                _pendingLowZoomPageRasterObjectIndex++;
+                if (page.Objects[_pendingLowZoomPageRasterObjectIndex].IsHidden)
+                {
+                    _pendingLowZoomPageRasterObjectIndex++;
+                    continue;
+                }
+                var consumed = TryDrawInkBatch(
+                    session,
+                    page.Objects,
+                    _pendingLowZoomPageRasterObjectIndex,
+                    rasterScale,
+                    IsDarkColor(page.Template.PaperColor),
+                    buildCancellation.Token);
+                if (consumed == 0)
+                {
+                    DrawObject(session, page.Objects[_pendingLowZoomPageRasterObjectIndex],
+                        cancellationToken: buildCancellation.Token,
+                        renderScale: rasterScale);
+                    consumed = 1;
+                }
+                _pendingLowZoomPageRasterObjectIndex += consumed;
                 if (MillisecondsSince(frameStarted) >= PageRasterFrameBudgetMs) break;
             }
         }
@@ -4669,7 +4701,7 @@ public sealed partial class MainPage : Page
             session.Transform = Matrix3x2.CreateScale((float)NavigationSnapshotScale(page));
             foreach (var batch in _pageRenderOverlayBatches) session.DrawImage(batch);
             foreach (var overlay in _pageRenderOverlays)
-                if (!overlay.IsHidden) DrawObject(session, overlay);
+                if (!overlay.IsHidden) DrawObject(session, overlay, renderScale: NavigationSnapshotScale(page));
         }
         foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
         _pageRenderOverlayBatches.Clear();
@@ -4695,7 +4727,8 @@ public sealed partial class MainPage : Page
         using (var session = _lowZoomPageRaster.CreateDrawingSession())
         {
             session.Transform = Matrix3x2.CreateScale((float)NavigationSnapshotScale(page));
-            if (!appended.IsHidden) DrawObject(session, appended, cacheInkGeometry: true);
+            if (!appended.IsHidden) DrawObject(session, appended, cacheInkGeometry: true,
+                renderScale: NavigationSnapshotScale(page));
         }
         // Advance only to the edit represented by this queue entry. A new pointer gesture may
         // pause draining between entries; claiming the page's latest timestamp here would make
@@ -4726,7 +4759,8 @@ public sealed partial class MainPage : Page
                 tileSession.Transform = Matrix3x2.CreateTranslation(
                                             (float)-tileBounds.X, (float)-tileBounds.Y) *
                                         Matrix3x2.CreateScale((float)_navigationTileScale);
-                if (!appended.IsHidden) DrawObject(tileSession, appended, cacheInkGeometry: true);
+                if (!appended.IsHidden) DrawObject(tileSession, appended, cacheInkGeometry: true,
+                    renderScale: _navigationTileScale);
             }
         }
 
@@ -4767,7 +4801,8 @@ public sealed partial class MainPage : Page
                                 Matrix3x2.CreateScale((float)_navigationTileScale);
             foreach (var batch in _pageRenderOverlayBatches) session.DrawImage(batch);
             foreach (var overlay in _pageRenderOverlays)
-                if (!overlay.IsHidden) DrawObject(session, overlay, cacheInkGeometry: true);
+                if (!overlay.IsHidden) DrawObject(session, overlay, cacheInkGeometry: true,
+                    renderScale: _navigationTileScale);
         }
     }
 
@@ -4976,14 +5011,15 @@ public sealed partial class MainPage : Page
         CanvasDrawingSession drawingSession,
         CanvasObject canvasObject,
         bool cacheInkGeometry = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        double? renderScale = null)
     {
         var previous = drawingSession.Transform;
         drawingSession.Transform = canvasObject.Transform.ToMatrix() * previous;
         switch (canvasObject)
         {
             case InkStrokeObject ink:
-                DrawInk(drawingSession, ink, cacheInkGeometry, cancellationToken);
+                DrawInk(drawingSession, ink, cacheInkGeometry, cancellationToken, renderScale);
                 break;
             case RichTextObject text:
                 using (var format = CreateTextFormat(text))
@@ -5001,6 +5037,139 @@ public sealed partial class MainPage : Page
                 break;
         }
         drawingSession.Transform = previous;
+    }
+
+    private void DrawBatchedObjects(
+        CanvasDrawingSession drawingSession,
+        IReadOnlyList<CanvasObject> objects,
+        double renderScale,
+        bool darkSurface,
+        CancellationToken cancellationToken = default,
+        Func<bool>? shouldAbort = null)
+    {
+        for (var index = 0; index < objects.Count;)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (shouldAbort?.Invoke() == true)
+                throw new OperationCanceledException(cancellationToken);
+            var consumed = TryDrawInkBatch(
+                drawingSession, objects, index, renderScale, darkSurface, cancellationToken);
+            if (consumed == 0)
+            {
+                DrawObject(
+                    drawingSession,
+                    objects[index],
+                    cacheInkGeometry: true,
+                    cancellationToken: cancellationToken,
+                    renderScale: renderScale);
+                consumed = 1;
+            }
+            index += consumed;
+        }
+    }
+
+    private int TryDrawInkBatch(
+        CanvasDrawingSession drawingSession,
+        IReadOnlyList<CanvasObject> objects,
+        int start,
+        double renderScale,
+        bool darkSurface,
+        CancellationToken cancellationToken)
+    {
+        if (start < 0 || start >= objects.Count || objects[start] is not InkStrokeObject first ||
+            first.IsHidden || first.Points.Count < 2 ||
+            first.Style.Tool == InkToolKind.Highlighter)
+            return 0;
+        var firstStyle = first.Style.Normalize();
+        var centerline = StrokeOutlineBuilder.UsesCenterlineStroke(first);
+        var count = InkBatchPolicy.CompatiblePrefixLength(
+            objects,
+            start,
+            InkGeometryBatchStrokeLimit,
+            InkGeometryBatchSourcePointLimit);
+        if (count < 2) return 0;
+
+        using var path = new CanvasPathBuilder(drawingSession);
+        if (!centerline)
+            path.SetFilledRegionDetermination(CanvasFilledRegionDetermination.Winding);
+        for (var offset = 0; offset < count; offset++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var stroke = (InkStrokeObject)objects[start + offset];
+            if (centerline)
+            {
+                var fitted = ShouldUseCanonicalSmoothCenterline(stroke)
+                    ? stroke.Points
+                    : StrokeOutlineBuilder.FitCenterline(stroke);
+                var points = StrokeRenderSampler.ForRaster(fitted, renderScale, cancellationToken);
+                if (points.Count < 2) return 0;
+                AddCenterlineFigure(path, points, ShouldUseCanonicalSmoothCenterline(stroke));
+            }
+            else
+            {
+                var points = StrokeRenderSampler.ForRaster(
+                    stroke.Points, renderScale, cancellationToken);
+                var contour = StrokeOutlineBuilder.Build(points, stroke.Style).Contour;
+                if (contour.Count < 3) return 0;
+                AddOutlineFigure(path, contour);
+            }
+        }
+
+        using var geometry = CanvasGeometry.CreatePath(path);
+        var previousTransform = drawingSession.Transform;
+        drawingSession.Transform = first.Transform.ToMatrix() * previousTransform;
+        using var blend = ConfigureInkBlend(drawingSession, firstStyle, darkSurface, out var color);
+        if (centerline)
+            drawingSession.DrawGeometry(
+                geometry, color, StrokeOutlineBuilder.VectorCenterlineWidth(firstStyle),
+                _roundInkStrokeStyle);
+        else
+            drawingSession.FillGeometry(geometry, color);
+        drawingSession.Transform = previousTransform;
+        return count;
+    }
+
+    private static void AddCenterlineFigure(
+        CanvasPathBuilder path,
+        IReadOnlyList<InkPoint> points,
+        bool smooth)
+    {
+        var current = points[0].Position.ToVector2();
+        path.BeginFigure(current);
+        if (smooth && points.Count >= 3)
+        {
+            for (var index = 1; index < points.Count - 1; index++)
+            {
+                var control = points[index].Position.ToVector2();
+                var next = points[index + 1].Position.ToVector2();
+                var midpoint = (control + next) * 0.5f;
+                path.AddCubicBezier(
+                    current + (control - current) * (2f / 3f),
+                    midpoint + (control - midpoint) * (2f / 3f),
+                    midpoint);
+                current = midpoint;
+            }
+            var finalControl = points[^2].Position.ToVector2();
+            var final = points[^1].Position.ToVector2();
+            path.AddCubicBezier(
+                current + (finalControl - current) * (2f / 3f),
+                final + (finalControl - final) * (2f / 3f),
+                final);
+        }
+        else
+        {
+            for (var index = 1; index < points.Count; index++)
+                path.AddLine(points[index].Position.ToVector2());
+        }
+        path.EndFigure(CanvasFigureLoop.Open);
+    }
+
+    private static void AddOutlineFigure(CanvasPathBuilder path, IReadOnlyList<PointD> contour)
+    {
+        path.BeginFigure(contour[0].ToVector2());
+        for (var index = 1; index < contour.Count; index++)
+            path.AddLine(contour[index].ToVector2());
+        path.EndFigure(CanvasFigureLoop.Closed);
     }
 
     private static CanvasTextFormat CreateTextFormat(RichTextObject text)
@@ -5165,23 +5334,25 @@ public sealed partial class MainPage : Page
         CanvasDrawingSession drawingSession,
         InkStrokeObject stroke,
         bool cacheGeometry = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        double? renderScale = null)
     {
         if (stroke.Points.Count == 0) return;
+        var effectiveRenderScale = Math.Clamp(renderScale ?? _zoom, 1d / 16d, 8d);
         var normalizedStyle = stroke.Style.Normalize();
         using var blend = ConfigureInkBlend(
             drawingSession, normalizedStyle,
             IsDarkColor(_page?.Template.PaperColor ?? "#FFFDF8"), out var color);
         if (cacheGeometry && TryDrawCachedInk(
-                drawingSession, stroke, color, cancellationToken)) return;
+                drawingSession, stroke, color, cancellationToken, effectiveRenderScale)) return;
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
-            DrawCenterlineInk(drawingSession, stroke, color, cancellationToken);
+            DrawCenterlineInk(drawingSession, stroke, color, cancellationToken, effectiveRenderScale);
             return;
         }
 
         var renderPoints = StrokeRenderSampler.ForRaster(
-            stroke.Points, Math.Max(_zoom, 2), cancellationToken);
+            stroke.Points, effectiveRenderScale, cancellationToken);
         var outline = StrokeOutlineBuilder.Build(renderPoints, stroke.Style);
         if (outline.Contour.Count < 3)
         {
@@ -5231,12 +5402,14 @@ public sealed partial class MainPage : Page
         CanvasDrawingSession drawingSession,
         InkStrokeObject stroke,
         Color color,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        double renderScale)
     {
         if (stroke.Points.Count < 2) return false;
         if (_strokeGeometryCache.TryGetValue(stroke.Id, out var existing))
         {
-            if (ReferenceEquals(existing.Stroke, stroke) && existing.Color.Equals(color))
+            if (ReferenceEquals(existing.Stroke, stroke) && existing.Color.Equals(color) &&
+                Math.Abs(existing.RenderScale - renderScale) < 0.0001)
             {
                 TouchStrokeGeometry(stroke.Id);
                 DrawStrokeGeometry(drawingSession, existing);
@@ -5254,7 +5427,8 @@ public sealed partial class MainPage : Page
         if (_strokeGeometryCache.Count >= StrokeGeometryCacheLimit) return false;
         if (_frameStrokeGeometryBuilds >= FrameStrokeGeometryBuildLimit) return false;
         _frameStrokeGeometryBuilds++;
-        var cached = CreateStrokeGeometry(drawingSession, stroke, color, cancellationToken);
+        var cached = CreateStrokeGeometry(
+            drawingSession, stroke, color, cancellationToken, renderScale);
         if (cached is null) return false;
         if (cached.PointCount > StrokeGeometryCachePointLimit - _strokeGeometryCachedPoints)
         {
@@ -5270,7 +5444,8 @@ public sealed partial class MainPage : Page
         ICanvasResourceCreator resourceCreator,
         InkStrokeObject stroke,
         Color color,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        double renderScale)
     {
         if (StrokeOutlineBuilder.UsesCenterlineStroke(stroke))
         {
@@ -5279,7 +5454,7 @@ public sealed partial class MainPage : Page
                 ? stroke.Points
                 : StrokeOutlineBuilder.FitCenterline(stroke);
             var renderPoints = StrokeRenderSampler.ForRaster(
-                fitted, Math.Max(_zoom, 2), cancellationToken);
+                fitted, renderScale, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             var geometry = ShouldUseCanonicalSmoothCenterline(stroke)
                 ? CreateSmoothCenterlineGeometry(resourceCreator, renderPoints, 0, renderPoints.Count)
@@ -5290,11 +5465,12 @@ public sealed partial class MainPage : Page
                 color,
                 IsCenterline: true,
                 Width: StrokeOutlineBuilder.VectorCenterlineWidth(stroke.Style),
-                PointCount: renderPoints.Count);
+                PointCount: renderPoints.Count,
+                RenderScale: renderScale);
         }
 
         var renderPointsForOutline = StrokeRenderSampler.ForRaster(
-            stroke.Points, Math.Max(_zoom, 2), cancellationToken);
+            stroke.Points, renderScale, cancellationToken);
         var outline = StrokeOutlineBuilder.Build(renderPointsForOutline, stroke.Style);
         cancellationToken.ThrowIfCancellationRequested();
         if (outline.Contour.Count < 3) return null;
@@ -5304,7 +5480,8 @@ public sealed partial class MainPage : Page
             color,
             IsCenterline: false,
             Width: 0,
-            PointCount: outline.Contour.Count);
+            PointCount: outline.Contour.Count,
+            RenderScale: renderScale);
     }
 
     private void DrawStrokeGeometry(CanvasDrawingSession drawingSession, StrokeGeometryCacheEntry entry)
@@ -5367,11 +5544,13 @@ public sealed partial class MainPage : Page
         CanvasDrawingSession drawingSession,
         InkStrokeObject stroke,
         Color color,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        double? renderScale = null)
     {
         // Keep width in document space so fine handwriting becomes proportionally thinner as
         // the page is zoomed out. Direct2D handles subpixel antialiasing at the viewport edge.
-        var width = StrokeOutlineBuilder.VisibleCenterlineWidth(stroke.Style, _zoom);
+        var effectiveRenderScale = Math.Clamp(renderScale ?? _zoom, 1d / 16d, 8d);
+        var width = StrokeOutlineBuilder.VisibleCenterlineWidth(stroke.Style, effectiveRenderScale);
         if (stroke.Points.Count == 1)
         {
             var point = stroke.Points[0];
@@ -5383,7 +5562,7 @@ public sealed partial class MainPage : Page
             ? stroke.Points
             : StrokeOutlineBuilder.FitCenterline(stroke);
         var centerline = StrokeRenderSampler.ForRaster(
-            fittedCenterline, Math.Max(_zoom, 2), cancellationToken);
+            fittedCenterline, effectiveRenderScale, cancellationToken);
         if (centerline.Count == 0) return;
         if (centerline.Count == 1)
         {
@@ -5950,7 +6129,9 @@ public sealed partial class MainPage : Page
             _selectedObjects.Clear();
             _selectedObjects.AddRange(after);
             _selectedObject = after.Length == 1 ? after[0] : null;
-            OnDocumentChanged(recognizeInk: after.Any(item => item is InkStrokeObject));
+            OnDocumentChanged(
+                recognizeInk: after.Any(item => item is InkStrokeObject),
+                dirtyRegions: DirtyRegionsForObjects(originals.Concat(after)));
             Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
             return true;
         }
@@ -5964,7 +6145,9 @@ public sealed partial class MainPage : Page
         _selectedObject = _transformPreview;
         _selectedObjects.Clear();
         _selectedObjects.Add(_transformPreview);
-        OnDocumentChanged(recognizeInk: _transformPreview is InkStrokeObject);
+        OnDocumentChanged(
+            recognizeInk: _transformPreview is InkStrokeObject,
+            dirtyRegions: DirtyRegionsForObjects([_transformOriginal, _transformPreview]));
         Volatile.Write(ref _transformPreviewCommitVersion, _editVersion);
         return true;
     }
@@ -6826,6 +7009,7 @@ public sealed partial class MainPage : Page
         var delta = pointer.Properties.MouseWheelDelta;
         if (delta == 0) return;
         var horizontal = pointer.Properties.IsHorizontalMouseWheel;
+        var panDelta = TrackpadPanPolicy.WheelDeltaForPan(delta, horizontal);
         if (horizontal || _readMode || !IsControlDown())
         {
             StopWheelZoomAnimation(resumeBackgroundWork: false);
@@ -6834,12 +7018,12 @@ public sealed partial class MainPage : Page
             BeginNavigationSettle();
             if (horizontal)
             {
-                _pan.X += delta * 0.13f;
+                _pan.X += panDelta * 0.13f;
                 ClampHorizontalPan();
             }
             else
             {
-                _pan.Y += delta * 0.13f;
+                _pan.Y += panDelta * 0.13f;
             }
             if (!_wheelScrollAnimating)
             {
@@ -6849,10 +7033,10 @@ public sealed partial class MainPage : Page
             }
             if (horizontal)
                 _wheelScrollVelocity.X = Math.Clamp(
-                    _wheelScrollVelocity.X + delta * 5.7f, -5_000, 5_000);
+                    _wheelScrollVelocity.X + panDelta * 5.7f, -5_000, 5_000);
             else
                 _wheelScrollVelocity.Y = Math.Clamp(
-                    _wheelScrollVelocity.Y + delta * 5.7f, -5_000, 5_000);
+                    _wheelScrollVelocity.Y + panDelta * 5.7f, -5_000, 5_000);
             _fitPending = false;
             if (!horizontal) TryContinueToAdjacentPage();
             e.Handled = true;
@@ -7476,7 +7660,7 @@ public sealed partial class MainPage : Page
         _page.Objects.AddRange(_eraseSnapshot);
         _history.Execute(new ReplaceObjectsCommand(_page.Id, _eraseSnapshot, after,
             _gestureTool == EditorTool.SegmentEraser ? "Erase ink segments" : "Erase objects"), _document);
-        OnDocumentChanged(recognizeInk: true);
+        OnDocumentChanged(recognizeInk: true, dirtyRegions: _eraseDirtyRegions.ToArray());
         if (_eraseDirtyRegions.Count > 0)
             Volatile.Write(ref _erasePreviewCommitVersion, _editVersion);
     }
@@ -7591,13 +7775,17 @@ public sealed partial class MainPage : Page
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, [original], [], "Remove empty text box"), _document);
                 _selectedObject = null;
                 _selectedObjects.Clear();
-                OnDocumentChanged(recognizeInk: false);
+                OnDocumentChanged(
+                    recognizeInk: false,
+                    dirtyRegions: DirtyRegionsForObjects([original]));
             }
             else if (original.Content != preview.Content)
             {
                 _history.Execute(new ReplaceObjectsCommand(_page.Id, [original], [preview], "Edit text"), _document);
                 SelectSingleObject(preview);
-                OnDocumentChanged(recognizeInk: false);
+                OnDocumentChanged(
+                    recognizeInk: false,
+                    dirtyRegions: DirtyRegionsForObjects([original, preview]));
             }
         }
         UpdateSelectionUi();
@@ -7667,7 +7855,8 @@ public sealed partial class MainPage : Page
     private void OnDocumentChanged(
         bool recognizeInk,
         CanvasObject? appendedObject = null,
-        IEnumerable<Guid>? affectedPageIds = null)
+        IEnumerable<Guid>? affectedPageIds = null,
+        IEnumerable<RectD>? dirtyRegions = null)
     {
         if (_page is not null) _page.UpdatedAt = DateTimeOffset.UtcNow;
         _hasUnsavedChanges = true;
@@ -7692,10 +7881,6 @@ public sealed partial class MainPage : Page
             _fullSaveVersion++;
         }
         var appendOnly = appendedObject is not null && _page is not null;
-        if (appendOnly)
-            _pendingPageRenderAppends.Enqueue((_page!.Id, appendedObject!, _page.UpdatedAt));
-        else
-            InvalidatePageRenderCache();
         if (_page is not null)
         {
             if (appendOnly)
@@ -7710,9 +7895,22 @@ public sealed partial class MainPage : Page
             }
         }
         if (!appendOnly) UpdateSelectionUi();
+        // Publish the new immutable page shell before waking the render thread. Otherwise a
+        // fast frame can consume the dirty-region request against the previous object list and
+        // fall back to rebuilding the full retained page on the next frame.
+        PublishPageRenderState();
+        if (appendOnly)
+            _pendingPageRenderAppends.Enqueue((_page!.Id, appendedObject!, _page.UpdatedAt));
+        else
+            InvalidatePageRenderCache(dirtyRegions);
         InvalidateCanvas();
         ScheduleSave(affectedPageIds);
     }
+
+    private static RectD[] DirtyRegionsForObjects(IEnumerable<CanvasObject> objects) =>
+        objects.Select(StrokeGeometry.GetWorldBounds)
+            .Where(bounds => bounds.IsFinite && bounds.Width >= 0 && bounds.Height >= 0)
+            .ToArray();
 
     private void ScheduleSave(IEnumerable<Guid>? affectedPageIds = null)
     {
@@ -8835,6 +9033,13 @@ public sealed partial class MainPage : Page
         ScheduleUserPreferencesSave();
     }
 
+    private void OnSmartShapesToggled(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        _userPreferences = _userPreferences with { SmartShapes = SmartShapesToggle.IsOn };
+        ScheduleUserPreferencesSave();
+    }
+
     private void UpdateStyleToolUi()
     {
         _syncingStyleTool = true;
@@ -9840,7 +10045,12 @@ public sealed partial class MainPage : Page
         }
         RebindSelectionAfterHistoryChange();
         PrepareHistoryRenderCorrection();
-        OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
+        OnDocumentChanged(
+            recognizeInk: true,
+            affectedPageIds: _history.LastAffectedPageIds,
+            dirtyRegions: DirtyRegionsForObjects(_history.LastAffectedCanvasObjects
+                .Where(item => item.PageId == _page?.Id)
+                .Select(item => item.Object)));
     }
 
     private void OnRedoClick(object sender, RoutedEventArgs e)
@@ -9855,7 +10065,12 @@ public sealed partial class MainPage : Page
         }
         RebindSelectionAfterHistoryChange();
         PrepareHistoryRenderCorrection();
-        OnDocumentChanged(recognizeInk: true, affectedPageIds: _history.LastAffectedPageIds);
+        OnDocumentChanged(
+            recognizeInk: true,
+            affectedPageIds: _history.LastAffectedPageIds,
+            dirtyRegions: DirtyRegionsForObjects(_history.LastAffectedCanvasObjects
+                .Where(item => item.PageId == _page?.Id)
+                .Select(item => item.Object)));
     }
 
     private void PrepareHistoryRenderCorrection()
@@ -9929,7 +10144,9 @@ public sealed partial class MainPage : Page
         _selectedObjects.Clear();
         _selectedObjects.AddRange(duplicates);
         _selectedObject = duplicates.Length == 1 ? duplicates[0] : null;
-        OnDocumentChanged(recognizeInk: duplicates.Any(item => item is InkStrokeObject));
+        OnDocumentChanged(
+            recognizeInk: duplicates.Any(item => item is InkStrokeObject),
+            dirtyRegions: DirtyRegionsForObjects(duplicates));
     }
 
     private void OnDeleteClick(object sender, RoutedEventArgs e)
@@ -9941,7 +10158,9 @@ public sealed partial class MainPage : Page
         _history.Execute(new ReplaceObjectsCommand(_page.Id, removed, [], "Delete selection"), _document);
         _selectedObject = null;
         _selectedObjects.Clear();
-        OnDocumentChanged(recognizeInk: removed.Any(item => item is InkStrokeObject));
+        OnDocumentChanged(
+            recognizeInk: removed.Any(item => item is InkStrokeObject),
+            dirtyRegions: DirtyRegionsForObjects(removed));
     }
 
     private async void OnAddImageClick(object sender, RoutedEventArgs e)
@@ -10015,7 +10234,9 @@ public sealed partial class MainPage : Page
         _selectedObject = updated;
         _selectedObjects.Clear();
         _selectedObjects.Add(updated);
-        OnDocumentChanged(recognizeInk: false);
+        OnDocumentChanged(
+            recognizeInk: false,
+            dirtyRegions: DirtyRegionsForObjects([selected, updated]));
     }
 
     private IReadOnlyList<CanvasObject> SelectedCanvasObjects() => _selectedObjects.Count > 0
@@ -10215,7 +10436,9 @@ public sealed partial class MainPage : Page
         _selectedObjects.Clear();
         _selectedObjects.AddRange(pasted);
         _selectedObject = pasted.Length == 1 ? pasted[0] : null;
-        OnDocumentChanged(recognizeInk: pasted.Any(item => item is InkStrokeObject));
+        OnDocumentChanged(
+            recognizeInk: pasted.Any(item => item is InkStrokeObject),
+            dirtyRegions: DirtyRegionsForObjects(pasted));
         StatusText.Text = $"Pasted {pasted.Length} object(s)";
     }
 
@@ -11461,6 +11684,7 @@ public sealed partial class MainPage : Page
             PenColor = _penColor,
             HighlighterColor = _highlighterColor,
             HighlighterStraightLine = HighlighterStraightCheckBox.IsChecked == true,
+            SmartShapes = SmartShapesToggle.IsOn,
             TemporaryGridSize = _temporaryGridSize,
             StyleBrushSize = _styleBrushSize,
             EraserSize = _eraserSize,
@@ -11773,8 +11997,24 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void InvalidatePageRenderCache()
+    private void InvalidatePageRenderCache(IEnumerable<RectD>? dirtyRegions = null)
     {
+        var page = _page;
+        var normalized = page is null || dirtyRegions is null
+            ? []
+            : NavigationDirtyRegionPolicy.Normalize(
+                dirtyRegions,
+                page.Size,
+                Math.Max(2, 3 / Math.Max(_zoom, 0.08)));
+        if (page is null || normalized.Count == 0)
+        {
+            Interlocked.Exchange(ref _pageRenderFullInvalidationRequested, 1);
+        }
+        else
+        {
+            foreach (var region in normalized)
+                _pendingPageRenderDirtyRegions.Enqueue((page.Id, region));
+        }
         Interlocked.Exchange(ref _pageRenderInvalidationRequested, 1);
     }
 
@@ -11808,7 +12048,9 @@ public sealed partial class MainPage : Page
             new PageRenderSwitch(_publishedPageSnapshot, targetPage?.Id, targetPage?.UpdatedAt));
     }
 
-    private void InvalidatePageRenderCacheCore(bool preserveSharpFallback = true)
+    private void InvalidatePageRenderCacheCore(
+        bool preserveSharpFallback = true,
+        IReadOnlyList<RectD>? dirtyRegions = null)
     {
         _preloadedFallbackPageId = null;
         CancelPendingLowZoomPageRasterCore();
@@ -11823,6 +12065,28 @@ public sealed partial class MainPage : Page
             MergeOverlaysIntoNavigationTiles(publishedPage);
             if (_lowZoomPageRaster is not null && _lowZoomPageRasterPageId == publishedPage.Id)
                 MergeOverlaysIntoLowZoomRaster(publishedPage);
+        }
+        var normalizedDirtyRegions = publishedPage is null || dirtyRegions is null
+            ? []
+            : NavigationDirtyRegionPolicy.Normalize(dirtyRegions, publishedPage.Size);
+        var canPatchRetainedPage = preserveSharpFallback && publishedPage is not null &&
+            normalizedDirtyRegions.Count > 0 &&
+            _lowZoomPageRaster is not null && _lowZoomPageRasterPageId == publishedPage.Id &&
+            !_lowZoomPageRasterInvalidated;
+        if (canPatchRetainedPage)
+        {
+            PatchLowZoomPageRaster(publishedPage!, normalizedDirtyRegions);
+            InvalidateNavigationTiles(publishedPage!, normalizedDirtyRegions);
+            _pageRenderCache?.Dispose();
+            _pageRenderCache = null;
+            _pageRenderCachePageId = null;
+            _pageRenderCacheUpdatedAt = null;
+            foreach (var batch in _pageRenderOverlayBatches) batch.Dispose();
+            _pageRenderOverlayBatches.Clear();
+            _pageRenderOverlays.Clear();
+            _pageRenderCacheObjectIds.Clear();
+            _pageRenderCacheObjectIds.UnionWith(publishedPage!.Objects.Select(item => item.Id));
+            return;
         }
         if (preserveSharpFallback) PreserveNavigationTilesAsFallbackCore();
         else ClearNavigationTileCacheCore();
@@ -11861,6 +12125,61 @@ public sealed partial class MainPage : Page
         _pageRenderCacheUpdatedAt = null;
         _pageRenderCacheObjectIds.Clear();
         _pageRenderOverlays.Clear();
+    }
+
+    private void PatchLowZoomPageRaster(NotePage page, IReadOnlyList<RectD> dirtyRegions)
+    {
+        if (_lowZoomPageRaster is null || _lowZoomPageRasterPageId != page.Id) return;
+        var rasterScale = NavigationSnapshotScale(page);
+        using var session = _lowZoomPageRaster.CreateDrawingSession();
+        session.Transform = Matrix3x2.CreateScale((float)rasterScale);
+        foreach (var region in dirtyRegions)
+        {
+            using var layer = session.CreateLayer(1f,
+                new Rect(region.X, region.Y, region.Width, region.Height));
+            DrawPageBackground(session, page, region);
+            DrawImportedLayer(session, page);
+            if (_temporaryGridVisible) DrawTemporaryGrid(session, page, region);
+            var objects = CanvasObjectRenderPolicy.VisibleInAuthoredOrder(page.Objects.Where(canvasObject =>
+                !canvasObject.IsHidden &&
+                StrokeGeometry.GetWorldBounds(canvasObject).Intersects(region))).ToArray();
+            DrawBatchedObjects(
+                session,
+                objects,
+                rasterScale,
+                IsDarkColor(page.Template.PaperColor));
+        }
+        _lowZoomPageRasterUpdatedAt = page.UpdatedAt;
+        _lowZoomPageRasterInvalidated = false;
+    }
+
+    private void InvalidateNavigationTiles(NotePage page, IReadOnlyList<RectD> dirtyRegions)
+    {
+        if (_navigationTilePageId != page.Id || _navigationTileScale <= 0 ||
+            _navigationTiles.Count == 0) return;
+        if (_staleNavigationTiles.Count > 0 &&
+            (_staleNavigationTilePageId != page.Id ||
+             Math.Abs(_staleNavigationTileScale - _navigationTileScale) >= 0.0001))
+            ClearStaleNavigationTilesCore();
+        _staleNavigationTilePageId = page.Id;
+        _staleNavigationTileScale = _navigationTileScale;
+        var dirtyKeys = NavigationDirtyRegionPolicy.TileKeys(
+            dirtyRegions, page.Size, _navigationTileScale, NavigationTilePixels);
+        foreach (var key in dirtyKeys)
+        {
+            if (!_navigationTiles.Remove(key, out var tile)) continue;
+            if (_navigationTileLruNodes.Remove(key, out var node))
+                _navigationTileLru.Remove(node);
+            _navigationTileBytes = Math.Max(0, _navigationTileBytes - NavigationTileBytes(tile));
+            if (_staleNavigationTiles.Remove(key, out var previous))
+            {
+                _staleNavigationTileBytes = Math.Max(0,
+                    _staleNavigationTileBytes - NavigationTileBytes(previous));
+                previous.Dispose();
+            }
+            _staleNavigationTiles[key] = tile;
+            _staleNavigationTileBytes += NavigationTileBytes(tile);
+        }
     }
 
     private void InvalidateAllPageRenderCaches()
@@ -12065,7 +12384,9 @@ public sealed partial class MainPage : Page
         _selectedObjects.Clear();
         _selectedObjects.AddRange(updated);
         _selectedObject = updated.Length == 1 ? updated[0] : null;
-        OnDocumentChanged(recognizeInk: updated.Any(item => item is InkStrokeObject));
+        OnDocumentChanged(
+            recognizeInk: updated.Any(item => item is InkStrokeObject),
+            dirtyRegions: DirtyRegionsForObjects(targets.Concat(updated)));
     }
 
     private void PickStyleAtPoint(PointD point)
@@ -12138,7 +12459,9 @@ public sealed partial class MainPage : Page
         _history.Execute(new ReplaceObjectsCommand(_page.Id, before, after, "Brush object styles"), _document);
         _selectedObject = null;
         _selectedObjects.Clear();
-        OnDocumentChanged(recognizeInk: false);
+        OnDocumentChanged(
+            recognizeInk: false,
+            dirtyRegions: DirtyRegionsForObjects(before.Concat(after)));
         StatusText.Text = $"Styled {after.Length} object(s)";
     }
 
@@ -12163,7 +12486,9 @@ public sealed partial class MainPage : Page
         var updated = text with { Content = content };
         _history.Execute(new ReplaceObjectsCommand(_page.Id, [text], [updated], "Format text"), _document);
         SelectSingleObject(updated);
-        OnDocumentChanged(recognizeInk: false);
+        OnDocumentChanged(
+            recognizeInk: false,
+            dirtyRegions: DirtyRegionsForObjects([text, updated]));
     }
 
     private void OnTextColorChanged(ColorPicker sender, ColorChangedEventArgs args)
@@ -12197,7 +12522,9 @@ public sealed partial class MainPage : Page
         _history.Execute(new ReplaceObjectsCommand(_page.Id, [text], [updated], "Change text color"), _document);
         SelectSingleObject(updated);
         TextColorSwatch.Background = new SolidColorBrush(selectedColor);
-        OnDocumentChanged(recognizeInk: false);
+        OnDocumentChanged(
+            recognizeInk: false,
+            dirtyRegions: DirtyRegionsForObjects([text, updated]));
     }
 
     private void UpdateSelectionLockOverlay()

@@ -10,8 +10,8 @@ public sealed class SqliteDocumentRepository : IDocumentRepository
 {
     public sealed record CachedPagePreview(byte[] Png, SizeD PageSize);
 
-    private const int AppendJournalCompactionRowLimit = 128;
-    private const long AppendJournalCompactionByteLimit = 8L * 1024 * 1024;
+    private const int AppendJournalCompactionRowLimit = 1_024;
+    private const long AppendJournalCompactionByteLimit = 16L * 1024 * 1024;
     private const int CurrentDatabaseVersion = 2;
     private static int _providerInitialized;
     private readonly SqliteConnection _connection;
