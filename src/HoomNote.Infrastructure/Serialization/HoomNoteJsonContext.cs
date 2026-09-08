@@ -12,6 +12,8 @@ namespace HoomNote.Infrastructure.Serialization;
 [JsonSerializable(typeof(HoomNoteDocument))]
 [JsonSerializable(typeof(NotePage))]
 [JsonSerializable(typeof(CanvasObject))]
+[JsonSerializable(typeof(IReadOnlyList<CanvasObject>))]
+[JsonSerializable(typeof(List<CanvasObject>))]
 [JsonSerializable(typeof(InkStrokeObject))]
 [JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(List<NotebookSection>))]

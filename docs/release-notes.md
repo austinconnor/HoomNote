@@ -1,11 +1,10 @@
-# HoomNote 0.8.4
+# HoomNote 0.8.5
 
-- Fixed Samsung Notes image placement by reading the displayed-image binding from the fill record. Repeated references now reuse the correct image, and missing bindings no longer select an unrelated file.
-- Preserved Samsung image rotation and the order of objects across layers.
-- Fixed image loads losing refresh notifications after a graphics-device reset. Image-heavy pages now share a decode budget and retain their active images while rendering.
-- Prevented adding or pasting an image into a different page when navigation occurs during loading. Failed image loads show an unavailable message.
-- Preserved image proportions and rotation, and imported PDF transforms, during PDF export.
-- Made notebook package import reject missing, duplicate, or mismatched assets. Export stops before replacing an existing package if a referenced asset is missing.
-- Fixed applying notebook page settings to unloaded pages so those settings survive reopening.
+- Fixed copying notebook objects failing before they reached the clipboard. Selected handwriting, images, shapes, and typed text can now be copied and pasted within HoomNote.
+- Fixed the internal clipboard fallback after a failed Windows clipboard write. Copies remain available across notebook tabs and windows until the system clipboard changes.
+- Made copied content persist after HoomNote exits when Windows accepts the clipboard flush.
+- Made pasting multiple objects a single undo and redo action.
+- Prevented delayed text and object paste from inserting into a different page after navigation.
+- Added a visible message when copied object data cannot be read.
 
 Existing Samsung imports must be reimported to correct previously saved image associations. Keep the previous notebook if it contains edits made after import.

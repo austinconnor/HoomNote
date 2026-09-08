@@ -559,8 +559,7 @@ public sealed partial class MainPage : Page
     private int _fullSaveVersion;
     private bool _hasUnsavedChanges;
     private int _editVersion;
-    private string? _internalClipboard;
-    private string? _internalTextClipboard;
+    private static ClipboardSnapshot? _clipboardSnapshot;
     private bool _temporaryGridVisible;
     private bool _readMode;
     private bool _libraryWasVisible;
@@ -2068,8 +2067,7 @@ public sealed partial class MainPage : Page
 
     private bool ClipboardMayContainPasteData()
     {
-        if (!string.IsNullOrWhiteSpace(_internalClipboard) ||
-            !string.IsNullOrWhiteSpace(_internalTextClipboard)) return true;
+        if (CurrentClipboardSnapshot() is not null) return true;
         try
         {
             var view = Clipboard.GetContent();
@@ -10295,52 +10293,60 @@ public sealed partial class MainPage : Page
         {
             var text = SelectedRegionText();
             if (string.IsNullOrWhiteSpace(text)) return false;
-            _internalClipboard = null;
-            _internalTextClipboard = text;
-            try
-            {
-                var textPackage = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-                textPackage.SetText(text);
-                Clipboard.SetContent(textPackage);
-                StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s)";
-            }
-            catch (Exception exception)
-            {
-                DiagnosticsLog.Warning("clipboard.copy_failed", ("error", exception.Message));
-                StatusText.Text = $"Copied {_selectedTextRegions.Count} text region(s) inside HoomNote";
-            }
-            return true;
+            return PublishClipboard(null, text, $"{_selectedTextRegions.Count} text region(s)");
         }
         var selected = SelectedCanvasObjects();
         if (selected.Count == 0) return false;
         try
         {
-            _internalClipboard = JsonSerializer.Serialize(selected, HoomNoteJson.Options);
+            var json = JsonSerializer.Serialize(selected, HoomNoteJson.Options);
             var plainText = string.Join(Environment.NewLine,
                 selected.OfType<RichTextObject>()
                     .Select(item => item.Content.PlainText)
                     .Where(item => !string.IsNullOrWhiteSpace(item)));
-            _internalTextClipboard = string.IsNullOrWhiteSpace(plainText) ? null : plainText;
-            try
-            {
-                var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-                package.SetData(CanvasClipboardFormat, _internalClipboard);
-                if (_internalTextClipboard is not null) package.SetText(_internalTextClipboard);
-                Clipboard.SetContent(package);
-                StatusText.Text = $"Copied {selected.Count} object(s)";
-            }
-            catch (Exception exception)
-            {
-                DiagnosticsLog.Warning("clipboard.copy_failed", ("error", exception.Message));
-                StatusText.Text = $"Copied {selected.Count} object(s) inside HoomNote";
-            }
-            return true;
+            return PublishClipboard(json, string.IsNullOrWhiteSpace(plainText) ? null : plainText,
+                $"{selected.Count} object(s)");
         }
         catch (Exception exception)
         {
             ShowError("The selection could not be copied.", exception);
             return false;
         }
+    }
+
+    private bool PublishClipboard(string? json, string? text, string description)
+    {
+        var published = false;
+        try
+        {
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            if (json is not null) package.SetData(CanvasClipboardFormat, json);
+            if (text is not null) package.SetText(text);
+            Clipboard.SetContent(package);
+            published = true;
+            Clipboard.Flush();
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.Warning(published ? "clipboard.flush_failed" : "clipboard.copy_failed",
+                ("error", exception.Message));
+        }
+
+        var sequence = ClipboardSequence.GetClipboardSequenceNumber();
+        _clipboardSnapshot = new ClipboardSnapshot(sequence, json, text);
+        if (!published && !_clipboardSnapshot.IsCurrent(sequence))
+        {
+            StatusText.Text = "Copy failed. Try again.";
+            return false;
+        }
+        StatusText.Text = $"Copied {description}" + (published ? string.Empty : " inside HoomNote");
+        return true;
+    }
+
+    private static ClipboardSnapshot? CurrentClipboardSnapshot()
+    {
+        var snapshot = _clipboardSnapshot;
+        return snapshot?.IsCurrent(ClipboardSequence.GetClipboardSequenceNumber()) == true ? snapshot : null;
     }
 
     private string SelectedRegionText() => SelectedRegionText(_selectedTextRegions);
@@ -10415,21 +10421,27 @@ public sealed partial class MainPage : Page
     private async Task PasteSelectionCoreAsync(PointD? targetPoint)
     {
         if (_document is null || _page is null || _assetStore is null) return;
+        var targetDocument = _document;
+        var targetPage = _page;
         var pasteTarget = ResolvePasteTarget(targetPoint);
-        string? json = null;
-        DataPackageView? view = null;
-        try
+        var snapshot = CurrentClipboardSnapshot();
+        var json = snapshot?.ObjectsJson;
+        if (json is null && !string.IsNullOrWhiteSpace(snapshot?.Text))
         {
-            view = Clipboard.GetContent();
+            PasteTextAt(snapshot.Text, pasteTarget);
+            return;
         }
-        catch (Exception exception)
+        DataPackageView? view = null;
+        if (json is null)
         {
-            // The in-process copy remains available if another app owns a delayed clipboard item.
-            DiagnosticsLog.Warning("clipboard.read_failed", ("error", exception.Message));
-            json = _internalClipboard;
-            if (string.IsNullOrWhiteSpace(json) && !string.IsNullOrWhiteSpace(_internalTextClipboard))
+            try
             {
-                PasteTextAt(_internalTextClipboard, pasteTarget);
+                view = Clipboard.GetContent();
+            }
+            catch (Exception exception)
+            {
+                DiagnosticsLog.Warning("clipboard.read_failed", ("error", exception.Message));
+                StatusText.Text = "The clipboard is busy. Try pasting again.";
                 return;
             }
         }
@@ -10442,18 +10454,22 @@ public sealed partial class MainPage : Page
             else if (view.Contains(StandardDataFormats.Text))
             {
                 var text = await view.GetTextAsync();
+                if (!ReferenceEquals(_document, targetDocument) || !ReferenceEquals(_page, targetPage)) return;
                 if (!string.IsNullOrWhiteSpace(text)) PasteTextAt(text, pasteTarget);
                 return;
             }
         }
+        if (!ReferenceEquals(_document, targetDocument) || !ReferenceEquals(_page, targetPage)) return;
         if (string.IsNullOrWhiteSpace(json)) return;
         List<CanvasObject>? source;
         try
         {
             source = JsonSerializer.Deserialize<List<CanvasObject>>(json, HoomNoteJson.Options);
         }
-        catch (JsonException)
+        catch (JsonException exception)
         {
+            DiagnosticsLog.Warning("clipboard.invalid_objects", ("error", exception.Message));
+            StatusText.Text = "The copied objects could not be read. Copy the selection again.";
             return;
         }
         if (source is null || source.Count == 0) return;
@@ -10478,7 +10494,7 @@ public sealed partial class MainPage : Page
                 ? group with { ChildIds = group.ChildIds.Select(id => idMap.GetValueOrDefault(id, id)).ToList() }
                 : clone;
         }).ToArray();
-        foreach (var item in pasted) _history.Execute(new AddObjectCommand(_page.Id, item), _document);
+        _history.Execute(new ReplaceObjectsCommand(_page.Id, [], pasted, "Paste objects"), _document);
         _selectedObjects.Clear();
         _selectedObjects.AddRange(pasted);
         _selectedObject = pasted.Length == 1 ? pasted[0] : null;
