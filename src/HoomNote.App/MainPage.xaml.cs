@@ -242,7 +242,7 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<string, CanvasBitmap> _imageBitmapCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, long> _imageBitmapSizes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _imageBitmapLru = [];
-    private const long ImageBitmapCacheBudget = 24L * 1024 * 1024;
+    private const long ImageBitmapCacheBudget = ImageDecodePolicy.PageBudgetBytes;
     private long _imageBitmapBytes;
     private readonly HashSet<string> _pendingImageLoads = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _queuedImageLoadRequests =
@@ -2523,11 +2523,13 @@ public sealed partial class MainPage : Page
 
     private async Task<bool> EnsureAllPagesLoadedAsync(CancellationToken cancellationToken = default)
     {
-        if (_document is null) return false;
-        foreach (var page in _document.Pages.ToArray())
+        var document = _document;
+        if (document is null) return false;
+        foreach (var page in document.Pages.ToArray())
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (await EnsurePageContentLoadedAsync(page, cancellationToken) is null) return false;
+            if (!ReferenceEquals(document, _document)) return false;
         }
         return true;
     }
@@ -5194,103 +5196,119 @@ public sealed partial class MainPage : Page
 
     private void DrawImageObject(CanvasDrawingSession drawingSession, ImageObject image)
     {
-        if (_imageBitmapCache.TryGetValue(image.AssetHash, out var bitmap))
+        lock (_pageRenderGate)
         {
-            TouchImageBitmap(image.AssetHash);
-            var destination = ImageLayout.Destination(
-                image.Bounds,
-                bitmap.SizeInPixels.Width,
-                bitmap.SizeInPixels.Height,
-                image.PreserveAspectRatio);
-            drawingSession.DrawImage(bitmap, new Rect(
-                destination.X, destination.Y, destination.Width, destination.Height));
-            return;
+            if (_imageBitmapCache.TryGetValue(image.AssetHash, out var bitmap))
+            {
+                TouchImageBitmap(image.AssetHash);
+                var destination = ImageLayout.Destination(image.Bounds,
+                    bitmap.SizeInPixels.Width, bitmap.SizeInPixels.Height, image.PreserveAspectRatio);
+                drawingSession.DrawImage(bitmap, new Rect(
+                    destination.X, destination.Y, destination.Width, destination.Height));
+                return;
+            }
+            var failed = _failedImageLoads.Contains($"{_imageLoadGeneration}:{image.AssetHash}");
+            drawingSession.FillRectangle((float)image.Bounds.X, (float)image.Bounds.Y,
+                (float)image.Bounds.Width, (float)image.Bounds.Height, Color.FromArgb(255, 42, 47, 58));
+            drawingSession.DrawRectangle((float)image.Bounds.X, (float)image.Bounds.Y,
+                (float)image.Bounds.Width, (float)image.Bounds.Height, Color.FromArgb(255, 113, 167, 255), 1);
+            drawingSession.DrawText(failed ? "Image unavailable" : "Loading image…",
+                (float)image.Bounds.X + 12, (float)image.Bounds.Y + 12, Color.FromArgb(255, 210, 218, 230));
+            RequestImageLoad(image);
         }
-
-        drawingSession.FillRectangle((float)image.Bounds.X, (float)image.Bounds.Y,
-            (float)image.Bounds.Width, (float)image.Bounds.Height, Color.FromArgb(255, 42, 47, 58));
-        drawingSession.DrawRectangle((float)image.Bounds.X, (float)image.Bounds.Y,
-            (float)image.Bounds.Width, (float)image.Bounds.Height, Color.FromArgb(255, 113, 167, 255), 1);
-        drawingSession.DrawText("Loading image…", (float)image.Bounds.X + 12, (float)image.Bounds.Y + 12,
-            Color.FromArgb(255, 210, 218, 230));
-        RequestImageLoad(image);
     }
 
     private void RequestImageLoad(ImageObject image)
     {
+        var generation = _imageLoadGeneration;
+        var page = Volatile.Read(ref _publishedPageRenderState).Page;
+        var pendingKey = $"{generation}:{image.AssetHash}";
         if (DispatcherQueue.HasThreadAccess)
         {
-            BeginImageLoad(image);
+            BeginImageLoad(image, page, generation);
             return;
         }
-        if (!_queuedImageLoadRequests.TryAdd(image.AssetHash, 0)) return;
-        DispatcherQueue.TryEnqueue(() =>
+        if (!_queuedImageLoadRequests.TryAdd(pendingKey, 0)) return;
+        if (!DispatcherQueue.TryEnqueue(() =>
         {
-            _queuedImageLoadRequests.TryRemove(image.AssetHash, out _);
-            BeginImageLoad(image);
-        });
+            _queuedImageLoadRequests.TryRemove(pendingKey, out _);
+            BeginImageLoad(image, page, generation);
+        })) _queuedImageLoadRequests.TryRemove(pendingKey, out _);
     }
 
-    private void BeginImageLoad(ImageObject image)
+    private void BeginImageLoad(ImageObject image, NotePage? page, int generation)
     {
-        var assetHash = image.AssetHash;
-        var generation = _imageLoadGeneration;
-        var pendingKey = $"{generation}:{assetHash}";
-        if (_assetStore is null || string.IsNullOrWhiteSpace(assetHash) ||
-            _imageBitmapCache.ContainsKey(assetHash) || _failedImageLoads.Contains(pendingKey)) return;
-        if (_page is not null)
+        lock (_pageRenderGate)
         {
-            if (!_imageWaitingPages.TryGetValue(assetHash, out var pages))
-                _imageWaitingPages[assetHash] = pages = [];
-            pages.Add(_page.Id);
+            var assetHash = image.AssetHash;
+            var pendingKey = $"{generation}:{assetHash}";
+            if (generation != _imageLoadGeneration || _assetStore is null ||
+                string.IsNullOrWhiteSpace(assetHash) || _imageBitmapCache.ContainsKey(assetHash) ||
+                _failedImageLoads.Contains(pendingKey)) return;
+            if (page is not null)
+            {
+                if (!_imageWaitingPages.TryGetValue(pendingKey, out var pages))
+                    _imageWaitingPages[pendingKey] = pages = [];
+                pages.Add(page.Id);
+            }
+            if (!_pendingImageLoads.Add(pendingKey)) return;
+            var imageCount = page?.Objects.OfType<ImageObject>().Where(item => !item.IsHidden)
+                .Select(item => item.AssetHash).Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 1;
+            _ = LoadImageBitmapAsync(assetHash, image.Bounds.Width, image.Bounds.Height,
+                ImageDecodePolicy.MaximumLongEdge(imageCount), generation, pendingKey);
         }
-        if (!_pendingImageLoads.Add(pendingKey)) return;
-        _ = LoadImageBitmapAsync(assetHash, image.Bounds.Width, image.Bounds.Height, generation, pendingKey);
     }
 
     private async Task LoadImageBitmapAsync(string assetHash, double displayWidth, double displayHeight,
-        int generation, string pendingKey)
+        int maximumLongEdge, int generation, string pendingKey)
     {
         try
         {
-            if (_assetStore is null) return;
-            var loaded = await LoadDownsampledBitmapAsync(assetHash, displayWidth, displayHeight);
-            var bitmap = loaded.Bitmap;
-            if (generation != _imageLoadGeneration)
+            var loaded = await LoadDownsampledBitmapAsync(assetHash, displayWidth, displayHeight, maximumLongEdge);
+            lock (_pageRenderGate)
             {
-                bitmap.Dispose();
-                return;
+                if (generation != _imageLoadGeneration)
+                {
+                    loaded.Bitmap.Dispose();
+                    return;
+                }
+                CacheImageBitmap(assetHash, loaded.Bitmap);
             }
-            CacheImageBitmap(assetHash, bitmap);
         }
         catch (Exception exception)
         {
-            if (generation == _imageLoadGeneration) _failedImageLoads.Add(pendingKey);
-            ShowError("An image could not be rendered.", exception);
+            lock (_pageRenderGate)
+            {
+                if (generation == _imageLoadGeneration)
+                {
+                    _failedImageLoads.Add(pendingKey);
+                    ShowError("An image could not be rendered.", exception);
+                }
+            }
         }
         finally
         {
-            _pendingImageLoads.Remove(pendingKey);
-            if (_imageWaitingPages.Remove(assetHash, out var waitingPages))
-                _imagePagesNeedingRefresh.UnionWith(waitingPages);
-            if (generation == _imageLoadGeneration &&
-                !_pendingImageLoads.Any(key => key.StartsWith($"{generation}:", StringComparison.Ordinal)))
+            lock (_pageRenderGate)
             {
-                // Re-record a dense page once after its image batch is ready, rather than once
-                // per image. Rebuilding thousands of vector strokes for every decode caused a
-                // visible sequence of stalls on Samsung pages with many embedded images.
-                if (_page is not null && _imagePagesNeedingRefresh.Contains(_page.Id))
+                // A disposed device's completion must not consume a newer load's waiters.
+                if (generation == _imageLoadGeneration)
                 {
-                    InvalidatePageRenderCache();
-                    InvalidateCanvas();
+                    _pendingImageLoads.Remove(pendingKey);
+                    if (_imageWaitingPages.Remove(pendingKey, out var waitingPages))
+                        _imagePagesNeedingRefresh.UnionWith(waitingPages);
+                    if (_pendingImageLoads.Count == 0 && _imagePagesNeedingRefresh.Count > 0)
+                    {
+                        InvalidateAllPageRenderCaches();
+                        InvalidateCanvas();
+                        _imagePagesNeedingRefresh.Clear();
+                    }
                 }
-                _imagePagesNeedingRefresh.Clear();
             }
         }
     }
 
     private async Task<(CanvasBitmap Bitmap, int SourceWidth, int SourceHeight)> LoadDownsampledBitmapAsync(
-        string assetHash, double displayWidth, double displayHeight)
+        string assetHash, double displayWidth, double displayHeight, int maximumLongEdge = 1600)
     {
         if (_assetStore is null) throw new InvalidOperationException("The asset store is not initialized.");
         await _imageDecodeGate.WaitAsync();
@@ -5301,7 +5319,7 @@ public sealed partial class MainPage : Page
             var decoder = await BitmapDecoder.CreateAsync(stream);
             var sourceWidth = checked((int)Math.Max(1u, decoder.PixelWidth));
             var sourceHeight = checked((int)Math.Max(1u, decoder.PixelHeight));
-            var desiredLongEdge = Math.Clamp(Math.Max(displayWidth, displayHeight) * 1.5, 256, 1_600);
+            var desiredLongEdge = Math.Min(maximumLongEdge, Math.Clamp(Math.Max(displayWidth, displayHeight) * 1.5, 256, 1600));
             var scale = Math.Min(1d, desiredLongEdge / Math.Max(sourceWidth, sourceHeight));
             var targetWidth = Math.Max(1, (int)Math.Round(sourceWidth * scale));
             var targetHeight = Math.Max(1, (int)Math.Round(sourceHeight * scale));
@@ -8647,6 +8665,7 @@ public sealed partial class MainPage : Page
     private async void OnNotebookSettingsClick(object sender, RoutedEventArgs e)
     {
         if (_document is null) return;
+        var targetDocument = _document;
         var style = new ComboBox { Header = "Page style", HorizontalAlignment = HorizontalAlignment.Stretch };
         foreach (var optionKind in new[] { PageTemplateKind.Blank, PageTemplateKind.Lined, PageTemplateKind.Dotted,
                      PageTemplateKind.SquareGrid, PageTemplateKind.Graph })
@@ -8682,6 +8701,21 @@ public sealed partial class MainPage : Page
         if (await dialog.ShowAsync() != ContentDialogResult.Primary ||
             style.SelectedItem is not ComboBoxItem { Tag: string tag } ||
             !Enum.TryParse<PageTemplateKind>(tag, out var selectedKind)) return;
+        if (!ReferenceEquals(targetDocument, _document)) return;
+        if (applyExisting.IsChecked == true)
+        {
+            try
+            {
+                // Unloaded page shells are not serialized during save. Load their content
+                // before changing templates so the new settings survive reopening.
+                if (!await EnsureAllPagesLoadedAsync() || !ReferenceEquals(targetDocument, _document)) return;
+            }
+            catch (Exception exception)
+            {
+                ShowError("The notebook pages could not be loaded. Page settings were not changed.", exception);
+                return;
+            }
+        }
         var paperColor = $"#{color.Color.R:X2}{color.Color.G:X2}{color.Color.B:X2}";
         if (useForNotebook.IsChecked == true)
         {
@@ -10167,6 +10201,8 @@ public sealed partial class MainPage : Page
     {
         var hostWindow = HostWindow;
         if (_document is null || _page is null || _assetStore is null || hostWindow is null) return;
+        var targetDocument = _document;
+        var targetPage = _page;
         try
         {
             var picker = new FileOpenPicker();
@@ -10179,7 +10215,7 @@ public sealed partial class MainPage : Page
 
             await using var input = File.OpenRead(file.Path);
             var assetHash = await _assetStore.AddAsync(input, Path.GetExtension(file.Path));
-            await AddImageAssetAsync(assetHash, file.Name);
+            await AddImageAssetAsync(assetHash, file.Name, targetDocument, targetPage);
             StatusText.Text = $"Added {file.Name}";
         }
         catch (Exception exception)
@@ -10191,12 +10227,22 @@ public sealed partial class MainPage : Page
     private async Task AddImageAssetAsync(
         string assetHash,
         string displayName,
+        HoomNoteDocument targetDocument,
+        NotePage targetPage,
         PointD? placementCenter = null)
     {
-        if (_document is null || _page is null) return;
-        var loaded = await LoadDownsampledBitmapAsync(assetHash, _page.Size.Width * 0.72,
-            _page.Size.Height * 0.72);
+        if (!ReferenceEquals(targetDocument, _document) || !ReferenceEquals(targetPage, _page))
+            throw new InvalidOperationException("The active page changed. Add the image again on the intended page.");
+        var generation = _imageLoadGeneration;
+        var loaded = await LoadDownsampledBitmapAsync(assetHash, targetPage.Size.Width * 0.72,
+            targetPage.Size.Height * 0.72);
         var bitmap = loaded.Bitmap;
+        if (!ReferenceEquals(targetDocument, _document) || !ReferenceEquals(targetPage, _page) ||
+            generation != _imageLoadGeneration)
+        {
+            bitmap.Dispose();
+            throw new InvalidOperationException("The active page changed while the image was loading. Add the image again on the intended page.");
+        }
         CacheImageBitmap(assetHash, bitmap);
         var fit = Math.Min(1d, Math.Min(_page.Size.Width * 0.72 / loaded.SourceWidth,
             _page.Size.Height * 0.72 / loaded.SourceHeight));
@@ -10476,7 +10522,9 @@ public sealed partial class MainPage : Page
 
     private async Task<bool> TryPasteImageAsync(DataPackageView view, PointD? targetPoint)
     {
-        if (_assetStore is null) return false;
+        if (_assetStore is null || _document is null || _page is null) return false;
+        var targetDocument = _document;
+        var targetPage = _page;
         if (view.Contains(StandardDataFormats.StorageItems))
         {
             var files = await view.GetStorageItemsAsync();
@@ -10487,7 +10535,7 @@ public sealed partial class MainPage : Page
             {
                 await using var input = File.OpenRead(file.Path);
                 var assetHash = await _assetStore.AddAsync(input, Path.GetExtension(file.Name));
-                await AddImageAssetAsync(assetHash, file.Name, targetPoint);
+                await AddImageAssetAsync(assetHash, file.Name, targetDocument, targetPage, targetPoint);
                 StatusText.Text = $"Pasted {file.Name}";
                 return true;
             }
@@ -10497,7 +10545,7 @@ public sealed partial class MainPage : Page
         using var randomAccess = await reference.OpenReadAsync();
         await using var inputStream = randomAccess.AsStreamForRead();
         var hash = await _assetStore.AddAsync(inputStream, ".png");
-        await AddImageAssetAsync(hash, "Pasted image.png", targetPoint);
+        await AddImageAssetAsync(hash, "Pasted image.png", targetDocument, targetPage, targetPoint);
         StatusText.Text = "Pasted image";
         return true;
     }
@@ -11831,10 +11879,19 @@ public sealed partial class MainPage : Page
             _imageBitmapSizes[assetHash] = byteSize;
             _imageBitmapBytes += byteSize;
             _imageBitmapLru.AddFirst(assetHash);
-            while (_imageBitmapBytes > ImageBitmapCacheBudget && _imageBitmapLru.Count > 1)
+            // Keep the active page's images resident until its raster is recorded. Otherwise
+            // a page larger than the cache continually evicts and reloads its own images.
+            var activeAssets = Volatile.Read(ref _publishedPageRenderState).Page?.Objects
+                .OfType<ImageObject>().Where(item => !item.IsHidden)
+                .Select(item => item.AssetHash).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+            var candidate = _imageBitmapLru.Last;
+            while (_imageBitmapBytes > ImageBitmapCacheBudget && candidate is not null)
             {
-                var evicted = _imageBitmapLru.Last!.Value;
-                _imageBitmapLru.RemoveLast();
+                var node = candidate;
+                candidate = candidate.Previous;
+                var evicted = node.Value;
+                if (activeAssets.Contains(evicted) || evicted == assetHash) continue;
+                _imageBitmapLru.Remove(node);
                 if (_imageBitmapSizes.Remove(evicted, out var evictedBytes)) _imageBitmapBytes -= evictedBytes;
                 if (_imageBitmapCache.Remove(evicted, out var evictedBitmap)) evictedBitmap.Dispose();
             }

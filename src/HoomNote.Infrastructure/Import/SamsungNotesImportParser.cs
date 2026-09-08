@@ -23,7 +23,7 @@ internal static class SamsungNotesImportParser
     private const float SamsungStrokeWidthDivisor = 2.5f;
 
     internal sealed record SamsungEmbeddedImage(
-        int PageIndex, RectD Bounds, int ZIndex, string FileName, byte[] Data);
+        int PageIndex, RectD Bounds, Transform2D Transform, int ZIndex, string FileName, byte[] Data);
     internal sealed record SamsungEmbeddedPdf(string FileName, byte[] Data);
     internal sealed record ParsedSamsungNote(
         IReadOnlyList<NotePage> Pages,
@@ -45,9 +45,9 @@ internal static class SamsungNotesImportParser
     private sealed record SamsungImagePlacement(
         int PageIndex,
         RectD Bounds,
+        Transform2D Transform,
         int ZIndex,
-        uint? MediaBindId,
-        int FallbackMediaIndex);
+        uint? MediaBindId);
 
     public static Task<ParsedSamsungNote> ParseAsync(string path, CancellationToken cancellationToken) =>
         Task.Run(() => Parse(path, cancellationToken), cancellationToken);
@@ -64,13 +64,9 @@ internal static class SamsungNotesImportParser
 
         var documentPaperColor = ReadDocumentPaperColor(archive);
         var embeddedPdf = ReadEmbeddedPdf(archive);
-        // Image placements carry a media bind id. Resolve that id through mediaInfo.dat;
-        // placement order is only a fallback for older files that omit the binding field.
-        var mediaEntries = OrderedImageEntries(archive);
         var mediaByBindId = ReadMediaEntriesByBindId(archive);
         var pages = new List<NotePage>(entries.Length);
         var imagePlacements = new List<SamsungImagePlacement>();
-        var nextMediaIndex = 0;
         var skippedObjects = 0;
         foreach (var (entry, pageIndex) in entries.Select((value, index) => (value, index)))
         {
@@ -81,18 +77,17 @@ internal static class SamsungNotesImportParser
             using var memory = new MemoryStream((int)Math.Min(entry.Length, int.MaxValue));
             input.CopyTo(memory);
             pages.Add(ParsePage(memory.GetBuffer().AsSpan(0, checked((int)memory.Length)), pageIndex, documentPaperColor, imagePlacements,
-                ref nextMediaIndex, ref skippedObjects));
+                ref skippedObjects));
         }
 
         var images = new List<SamsungEmbeddedImage>();
         foreach (var placement in imagePlacements)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var media = placement.MediaBindId is { } bindId &&
                         mediaByBindId.TryGetValue(bindId, out var boundMedia)
                 ? boundMedia
-                : placement.FallbackMediaIndex >= 0 && placement.FallbackMediaIndex < mediaEntries.Length
-                    ? mediaEntries[placement.FallbackMediaIndex]
-                    : null;
+                : null;
             if (media is null)
             {
                 skippedObjects++;
@@ -106,8 +101,8 @@ internal static class SamsungNotesImportParser
             using var mediaInput = media.Open();
             using var mediaMemory = new MemoryStream((int)Math.Min(media.Length, int.MaxValue));
             mediaInput.CopyTo(mediaMemory);
-            images.Add(new SamsungEmbeddedImage(placement.PageIndex, placement.Bounds, placement.ZIndex,
-                Path.GetFileName(media.FullName), mediaMemory.GetBuffer()));
+            images.Add(new SamsungEmbeddedImage(placement.PageIndex, placement.Bounds, placement.Transform,
+                placement.ZIndex, Path.GetFileName(media.FullName), mediaMemory.ToArray()));
         }
 
         var warnings = new List<string>
@@ -116,6 +111,8 @@ internal static class SamsungNotesImportParser
         };
         if (images.Count > 0)
             warnings.Add($"{images.Count} placed Samsung image(s) were imported at their original page positions.");
+        if (imagePlacements.Count > images.Count)
+            warnings.Add($"{imagePlacements.Count - images.Count} Samsung image reference(s) could not be resolved. No substitute images were used; keep the source file.");
         var shapeCount = pages.SelectMany(page => page.Objects).OfType<ShapeObject>().Count();
         if (shapeCount > 0)
             warnings.Add($"{shapeCount} Samsung shape(s) and line(s) were imported as editable vectors.");
@@ -125,7 +122,7 @@ internal static class SamsungNotesImportParser
     }
 
     private static NotePage ParsePage(ReadOnlySpan<byte> data, int pageIndex, string? documentPaperColor,
-        List<SamsungImagePlacement> imagePlacements, ref int nextMediaIndex, ref int skippedObjects)
+        List<SamsungImagePlacement> imagePlacements, ref int skippedObjects)
     {
         var pageNumber = pageIndex + 1;
         if (data.Length < 32) throw new InvalidDataException($"Samsung Notes page {pageNumber} is truncated.");
@@ -141,7 +138,7 @@ internal static class SamsungNotesImportParser
         var paperColor = ReadPagePaperColor(data, baseOffset) ?? documentPaperColor ?? "#FFFDF8";
         var defaultInkColor = IsDarkColor(paperColor) ? "#F5F5F5" : "#111111";
         var objects = ReadObjects(data, baseOffset, scale, defaultInkColor, pageIndex, imagePlacements,
-            ref nextMediaIndex, ref skippedObjects);
+            ref skippedObjects);
 
         return new NotePage
         {
@@ -153,12 +150,13 @@ internal static class SamsungNotesImportParser
     }
 
     private static List<CanvasObject> ReadObjects(ReadOnlySpan<byte> data, int position, double scale, string defaultInkColor,
-        int pageIndex, List<SamsungImagePlacement> imagePlacements, ref int nextMediaIndex, ref int skippedObjects)
+        int pageIndex, List<SamsungImagePlacement> imagePlacements, ref int skippedObjects)
     {
         var objects = new List<CanvasObject>();
         try
         {
             var layerCount = ReadUInt16(data, position);
+            var zIndex = 0;
             position += 4;
             if (layerCount > 4096) throw new InvalidDataException("Samsung Notes layer count is invalid.");
             for (var layer = 0; layer < layerCount; layer++)
@@ -183,6 +181,7 @@ internal static class SamsungNotesImportParser
                 if (objectCount > 1_000_000) throw new InvalidDataException("Samsung Notes object count is invalid.");
                 for (var objectIndex = 0U; objectIndex < objectCount; objectIndex++)
                 {
+                    var objectZIndex = zIndex++;
                     Ensure(data, position, 3);
                     var type = data[position];
                     position += 3;
@@ -197,18 +196,18 @@ internal static class SamsungNotesImportParser
                     if (StrokeObjectTypes.Contains(type))
                     {
                         var stroke = ParseStroke(data.Slice(position, size), scale, defaultInkColor);
-                        if (stroke is not null) objects.Add(stroke with { ZIndex = checked((int)objectIndex) });
+                        if (stroke is not null) objects.Add(stroke with { ZIndex = objectZIndex });
                         else skippedObjects++;
                     }
                     else if (type == 7 &&
                              ParseShape(data.Slice(position, size), scale, defaultInkColor) is { } shape)
                     {
-                        objects.Add(shape with { ZIndex = checked((int)objectIndex) });
+                        objects.Add(shape with { ZIndex = objectZIndex });
                     }
                     else if (type == 8 &&
                              ParseLine(data.Slice(position, size), scale, defaultInkColor) is { } line)
                     {
-                        objects.Add(line with { ZIndex = checked((int)objectIndex) });
+                        objects.Add(line with { ZIndex = objectZIndex });
                     }
                     else if (type == 3 &&
                              ParseImagePlacement(data.Slice(position, size), scale) is { } placement)
@@ -216,9 +215,9 @@ internal static class SamsungNotesImportParser
                         imagePlacements.Add(new SamsungImagePlacement(
                             pageIndex,
                             placement.Bounds,
-                            checked((int)objectIndex),
-                            placement.MediaBindId,
-                            nextMediaIndex++));
+                            placement.Transform,
+                            objectZIndex,
+                            placement.MediaBindId));
                     }
                     else skippedObjects++;
                     position += size;
@@ -263,54 +262,58 @@ internal static class SamsungNotesImportParser
         }
     }
 
-    private static (RectD Bounds, uint? MediaBindId)? ParseImagePlacement(
+    private static (RectD Bounds, Transform2D Transform, uint? MediaBindId)? ParseImagePlacement(
         ReadOnlySpan<byte> data,
         double scale)
     {
         var bounds = ParseObjectBounds(data, scale);
         if (bounds is null) return null;
-
+        var transform = Transform2D.Identity;
         try
         {
             if (!TryReadObjectBlock(data, 0, 0, out var shapeBaseOffset) ||
-                !TryReadObjectBlock(data, shapeBaseOffset, 6, out var imageOffset) ||
-                !TryReadObjectBlock(data, imageOffset, 7, out var imageDataOffset) ||
-                !TryReadObjectBlock(data, imageDataOffset, 3, out _) ||
-                !TryReadFlagBlock(data, imageDataOffset, out _, out var position, out var fieldFlags) ||
-                position < 0)
-                return (bounds.Value, null);
+                !TryReadObjectBlock(data, shapeBaseOffset, 6, out var shapeOffset) ||
+                !TryReadObjectBlock(data, shapeOffset, 7, out var imageOffset))
+                return (bounds.Value, transform, null);
 
-            // Flexible image fields are serialized in bit order. Field 18 is the original
-            // image bind id that points into media/mediaInfo.dat.
-            var fieldSizes = new Dictionary<int, int>
+            // Bound every field read to this frame. Type 3 contains the original and border
+            // image IDs; the displayed image belongs to the type-7 FillImageEffect instead.
+            var shape = data.Slice(shapeOffset, imageOffset - shapeOffset);
+            if (!TryReadFlagBlock(shape, 0, out var fixedOffset, out var position, out var flags))
+                return (bounds.Value, transform, null);
+            Ensure(shape, fixedOffset, 40);
+            bounds = ReadRect(shape, fixedOffset + 4, scale) ?? bounds;
+            var angle = ReadSingle(shape, fixedOffset + 36);
+            if (float.IsFinite(angle) && Math.Abs(angle) <= 360)
+                transform = Transform2D.Rotation(angle * Math.PI / 180d, bounds.Value.Center);
+            if (position < 0 || (flags & (1u << 5)) == 0)
+                return (bounds.Value, transform, null);
+
+            if ((flags & 1) != 0)
             {
-                [1] = 16,
-                [3] = 4,
-                [4] = 4,
-                [5] = 2,
-                [9] = 4,
-                [10] = 16,
-                [11] = 16,
-                [12] = 4,
-                [17] = 32
-            };
-            for (var field = 0; field < 18; field++)
-            {
-                if ((fieldFlags & (1u << field)) == 0) continue;
-                if (!fieldSizes.TryGetValue(field, out var size))
-                    return (bounds.Value, null);
-                Ensure(data, position, size);
-                position += size;
+                // TextCommon is an inclusive length-prefixed frame.
+                var textSize = checked((int)ReadUInt32(shape, position));
+                if (textSize < 4) return (bounds.Value, transform, null);
+                Ensure(shape, position, textSize);
+                position += textSize;
             }
-            if ((fieldFlags & (1u << 18)) == 0)
-                return (bounds.Value, null);
-            Ensure(data, position, 4);
-            return (bounds.Value, ReadUInt32(data, position));
+            if ((flags & (1u << 1)) != 0) position += 1;
+            if ((flags & (1u << 2)) != 0) position += 4;
+            // No supported native field 3 precedes the fill. Do not guess its length.
+            if ((flags & (1u << 3)) != 0) return (bounds.Value, transform, null);
+            if ((flags & (1u << 4)) != 0) position += 4;
+            Ensure(shape, position, 5);
+            var effectSize = ReadUInt32(shape, position);
+            if (effectSize != 62 || shape[position + 4] != 2)
+                return (bounds.Value, transform, null);
+            Ensure(shape, position + 5, 62);
+            var bindId = ReadUInt32(shape, position + 6); // skip fill mode
+            return (bounds.Value, transform, bindId <= int.MaxValue ? bindId : null);
         }
         catch (Exception exception) when (exception is ArgumentOutOfRangeException or
                                           OverflowException or EndOfStreamException)
         {
-            return (bounds.Value, null);
+            return (bounds.Value, transform, null);
         }
     }
 
@@ -612,20 +615,6 @@ internal static class SamsungNotesImportParser
         return new SamsungEmbeddedPdf(Path.GetFileName(entry.FullName), memory.GetBuffer());
     }
 
-    private static ZipArchiveEntry[] OrderedImageEntries(ZipArchive archive)
-    {
-        var archiveImages = archive.Entries
-            .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
-                            IsSupportedImageExtension(Path.GetExtension(entry.FullName)))
-            // Samsung's numeric filename prefix is the stable media index. ZIP directory order
-            // is arbitrary (real exports commonly contain 3, 4, 14, 1, ...), which put the
-            // correct image dimensions around the wrong image content when bind IDs were absent.
-            .OrderBy(entry => ReadMediaIndex(entry.FullName))
-            .ThenBy(entry => entry.FullName, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        return archiveImages;
-    }
-
     private static int ReadMediaIndex(string fullName)
     {
         var fileName = Path.GetFileName(fullName);
@@ -642,25 +631,39 @@ internal static class SamsungNotesImportParser
     private static IReadOnlyDictionary<uint, ZipArchiveEntry> ReadMediaEntriesByBindId(
         ZipArchive archive)
     {
-        var metadata = archive.GetEntry("media/mediaInfo.dat");
-        if (metadata is not { Length: > 0 and <= MaximumEntryBytes })
+        var mediaEntries = archive.Entries
+            .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var metadata = mediaEntries.FirstOrDefault(entry =>
+            entry.FullName.Equals("media/mediaInfo.dat", StringComparison.OrdinalIgnoreCase));
+        if (metadata is null)
+        {
+            // Only an explicit ID and a unique matching prefix can recover a missing manifest.
+            return mediaEntries.GroupBy(entry => ReadMediaIndex(entry.FullName))
+                .Where(group => group.Key != int.MaxValue && group.Count() == 1 &&
+                                IsSupportedImageExtension(Path.GetExtension(group.First().FullName)))
+                .ToDictionary(group => (uint)group.Key, group => group.Single());
+        }
+        if (metadata.Length is <= 0 or > MaximumEntryBytes)
             return new Dictionary<uint, ZipArchiveEntry>();
-
-        var archiveImages = archive.Entries
-            .Where(entry => entry.FullName.StartsWith("media/", StringComparison.OrdinalIgnoreCase) &&
-                            IsSupportedImageExtension(Path.GetExtension(entry.FullName)))
-            .ToDictionary(
-                entry => Path.GetFileName(entry.FullName),
-                StringComparer.OrdinalIgnoreCase);
+        var archiveImages = mediaEntries
+            .GroupBy(entry => Path.GetFileName(entry.FullName), StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single(), StringComparer.OrdinalIgnoreCase);
         using var input = metadata.Open();
-        using var memory = new MemoryStream((int)Math.Min(metadata.Length, int.MaxValue));
+        using var memory = new MemoryStream((int)metadata.Length);
         input.CopyTo(memory);
 
         var result = new Dictionary<uint, ZipArchiveEntry>();
-        foreach (var (bindId, fileName) in ReadMediaBindings(
-                     memory.GetBuffer().AsSpan(0, checked((int)memory.Length))))
-            if (archiveImages.TryGetValue(fileName, out var entry))
-                result.TryAdd(bindId, entry);
+        foreach (var binding in ReadMediaBindings(
+                     memory.GetBuffer().AsSpan(0, checked((int)memory.Length))).GroupBy(item => item.BindId))
+        {
+            if (binding.Count() != 1) continue;
+            var fileName = binding.Single().FileName;
+            if (archiveImages.TryGetValue(fileName, out var entry) &&
+                IsSupportedImageExtension(Path.GetExtension(fileName)))
+                result.Add(binding.Key, entry);
+        }
         return result;
     }
 
@@ -677,8 +680,7 @@ internal static class SamsungNotesImportParser
             if (offset + 6 > data.Length - byteCount) continue;
             var fileName = System.Text.Encoding.Unicode.GetString(data.Slice(offset + 6, byteCount));
             if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
-                !fileName.Contains('@') ||
-                !IsSupportedImageExtension(Path.GetExtension(fileName))) continue;
+                string.IsNullOrEmpty(Path.GetExtension(fileName))) continue;
             bindings.Add((ReadUInt32(data, offset), fileName));
             offset += 5 + byteCount;
         }

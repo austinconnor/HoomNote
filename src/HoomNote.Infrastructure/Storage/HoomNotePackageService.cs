@@ -36,7 +36,8 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
                 foreach (var asset in ReferencedAssets(document).Distinct(StringComparer.OrdinalIgnoreCase))
                 {
                     var sourcePath = assetStore.GetPath(asset);
-                    if (!File.Exists(sourcePath)) continue;
+                    if (!File.Exists(sourcePath))
+                        throw new InvalidDataException($"The notebook asset '{asset}' is missing. The package was not exported.");
                     var entry = archive.CreateEntry($"assets/{asset}", CompressionLevel.SmallestSize);
                     await using var output = entry.Open();
                     await using var input = new FileStream(
@@ -66,11 +67,17 @@ public sealed class HoomNotePackageService(IAssetStore assetStore) : IPackageSer
             throw new InvalidDataException("This package was created by a newer HoomNote version.");
 
         var referencedAssets = ReferencedAssets(document).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in archive.Entries.Where(entry => entry.FullName.StartsWith("assets/", StringComparison.Ordinal)))
+        foreach (var asset in referencedAssets)
         {
-            if (entry.Name.Length == 0 || !referencedAssets.Contains(entry.Name)) continue;
+            var entries = archive.Entries.Where(entry =>
+                entry.FullName.Equals($"assets/{asset}", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (entries.Length != 1)
+                throw new InvalidDataException($"The package must contain exactly one copy of asset '{asset}'.");
+            var entry = entries[0];
             await using var source = entry.Open();
-            await assetStore.AddAsync(source, Path.GetExtension(entry.Name), cancellationToken);
+            var storedHash = await assetStore.AddAsync(source, Path.GetExtension(entry.Name), cancellationToken);
+            if (!storedHash.Equals(asset, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Package asset '{asset}' does not match its content hash.");
         }
 
         return RemapIdentity(document);

@@ -822,6 +822,53 @@ public sealed class PersistenceTests : IAsyncLifetime
         Assert.Equal(new RectD(100, 120, 300, 180), image.Bounds);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task SamsungImages_RepeatedReferencesKeepTheirIdentity(bool optionalFields, bool separateLayers)
+    {
+        var source = Path.Combine(_root, "repeated.sdocx");
+        WriteSamsungImageBindingFixture(source, [22, 11, 22], optionalFields: optionalFields,
+            separateLayers: separateLayers);
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "repeated-assets"));
+        var result = await new DocumentImportService(store).ImportAsync(new ImportRequest(source));
+        var images = result.Pages.Single().Objects.OfType<ImageObject>().ToArray();
+        Assert.Equal(new[] { "22@blue", "11@red", "22@blue" }, images.Select(image => image.AltText));
+        Assert.Equal(new[] { 0, 1, 2 }, images.Select(image => image.ZIndex));
+        Assert.Equal(images[0].AssetHash, images[2].AssetHash);
+        Assert.Equal(new byte[] { 0x22 }, await File.ReadAllBytesAsync(store.GetPath(images[0].AssetHash)));
+    }
+
+    [Theory]
+    [InlineData(99u, false, false, false)]
+    [InlineData(uint.MaxValue, false, false, false)]
+    [InlineData(22u, true, false, false)]
+    [InlineData(22u, false, true, false)]
+    [InlineData(22u, false, false, true)]
+    public async Task SamsungImages_UnresolvedBindingNeverSubstitutesAnotherAsset(uint id,
+        bool duplicateBinding, bool missingFile, bool truncateFill)
+    {
+        var source = Path.Combine(_root, "unresolved.sdocx");
+        WriteSamsungImageBindingFixture(source, [id], duplicateBinding: duplicateBinding,
+            missingFile: missingFile, truncateFill: truncateFill);
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "unresolved-assets"));
+        var result = await new DocumentImportService(store).ImportAsync(new ImportRequest(source));
+        Assert.Empty(result.Pages.Single().Objects);
+        Assert.Contains(result.Warnings, warning => warning.Contains("could not be resolved"));
+    }
+
+    [Fact]
+    public async Task SamsungImages_MissingManifestUsesExplicitId()
+    {
+        var source = Path.Combine(_root, "no-manifest.sdocx");
+        WriteSamsungImageBindingFixture(source, [22, 11, 22], includeManifest: false);
+        var store = new ContentAddressedAssetStore(Path.Combine(_root, "no-manifest-assets"));
+        var result = await new DocumentImportService(store).ImportAsync(new ImportRequest(source));
+        Assert.Equal(new[] { "22@blue", "11@red", "22@blue" },
+            result.Pages.Single().Objects.OfType<ImageObject>().Select(image => image.AltText));
+    }
+
     [Fact]
     public void SamsungNotesBulkDiscovery_FindsNotesRecursivelyAndPreservesFolders()
     {
@@ -1269,49 +1316,88 @@ public sealed class PersistenceTests : IAsyncLifetime
         metadata.Write([0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
-    private static void WriteSamsungImageBindingFixture(string path)
+    private static void WriteSamsungImageBindingFixture(string path, uint[]? ids = null,
+        bool includeManifest = true, bool duplicateBinding = false, bool missingFile = false,
+        bool optionalFields = false, bool separateLayers = false, bool truncateFill = false)
     {
-        var imageObject = new byte[95];
-        WriteUInt32(imageObject, 0, 64);
-        WriteUInt16(imageObject, 4, 0);
-        imageObject[10] = 2;
-        WriteDouble(imageObject, 32, 100);
-        WriteDouble(imageObject, 40, 120);
-        WriteDouble(imageObject, 48, 400);
-        WriteDouble(imageObject, 56, 300);
-        WriteUInt32(imageObject, 64, 6);
-        WriteUInt16(imageObject, 68, 6);
-        WriteUInt32(imageObject, 70, 6);
-        WriteUInt16(imageObject, 74, 7);
-        WriteUInt32(imageObject, 76, 19);
-        WriteUInt16(imageObject, 80, 3);
-        WriteUInt32(imageObject, 82, 15);
-        imageObject[86] = 0;
-        imageObject[87] = 3;
-        imageObject[88] = 0;
-        imageObject[89] = 0;
-        imageObject[90] = 4;
-        WriteUInt32(imageObject, 91, 22);
+        ids ??= [22];
+        var objects = new List<byte[]>();
+        foreach (var id in ids)
+        {
+            var preceding = optionalFields ? 13 : 0;
+            var shape = new byte[121 + preceding];
+            WriteUInt32(shape, 0, (uint)shape.Length);
+            WriteUInt16(shape, 4, 7);
+            WriteUInt32(shape, 6, 54);
+            shape[10] = 0;
+            shape[11] = 2;
+            shape[12] = optionalFields ? (byte)0x37 : (byte)0x20;
+            WriteUInt32(shape, 14, 4);
+            WriteDouble(shape, 18, 100);
+            WriteDouble(shape, 26, 120);
+            WriteDouble(shape, 34, 400);
+            WriteDouble(shape, 42, 300);
+            if (optionalFields) WriteUInt32(shape, 54, 4); // empty sized TextCommon
+            WriteUInt32(shape, 54 + preceding, truncateFill ? 63u : 62u);
+            shape[58 + preceding] = 2;
+            WriteUInt32(shape, 60 + preceding, id);
 
-        var pageBytes = new byte[222];
-        WriteUInt32(pageBytes, 0, 64);
-        WriteUInt32(pageBytes, 0x16, 816);
-        WriteUInt32(pageBytes, 0x1A, 1056);
-        WriteUInt16(pageBytes, 64, 1);
-        WriteUInt32(pageBytes, 84, 1);
-        pageBytes[88] = 3;
-        WriteUInt32(pageBytes, 91, (uint)imageObject.Length);
-        imageObject.CopyTo(pageBytes, 95);
-
+            var imageObject = new byte[64 + 6 + shape.Length + 19];
+            WriteUInt32(imageObject, 0, 64);
+            WriteUInt16(imageObject, 4, 0);
+            imageObject[10] = 2;
+            WriteDouble(imageObject, 32, 100);
+            WriteDouble(imageObject, 40, 120);
+            WriteDouble(imageObject, 48, 400);
+            WriteDouble(imageObject, 56, 300);
+            WriteUInt32(imageObject, 64, 6);
+            WriteUInt16(imageObject, 68, 6);
+            shape.CopyTo(imageObject, 70);
+            var original = 70 + shape.Length;
+            WriteUInt32(imageObject, original, 19);
+            WriteUInt16(imageObject, original + 4, 3);
+            WriteUInt32(imageObject, original + 6, 15);
+            imageObject[original + 11] = 3;
+            imageObject[original + 14] = 4;
+            WriteUInt32(imageObject, original + 15, 11); // original differs from displayed image
+            objects.Add(imageObject);
+        }
+        using var pageBytes = new MemoryStream();
+        var pageHeader = new byte[68];
+        WriteUInt32(pageHeader, 0, 64);
+        WriteUInt32(pageHeader, 0x16, 816);
+        WriteUInt32(pageHeader, 0x1A, 1056);
+        WriteUInt16(pageHeader, 64, (ushort)(separateLayers ? objects.Count : 1));
+        pageBytes.Write(pageHeader);
+        var layers = separateLayers ? objects.Select(item => new[] { item }).ToArray() : [objects.ToArray()];
+        foreach (var layer in layers)
+        {
+            var header = new byte[20];
+            WriteUInt32(header, 16, (uint)layer.Length);
+            pageBytes.Write(header);
+            foreach (var imageObject in layer)
+            {
+                var objectHeader = new byte[7];
+                objectHeader[0] = 3;
+                WriteUInt32(objectHeader, 3, (uint)imageObject.Length);
+                pageBytes.Write(objectHeader);
+                pageBytes.Write(imageObject);
+            }
+            pageBytes.Write(new byte[32]);
+        }
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         using (var pageStream = archive.CreateEntry("fixture.page").Open())
-            pageStream.Write(pageBytes);
+            pageStream.Write(pageBytes.ToArray());
         using (var red = archive.CreateEntry("media/11@red.png").Open())
             red.Write([0x11]);
-        using (var blue = archive.CreateEntry("media/22@blue.png").Open())
-            blue.Write([0x22]);
+        if (!missingFile)
+            using (var blue = archive.CreateEntry("media/22@blue.png").Open())
+                blue.Write([0x22]);
+        if (!includeManifest) return;
         using var metadata = archive.CreateEntry("media/mediaInfo.dat").Open();
-        foreach (var (bindId, fileName) in new[] { (11u, "11@red.png"), (22u, "22@blue.png") })
+        var bindings = new List<(uint Id, string Name)> { (11, "11@red.png"), (22, "22@blue.png") };
+        if (duplicateBinding) bindings.Add((22, "11@red.png"));
+        foreach (var (bindId, fileName) in bindings)
         {
             var nameBytes = System.Text.Encoding.Unicode.GetBytes(fileName);
             var header = new byte[6];

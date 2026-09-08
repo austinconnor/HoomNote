@@ -99,7 +99,13 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
         {
             using var form = XPdfForm.FromFile(assetStore.GetPath(layer.AssetHash));
             form.PageNumber = layer.SourcePageIndex + 1;
-            graphics.DrawImage(form, 0, 0, Dip(page.Size.Width), Dip(page.Size.Height));
+            var state = graphics.Save();
+            try
+            {
+                ApplyPdfTransform(graphics, layer.Transform);
+                graphics.DrawImage(form, 0, 0, Dip(page.Size.Width), Dip(page.Size.Height));
+            }
+            finally { graphics.Restore(state); }
         }
         catch (Exception exception)
         {
@@ -215,11 +221,16 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
                 try
                 {
                     using var xImage = XImage.FromFile(assetStore.GetPath(image.AssetHash));
-                    var imageTopLeft = canvasObject.Transform.Apply(new PointD(image.Bounds.Left, image.Bounds.Top));
-                    var imageBottomRight = canvasObject.Transform.Apply(new PointD(image.Bounds.Right, image.Bounds.Bottom));
-                    var imageRect = Normalize(imageTopLeft, imageBottomRight);
-                    graphics.DrawImage(xImage, Dip(imageRect.X), Dip(imageRect.Y),
-                        Dip(imageRect.Width), Dip(imageRect.Height));
+                    var destination = ImageLayout.Destination(image.Bounds,
+                        xImage.PixelWidth, xImage.PixelHeight, image.PreserveAspectRatio);
+                    var state = graphics.Save();
+                    try
+                    {
+                        ApplyPdfTransform(graphics, image.Transform);
+                        graphics.DrawImage(xImage, Dip(destination.X), Dip(destination.Y),
+                            Dip(destination.Width), Dip(destination.Height));
+                    }
+                    finally { graphics.Restore(state); }
                 }
                 catch (Exception exception)
                 {
@@ -379,6 +390,10 @@ public sealed class VectorExportService(IAssetStore assetStore) : IVectorExportS
         var pointList = string.Join(" ", points.Select(point => FormattableString.Invariant($"{point.X},{point.Y}")));
         return $"<polygon points=\"{pointList}\" {style}/>";
     }
+
+    private static void ApplyPdfTransform(XGraphics graphics, Transform2D transform) =>
+        graphics.MultiplyTransform(new XMatrix(transform.M11, transform.M12,
+            transform.M21, transform.M22, Dip(transform.M31), Dip(transform.M32)));
 
     private static RectD Normalize(PointD left, PointD right) => new(
         Math.Min(left.X, right.X), Math.Min(left.Y, right.Y), Math.Abs(right.X - left.X), Math.Abs(right.Y - left.Y));

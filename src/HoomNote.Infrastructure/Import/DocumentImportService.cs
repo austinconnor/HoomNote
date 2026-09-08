@@ -118,6 +118,7 @@ public sealed class DocumentImportService(IAssetStore assetStore, ISlideConverte
                 {
                     AssetHash = imageHash,
                     Bounds = image.Bounds,
+                    Transform = image.Transform,
                     AltText = Path.GetFileNameWithoutExtension(image.FileName),
                     ZIndex = image.ZIndex,
                     IsLocked = false,
